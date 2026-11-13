@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.6.3 (после продажи юнитов титан ставится сразу, без ожидания суммы на экране)"
+VERSION = "5.6.4 (способности жмутся клавишей T и повторяются до 10 с, пока не сработают)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -3191,6 +3191,7 @@ class Bot:
         self.bar_missing = 0
         self.failed_place = {}
         self.nomoney_snaps = 0
+        self.boss_stun_spam = {}
         self.boss_upgrade2 = None
         self.lapse_at = 0.0
         try:                             # снимки двух прошлых матчей хранятся в debug_prev и debug_prev2
@@ -3242,24 +3243,20 @@ class Bot:
 
     # --- способности и босс 30-й волны (Nightmare) ---
 
-    def use_ability(self, name, tries=None, sel_tries=3):
-        """Нажать способность юнита. У плунжера проверяется, что на кнопке появился отсчёт (сработала);
-        у титанов кнопка после нажатия не меняется, поэтому нажимается один раз без ожидания.
-        -> True (нажата/сработала/уже действует), False (не получилось), "cooldown" (на перезарядке),
-        "stunned" (юнит оглушён - способность сейчас не нажать)."""
+    def use_ability(self, name, tries=None, sel_tries=3, spam=10.0):
+        """Нажать способность юнита клавишей T (первая способность на панели) и убедиться по кнопке,
+        что она сработала (на кнопке появился отсчёт). Если не сработала - юнит оглушён, игра не
+        приняла нажатие - T нажимается снова и снова до spam секунд, пока не сработает.
+        -> True (сработала / уже действует), False (не получилось), "cooldown" (на перезарядке),
+        "stunned" (за всё время так и не сработала, юнит оглушён)."""
         name = getattr(self, "alias", {}).get(name, name)
         if name not in self.units:
             return False
         utype = self.types.get(name)
-        titan = utype in ("tcam", "ttv", "tspk")
         need = ABILITY_LEVEL.get(utype)
         if need and self.levels.get(name, 0) < need:
             log(f"  способность {name} ещё не открыта (ур. {self.levels.get(name, 0)} из {need})")
             return False
-        if self.unit_stunned(name):
-            return "stunned"
-        if tries is None:
-            tries = 1 if titan else 3
         ok_sel, lvl, _price = self.select_checked(name, tries=sel_tries)
         if not ok_sel:
             log(f"  не получается выделить {name} - способность не нажимаю")
@@ -3268,16 +3265,12 @@ class Bot:
             self.levels[name] = lvl
             log(f"  способность {name} ещё не открыта (на самом деле {lvl} ур. из {need})")
             return False
-        self.hover(ABILITY_POINT)
-        self.sleep(0.25)
         state = ability_state(self.grab())
         if state == "active":
             log(f"  способность {name} уже действует")
-            self.hover(IDLE_POINT)
             return True
         if state == "cooldown":
             log(f"  способность {name} на перезарядке")
-            self.hover(IDLE_POINT)
             return "cooldown"
         hook = utype == "ttv"
         if hook:
@@ -3286,34 +3279,43 @@ class Bot:
                 self.key("r")
                 self.sleep(0.12)
             self.sleep(0.35)
-        for attempt in range(tries):
-            self.click(ABILITY_POINT, dwell=0.2)
-            self.selected = name                  # клик по кнопке панели выделения не снимает
-            if hook:
-                self.sleep(0.6)
-                for _ in range(len(PRIORITIES) - PRIORITIES.index("Boss")):
-                    self.key("r")                 # Boss -> First
-                    self.sleep(0.12)
-            if titan:
-                self.sleep(0.3)
-                self.snap(f"abil_{name}")
-                log(f"  способность нажата: {name}")
-                report(f"✨ Способность: {unit_title(name)}", "", COLOR_INFO)
-                self.hover(IDLE_POINT)
-                return True
-            for _ in range(5):                    # до ~1.2 с ждём отсчёт на кнопке
-                self.sleep(0.25)
+        t_end = time.perf_counter() + spam
+        ok, presses = False, 0
+        while True:
+            self.key("t")
+            presses += 1
+            self.selected = name
+            for _ in range(3):                    # ~0.6 с ждём отсчёт на кнопке
+                self.sleep(0.2)
                 if ability_state(self.grab()) != "ready":
-                    log(f"  способность сработала: {name}")
-                    report(f"✨ Способность: {unit_title(name)}", "", COLOR_INFO)
-                    self.hover(IDLE_POINT)
-                    return True
-            if attempt == 0:
+                    ok = True
+                    break
+            if ok or time.perf_counter() > t_end:
+                break
+            if presses == 1:
                 self.snap(f"abil_{name}_fail")
-            log(f"  способность {name}: отсчёт на кнопке не появился - нажимаю ещё раз")
-        self.hover(IDLE_POINT)
-        log(f"  способность {name} НЕ подтвердилась")
-        return False
+                log(f"  способность {name} не сработала с первого нажатия"
+                    + (" (юнит оглушён)" if self.unit_stunned(name) else "")
+                    + f" - жму T ещё до {spam:.0f} с")
+            try:
+                opened = panel_open(self.grab())
+            except Exception:
+                opened = True
+            if not opened:                        # выделение слетело - выделяю заново
+                self.selected = None
+                if not self.select_checked(name, tries=2)[0]:
+                    break
+        if hook:
+            self.sleep(0.4 if ok else 0.1)
+            for _ in range(len(PRIORITIES) - PRIORITIES.index("Boss")):
+                self.key("r")                     # Boss -> First
+                self.sleep(0.12)
+        if ok:
+            log(f"  способность сработала: {name}" + (f" (с {presses}-го нажатия)" if presses > 1 else ""))
+            report(f"✨ Способность: {unit_title(name)}", "", COLOR_INFO)
+            return True
+        log(f"  способность {name} так и не сработала за {spam:.0f} с ({presses} нажатий)")
+        return "stunned" if self.unit_stunned(name) else False
 
     def teleport(self, name, at):
         """Teleport у Titan TV Man: способность работает как постановка - навести и кликнуть, Q - отмена.
@@ -3528,11 +3530,6 @@ class Bot:
                 if real not in self.units:
                     done.add(key)
                     return
-                if self.unit_stunned(real):
-                    if key not in self.boss_waiting:
-                        self.boss_waiting.add(key)
-                        log(f"БОСС +{el():.0f}с: {unit} оглушён - способность нажму, когда очнётся")
-                    return                        # оглушение - не неудача, попытку не трачу
                 if key.startswith("hook") and time.perf_counter() < getattr(self, "boss_hook_wait", 0):
                     return
                 if not attempt(key, limit):
@@ -3543,7 +3540,13 @@ class Bot:
                 if res == "cooldown" and key.startswith("hook"):
                     tries[key] -= 1               # крюк ещё перезаряжается - попытку не трачу, нажму позже
                     self.boss_hook_wait = time.perf_counter() + 4
-                elif res and res != "stunned":
+                elif res == "stunned":
+                    # 10 секунд жал - юнит всё это время был оглушён. Не больше двух таких заходов на шаг.
+                    spams = self.__dict__.setdefault("boss_stun_spam", {})
+                    spams[key] = spams.get(key, 0) + 1
+                    if spams[key] < 2:
+                        tries[key] -= 1
+                elif res:
                     done.add(key)
 
             # здоровье босса в журнал раз в ~10 с - чтобы потом было видно, как шёл бой
