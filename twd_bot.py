@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.6.1 (окно Disconnected распознаётся и на размытом сером фоне)"
+VERSION = "5.6.2 (если сумма денег не читается - сохраняет её снимок для разбора)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2340,6 +2340,20 @@ class Bot:
                         return v2
             if self.end_screen():
                 raise MatchEnded
+            if v is None and time.perf_counter() - last_seen > 2.5 and getattr(self, "nomoney_snaps", 0) < 4 \
+                    and time.perf_counter() - getattr(self, "nomoney_at", 0) > 5:
+                # сумма не читается уже 2.5 с - сохраняю область с деньгами без сжатия: по ней видно,
+                # как цифры выглядят на этом компьютере и что мешает их прочитать
+                self.nomoney_at = time.perf_counter()
+                self.nomoney_snaps = getattr(self, "nomoney_snaps", 0) + 1
+                try:
+                    d = os.path.join(HERE, "debug")
+                    os.makedirs(d, exist_ok=True)
+                    self.grab(MONEY_REGION).convert("RGB").save(
+                        os.path.join(d, f"nomoney_{self.nomoney_snaps}.png"))
+                    log(f"  сумму денег не удаётся прочитать - снимок сохранён в debug\\nomoney_{self.nomoney_snaps}.png")
+                except Exception:
+                    pass
             if time.perf_counter() - last_seen > 6:
                 # сумму не видно: награда "click anywhere" или конец матча
                 if self.end_screen():
@@ -3169,6 +3183,7 @@ class Bot:
         self.base_hp_ref = None
         self.bar_missing = 0
         self.failed_place = {}
+        self.nomoney_snaps = 0
         self.boss_upgrade2 = None
         self.lapse_at = 0.0
         try:                             # снимки двух прошлых матчей хранятся в debug_prev и debug_prev2
@@ -3179,10 +3194,10 @@ class Bot:
                         continue
                     os.makedirs(dst, exist_ok=True)
                     for fn in os.listdir(dst):
-                        if fn.endswith(".jpg"):
+                        if fn.endswith((".jpg", ".png")):
                             os.remove(os.path.join(dst, fn))
                     for fn in os.listdir(src):
-                        if fn.endswith(".jpg"):
+                        if fn.endswith((".jpg", ".png")):
                             os.replace(os.path.join(src, fn), os.path.join(dst, fn))
         except Exception:
             pass
