@@ -1,0 +1,30 @@
+TWD Farm - фарм HARD и NIGHTMARE на Invaded City
+
+1. Один раз: двойной клик по "Собрать exe.bat" (около минуты).
+   Появится "TWD Farm.exe" - это и есть приложение. Старый TWD_Bot.exe удалится.
+2. Запускай "TWD Farm.exe". Кнопка "Старт" (или F8) - фарм, "Стоп" (или F6) - остановить.
+   После старта переключись в Roblox (или бот сам кликнет в окно через пару секунд).
+3. Настройки и Discord - во вкладках слева, кнопка "Сохранить". Хранятся в settings.json.
+4. Если что-то пошло не так - пришли twd_log.txt (вкладка "Журнал" -> "Открыть папку").
+
+Discord
+1. https://discord.com/developers/applications -> New Application -> Bot -> Reset Token, скопируй токен.
+   (Message Content Intent больше НЕ нужен.)
+2. OAuth2 -> URL Generator: отметь scopes "bot" и "applications.commands",
+   права "View Channels", "Send Messages", "Embed Links", "Attach Files".
+   Открой ссылку внизу и добавь бота на свой сервер.
+3. Discord: Настройки -> Расширенные -> Режим разработчика. ПКМ по каналу -> Копировать ID канала.
+4. В приложении вкладка Discord: включи переключатель, вставь токен и ID канала,
+   "Сохранить и подключить". Слэш-команды появятся на сервере сразу:
+   /status  /screen  /log  /start  /stop
+Токен никому не показывай.
+
+"Диагностика.bat" - проверка, что бот видит деньги, экран и дорожку (нужен Python).
+
+Режимы
+На главной вкладке переключатель HARD / NIGHTMARE (в Discord: /mode). Меняется со следующего матча.
+Слоты бот определяет сам по ценам на карточках в начале каждого матча - порядок юнитов на панели не важен.
+Нужные юниты:
+  HARD:      Titan Cameraman, Titan Speakerman, Scientist TV Man, Plunger Cameraman 2.0 (или Dark Speakerman)
+  NIGHTMARE: Titan Cameraman, Titan Speakerman, Scientist TV Man, Plunger Cameraman 2.0, Scientist Cameraman
+Если чего-то нет на панели, бот остановится и напишет, чего не хватает.

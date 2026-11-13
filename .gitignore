@@ -1,0 +1,10 @@
+settings.json
+discord.json
+twd_log.txt
+twd_bot_prev.py
+unknown_screen.png
+diag_*.png
+debug/
+debug_prev/
+debug_prev2/
+__pycache__/
