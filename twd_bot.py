@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.6.0 (автообновление с GitHub; ссылка приватки - в настройках)"
+VERSION = "5.6.1 (окно Disconnected распознаётся и на размытом сером фоне)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -961,31 +961,49 @@ def panel_open(img):
     return 0.08 < white < 0.3 and dark > 0.5
 
 
+def _dense_span(mask, fill=0.7):
+    """Границы участка, где mask почти сплошная: от первого до последнего True, если между ними
+    True не меньше доли fill (строки с текстом и линиями внутри окна не должны рвать участок)."""
+    idx = np.nonzero(mask)[0]
+    if len(idx) == 0:
+        return 0, 0
+    a, b = int(idx[0]), int(idx[-1]) + 1
+    while b - a > 4 and len(idx) / (b - a) < fill:      # срезаю редкие выбросы по краям
+        gaps = np.diff(idx)
+        k = int(np.argmax(gaps))
+        idx = idx[:k + 1] if k + 1 >= len(idx) - (k + 1) else idx[k + 1:]
+        a, b = int(idx[0]), int(idx[-1]) + 1
+    return a, b
+
+
 def disconnect_dialog(img):
-    """Окно Roblox «Disconnected» (серый прямоугольник по центру с белой кнопкой Reconnect).
-    -> точка кнопки Reconnect в долях кадра или None."""
+    """Окно ошибки Roblox (Disconnected, Connection Failed, кик): серый прямоугольник по центру экрана
+    с белой кнопкой справа внизу. Фон под ним размыт и тоже бывает сероватым, поэтому окно ищется
+    как сплошной блок точного серого цвета. -> точка белой кнопки в долях кадра или None."""
     w, h = img.size
-    x0, y0, x1, y1 = int(0.30 * w), int(0.30 * h), int(0.70 * w), int(0.72 * h)
+    x0, y0, x1, y1 = int(0.25 * w), int(0.20 * h), int(0.75 * w), int(0.80 * h)
     a = np.asarray(img.crop((x0, y0, x1, y1)).convert("RGB")).astype(np.int16)
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
-    grey = (abs(r - 58) < 9) & (abs(g - 59) < 9) & (abs(b - 61) < 9)
-    if grey.mean() < 0.10:
+    grey = (abs(r - 57) < 6) & (abs(g - 59) < 6) & (abs(b - 61) < 6)
+    cx0, cx1 = _dense_span(grey.mean(axis=0) > 0.20)           # столбцы, где серого много
+    if cx1 - cx0 < 0.12 * w:
         return None
-    ys, xs = np.nonzero(grey)
-    gx0, gx1, gy0, gy1 = int(np.percentile(xs, 1)), int(np.percentile(xs, 99)), \
-        int(np.percentile(ys, 1)), int(np.percentile(ys, 99))
-    bw, bh = gx1 - gx0, gy1 - gy0
-    if bw < 0.12 * w or bh < 0.10 * h or not (1.1 < bw / max(1, bh) < 2.6):
+    ry0, ry1 = _dense_span(grey[:, cx0:cx1].mean(axis=1) > 0.45)
+    bw, bh = cx1 - cx0, ry1 - ry0
+    if bh < 0.10 * h or not (1.1 < bw / max(1, bh) < 2.6):
         return None
-    if grey[gy0:gy1, gx0:gx1].mean() < 0.55:          # внутри рамки должно быть в основном серое
+    box = grey[ry0:ry1, cx0:cx1]
+    if box.mean() < 0.55:                                      # внутри рамки должно быть в основном серое
         return None
-    low = a[gy0 + int(0.62 * bh):gy1, gx0:gx1]        # нижняя часть окна: кнопки Leave и Reconnect
+    low = a[ry0 + int(0.62 * bh):ry1, cx0:cx1]                 # нижняя часть окна: две кнопки
     white = low.min(axis=2) > 235
-    if white.mean() < 0.12:
+    if white.mean() < 0.10:
         return None
     wy, wx = np.nonzero(white)
-    cx = x0 + gx0 + float(np.median(wx))
-    cy = y0 + gy0 + int(0.62 * bh) + float(np.median(wy))
+    if float(np.median(wx)) < 0.5 * bw:                        # белая кнопка - правая
+        return None
+    cx = x0 + cx0 + float(np.median(wx))
+    cy = y0 + ry0 + int(0.62 * bh) + float(np.median(wy))
     return cx / w, cy / h
 
 
