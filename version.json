@@ -1,6 +1,6 @@
 {
-  "version": "5.6.5",
+  "version": "5.6.6",
   "file": "twd_bot.py",
-  "sha256": "00aaf25e790f81d7f69ce905ded77c5b6988ecc67cdbd69e0bcc307bc03ad7a5",
-  "notes": "Speakerman при переезде встаёт на открытую траву, а не в дерево"
+  "sha256": "990009f263e8e62b7ff83e0ef58cfab642afe9d71f054da872d5d3f37a96fb6e",
+  "notes": "сначала ставятся все 4 плунжера и 4 TV, потом прокачка"
 }

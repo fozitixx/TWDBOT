@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.6.5 (Speakerman при переезде встаёт на открытую траву, а не в дерево)"
+VERSION = "5.6.6 (сначала ставятся все 4 плунжера и 4 TV, потом прокачка)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -217,10 +217,11 @@ def _build_plan(mode, slots):
             _p("pl3", "plunger", "n3"),
             _p("tv1", "tv", "n5", priority="Flying"),
             _p("pl4", "plunger", "n4"),
-            *_u("pl1", "pl2", "pl3", "pl4"),
             _p("tv2", "tv", "n6", priority="Flying"),
             _p("tv3", "tv", "n7", priority="Flying"),
             _p("tv4", "tv", "n8", priority="Flying"),
+            # сначала на поле все восемь, и только потом прокачка: плунжеры, затем TV
+            *_u("pl1", "pl2", "pl3", "pl4"),
             *_u("tv1", "tv2", "tv3", "tv4"),
             # --- дальше порядок из видео после патча (босс 100 000 HP) ---
             # фермы сразу после кучки (к концу 9-й волны стоят все четыре) и до 3 ур. - раньше титана:
