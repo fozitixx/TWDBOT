@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.6.2 (если сумма денег не читается - сохраняет её снимок для разбора)"
+VERSION = "5.6.3 (после продажи юнитов титан ставится сразу, без ожидания суммы на экране)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2645,8 +2645,15 @@ class Bot:
                 value = sum(sell_value(self.types[u], self.levels.get(u, 0)) for u in sell if u in self.types)
             self.wait_money(max(0, cost - value) + step.get("margin", 150), f"{name} (после продажи {len(sell)} юнитов)")
             log(f"  продаю {', '.join(sell)} ради {name}")
+            sold_all = True
             for u in sell:
-                self.sell_unit(u)
+                if not self.sell_unit(u):
+                    sold_all = False
+            if sold_all:
+                # Денег теперь точно хватает: перед продажей было проверено, что с выручкой их достаточно.
+                # Ставлю сразу, не дожидаясь, пока сумма на экране прочитается (на части компьютеров
+                # она читается с задержкой, и титан вставал на 10 секунд позже, чем мог).
+                step = dict(step, nowait=True)
         if not step.get("nowait"):               # nowait: деньги точно есть (только что продан титан),
             self.wait_money(cost, name)          # а сумму на экране в бою с боссом бывает не прочитать
         at = step["at"]
