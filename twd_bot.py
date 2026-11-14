@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.6.6 (сначала ставятся все 4 плунжера и 4 TV, потом прокачка)"
+VERSION = "5.6.7 (суммы вида $7,260 теперь читаются - бот не ждёт денег, которые уже есть)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -771,13 +771,41 @@ MONEY_TOL = 0.18     # насколько цифра суммы может от�
                      # суммы с семёркой и крупные суммы не читались, и бот ждал денег, которые уже есть)
 
 
-def read_money_image(img):
-    glyphs = _segment(np.asarray(img.convert("RGB")))
-    if not glyphs or not (2 <= len(glyphs) <= 8):
-        return None
+def _cut_comma(gl, asp, base_h):
+    """Запятая после семёрки ($7,260) на части экранов прилипает к её ножке, и «7,» читается как один
+    непонятный знак - сумма с 7 тысячами не читалась вовсе. Такой знак выдаёт себя тем, что он выше
+    остальных цифр: запятая свисает ниже строки. Срезается всё ниже строки и правые столбцы,
+    где после этого точки остались только в самом низу. base_h - обычная высота цифры в этой сумме."""
+    g = np.asarray(gl).astype(bool)
+    h, w = g.shape
+    if not base_h or h < 1.12 * base_h or w < 8:
+        return gl, asp
+    g = g[:int(round(base_h))]                      # всё, что ниже строки, - хвост запятой
+    hh = g.shape[0]
+    cut = w
+    while cut > 0:
+        r = np.nonzero(g[:, cut - 1])[0]
+        if len(r) and r[0] < 0.7 * hh:
+            break
+        cut -= 1
+    if cut < 0.45 * w:
+        return gl, asp
+    left = g[:, :cut]
+    rows = np.nonzero(left.any(axis=1))[0]
+    cols = np.nonzero(left.any(axis=0))[0]
+    if len(rows) < 6 or len(cols) < 4:
+        return gl, asp
+    left = left[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+    return left.astype(np.asarray(gl).dtype), left.shape[1] / left.shape[0]
+
+
+def _money_from_glyphs(glyphs, cut):
     templates = _get_templates()
     chars = []
-    for gl, asp in glyphs:
+    base_h = float(np.median([np.asarray(g).shape[0] for g, _a in glyphs[1:]])) if len(glyphs) > 2 else 0
+    for i, (gl, asp) in enumerate(glyphs):
+        if cut and i:
+            gl, asp = _cut_comma(gl, asp, base_h)
         small = Image.fromarray((gl * 255).astype(np.uint8)).resize((_NW, _NH), Image.BILINEAR)
         v = np.asarray(small, dtype=np.float32) / 255.0
         best, score = None, 1e9
@@ -791,6 +819,16 @@ def read_money_image(img):
     if chars[0] != "$" or "$" in chars[1:]:
         return None
     return int("".join(chars[1:]))
+
+
+def read_money_image(img):
+    glyphs = _segment(np.asarray(img.convert("RGB")))
+    if not glyphs or not (2 <= len(glyphs) <= 8):
+        return None
+    v = _money_from_glyphs(glyphs, cut=False)
+    if v is None:                       # не прочиталось - возможно, к цифре прилипла запятая ($7,260)
+        v = _money_from_glyphs(glyphs, cut=True)
+    return v
 
 
 # ---------- юниты, слоты, режимы ----------
