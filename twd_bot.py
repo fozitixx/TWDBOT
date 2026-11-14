@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.6.7 (суммы вида $7,260 теперь читаются - бот не ждёт денег, которые уже есть)"
+VERSION = "5.6.8 (читаются суммы с 7 тысячами и узкие суммы вроде $11,110)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -739,7 +739,9 @@ def _segment(rgb):
     colsum = band.sum(0)
     spans, prev_end = [], 0
     for a, c in _runs(colsum > 0):
-        if a - prev_end > 1.0 * h:
+        # между значком и суммой зазор бывает больше, чем между цифрами: узкая сумма ($11,110)
+        # стоит правее. Раньше из-за этого такая сумма не читалась совсем.
+        if a - prev_end > (2.2 if not spans else 1.0) * h:
             break
         prev_end = c
         w = c - a
