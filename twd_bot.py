@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.2 (сток проверяется первым делом - сразу при старте фарма, а потом после каждого обновления между матчами)"
+VERSION = "5.8.3 (обновление видно сразу после выкладки, без пятиминутной задержки GitHub)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -1896,12 +1896,27 @@ def version_tuple(text):
     return tuple(int(x) for x in m.group(1).split(".")) if m else (0,)
 
 
-def _http_get(url, timeout=8):
+def _http_get(url, timeout=8, accept=None):
     import urllib.request
-    req = urllib.request.Request(url + f"?t={int(time.time())}", headers={"User-Agent": "TWD-Farm-updater",
-                                                                           "Cache-Control": "no-cache"})
+    headers = {"User-Agent": "TWD-Farm-updater", "Cache-Control": "no-cache"}
+    if accept:
+        headers["Accept"] = accept
+    req = urllib.request.Request(url + f"?t={int(time.time())}", headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
+
+
+def update_base():
+    """Адрес файлов последнего коммита. По ветке main GitHub отдаёт файлы из кэша ещё минут пять после
+    выкладки, поэтому сначала узнаю номер последнего коммита и беру файлы именно из него."""
+    try:
+        sha = _http_get(f"https://api.github.com/repos/{UPDATE_REPO}/commits/main", timeout=6,
+                        accept="application/vnd.github.sha").decode("ascii").strip()
+        if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):
+            return f"https://raw.githubusercontent.com/{UPDATE_REPO}/{sha}/"
+    except Exception:
+        pass
+    return UPDATE_BASE
 
 
 def self_update(quiet=False):
@@ -1912,7 +1927,8 @@ def self_update(quiet=False):
     if not SETTINGS.get("auto_update", True):
         return None
     try:
-        info = json.loads(_http_get(UPDATE_BASE + "version.json").decode("utf-8-sig"))
+        base = update_base()
+        info = json.loads(_http_get(base + "version.json").decode("utf-8-sig"))
         new = str(info.get("version", ""))
         if version_tuple(new) <= version_tuple(VERSION):
             if not quiet:
@@ -1920,7 +1936,7 @@ def self_update(quiet=False):
             return None
         log(f"на GitHub есть версия {new} (сейчас {VERSION.split()[0]}) - скачиваю"
             + (f": {info.get('notes')}" if info.get("notes") else ""))
-        data = _http_get(UPDATE_BASE + str(info.get("file", "twd_bot.py")), timeout=30)
+        data = _http_get(base + str(info.get("file", "twd_bot.py")), timeout=30)
         import hashlib
         digest = hashlib.sha256(data).hexdigest()
         if info.get("sha256") and digest != str(info["sha256"]).lower():
