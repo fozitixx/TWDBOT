@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.1 (сток проверяется каждые полчаса; покупает все штуки товара; добавлены Plunger, Spikes, Yellow Energy, Stun Gun, Toilet Rolls x100)"
+VERSION = "5.8.2 (сток проверяется первым делом - сразу при старте фарма, а потом после каждого обновления между матчами)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -4722,7 +4722,7 @@ class Bot:
                     LINK.send("Обновление", f"Установлена версия {new}, перезапускаюсь и продолжаю фарм.", COLOR_OK)
                     time.sleep(1.5)
                     restart_app(resume=True)
-            if done and self.stock_due():
+            if self.stock_due():                     # сток - первым делом: и при старте фарма, и между матчами
                 self.stock_trip()
                 STATS.state = "waiting"
             self.check()
@@ -5227,7 +5227,7 @@ class FarmApp:
         self.header(p, "Сток", "Research Shop в хабе: сток обновляется каждые полчаса (в XX:00 и XX:30)")
         s = self.section(p, "Автоскуп")
         self.switch(s, "stock_enabled", "Проверять сток",
-                    "После каждого обновления стока, между матчами, бот перезаходит на приватный сервер, идёт в Research Sector "
+                    "Сразу при старте фарма и после каждого обновления стока (между матчами) бот перезаходит на приватный сервер, идёт в Research Sector "
                     "к NPC с образцами и покупает отмеченные ниже предметы. Нужна ссылка приватного сервера.")
         self.switch(s, "stock_sell_trash", "Сдавать образцы перед покупкой",
                     "На вкладке Sample Exchange нажимает ALL и EXCHANGE - все образцы меняются на жетоны")
@@ -5238,7 +5238,7 @@ class FarmApp:
         bar = self.tk.Frame(s, bg=C["card"])
         bar.pack(fill="x", padx=18, pady=(4, 16))
         self.flat_button(bar, "Сохранить", self.save).pack(side="left")
-        self.flat_button(bar, "Проверить после этого матча", self.stock_now, color="card2", fg=C["text"]).pack(
+        self.flat_button(bar, "Проверить при первой возможности", self.stock_now, color="card2", fg=C["text"]).pack(
             side="left", padx=10)
         self.stock_lbl = self.label(bar, "", 9, "muted")
         self.stock_lbl.pack(side="left", padx=4)
@@ -5255,7 +5255,7 @@ class FarmApp:
     def stock_now(self):
         SETTINGS["stock_last"] = ""
         save_settings()
-        self.stock_lbl.configure(text="проверю сток после ближайшего матча" if SETTINGS.get("stock_enabled")
+        self.stock_lbl.configure(text="проверю сток перед следующим матчем" if SETTINGS.get("stock_enabled")
                                  else "сначала включи «Проверять сток» и сохрани")
 
     def _stock_rows(self):
