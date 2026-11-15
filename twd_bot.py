@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.6.8 (читаются суммы с 7 тысячами и узкие суммы вроде $11,110)"
+VERSION = "5.7.0 (выбор скорости игры 1x / 1.5x / 2x; времена боя с боссом подстраиваются под неё)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -67,7 +67,21 @@ VOTE_MAX_DIFF = 26.0
 VOTE_HARD_POINT = (0.5577, 0.7241)            # кнопка VOTE под HARD
 READY_BOX = (0.46, 0.17, 0.54, 0.21)
 READY_POINT = (0.4986, 0.1905)
-SPEED_POINT = (0.9602, 0.1392)                # кнопка 1.5x
+# Кнопки скорости справа сверху: 1x (обычная), 1.5x (GROUP - нужна группа игры), 2x (PASS - нужен геймпасс).
+SPEED_POINTS = {"1": (0.8360, 0.1392), "1.5": (0.8984, 0.1392), "2": (0.9602, 0.1392)}
+SPEED_TITLES = {"1": "1x", "1.5": "1.5x", "2": "2x"}
+
+
+def speed_key():
+    k = str(SETTINGS.get("speed", "2"))
+    return k if k in SPEED_POINTS else "2"
+
+
+def speed_factor():
+    """Во сколько раз игра идёт быстрее, чем на 1.5x: времена боя с боссом записаны для 1.5x."""
+    if not SETTINGS.get("use_speed", True):
+        return 1.0 / 1.5
+    return float(speed_key()) / 1.5
 
 # Лобби
 # Ссылка приватного сервера берётся из настроек (settings.json, поле server_link) - в коде её нет,
@@ -1582,6 +1596,7 @@ STATS = Stats()
 DEFAULT_SETTINGS = {
     "loops": 0,                  # 0 - бесконечно
     "use_speed": True,
+    "speed": "2",                # скорость игры: "1", "1.5" или "2"
     "focus_after": 3,
     "move_to_primary": True,
     "private_only": True,
@@ -3177,10 +3192,10 @@ class Bot:
         self.drop()
         if not self.ready_visible():
             return
-        if self.use_speed:
+        if self.use_speed and SETTINGS.get("use_speed", True):
             self.close_player_list()
-            log("включаю скорость 1.5x")
-            self.click(SPEED_POINT, dwell=0.35)
+            log(f"включаю скорость {SPEED_TITLES[speed_key()]}")
+            self.click(SPEED_POINTS[speed_key()], dwell=0.35)
             self.sleep(0.5)
         for _ in range(5):
             log("нажимаю READY")
@@ -3536,7 +3551,7 @@ class Bot:
             return
         now = time.perf_counter()
         if self.boss_t0 is None:
-            if self.holding is not None or time.time() - STATS.match_started < 600:
+            if self.holding is not None or time.time() - STATS.match_started < 600 / max(0.6, speed_factor()):
                 return
             self.boss_hits = self.boss_hits + 1 if self.boss_visible() else 0
             if self.boss_hits < 2:
@@ -3553,7 +3568,9 @@ class Bot:
             done, tries = self.boss_done, self.boss_try
 
             def el():
-                return time.perf_counter() - t0
+                # секунды боя в пересчёте на скорость 1.5x: все времена BOSS_* записаны для неё,
+                # на 2x босс проходит тот же путь быстрее, на 1x - медленнее
+                return (time.perf_counter() - t0) * speed_factor()
 
             def attempt(key, limit):
                 if key in done:
@@ -3609,7 +3626,7 @@ class Bot:
                     if el() >= BOSS_SHIELD_AT + 26 and el() < BOSS_TCAM_MOVE_MIN - 4:
                         ability("hook2", "tcam", 2)
                 elif getattr(self, "boss_moved_at", None):
-                    since = time.perf_counter() - self.boss_moved_at
+                    since = (time.perf_counter() - self.boss_moved_at) * speed_factor()
                     if since >= 6:
                         ability("hook3", "tcam", 3)
                     if since >= 34:
@@ -4356,6 +4373,17 @@ class FarmApp:
             self.mode_btn[key] = b
         self.mode_note = self.label(head, "", 9, "muted")
         self.mode_note.pack(side="left")
+        self.speed_btn = {}
+        seg2 = tk.Frame(head, bg=C["entry"], highlightthickness=1, highlightbackground=C["line"])
+        seg2.pack(side="right")
+        for key in ("1", "1.5", "2"):
+            b = tk.Label(seg2, text=SPEED_TITLES[key], font=(FONT, 9, "bold"), padx=12, pady=5, cursor="hand2",
+                         bg=C["entry"], fg=C["muted"])
+            b.pack(side="left")
+            b.bind("<Button-1>", lambda e, k=key: self.set_speed(k))
+            self.speed_btn[key] = b
+        self.label(head, "Скорость", 11, "text", "bold").pack(side="right", padx=(0, 10))
+        self._paint_speed()
         self.units_row = tk.Frame(uc, bg=C["card"])
         self.units_row.pack(fill="x", padx=16, pady=(4, 12))
         self._units_sig = None
@@ -4379,6 +4407,18 @@ class FarmApp:
                                 highlightthickness=0, wrap="none", state="disabled")
         self.mini_log.pack(fill="both", expand=True, padx=16, pady=(0, 14))
         self._tags(self.mini_log)
+
+    def _paint_speed(self):
+        cur = speed_key()
+        for k, b in self.speed_btn.items():
+            b.configure(bg=C["accent"] if k == cur else C["entry"], fg="#0f1115" if k == cur else C["muted"])
+
+    def set_speed(self, key):
+        SETTINGS["speed"] = key
+        save_settings()
+        self._paint_speed()
+        log(f"скорость игры: {SPEED_TITLES[key]}" + (" (применится со следующего матча)"
+                                                    if self.thread is not None and self.thread.is_alive() else ""))
 
     def set_mode(self, key):
         SETTINGS["mode"] = key
@@ -4550,7 +4590,7 @@ class FarmApp:
         self.header(p, "Настройки", "Сохраняются в settings.json рядом с приложением")
         s = self.section(p, "Матчи")
         self.entry(s, "loops", "Сколько матчей сыграть", "0 — без ограничений", width=8)
-        self.switch(s, "use_speed", "Включать скорость 1.5x", "Кнопка справа сверху в начале матча")
+        self.switch(s, "use_speed", "Включать скорость игры", "Какую именно - выбирается на главной странице (1x / 1.5x / 2x)")
         self.switch(s, "auto_update", "Обновляться автоматически",
                     "При запуске и между матчами бот скачивает новую версию с GitHub и перезапускается")
         s = self.section(p, "Окно Roblox")
