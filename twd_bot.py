@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.3 (обновление видно сразу после выкладки, без пятиминутной задержки GitHub)"
+VERSION = "5.8.4 (тестовые версии: переключатель «Получать тестовые версии» в настройках)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -1802,6 +1802,7 @@ DEFAULT_SETTINGS = {
     "private_only": True,
     "server_link": "",           # ссылка приватного сервера (roblox.com/share?code=...&type=Server)
     "auto_update": True,         # обновляться с GitHub при запуске и между матчами
+    "update_beta": False,        # получать ещё и тестовые версии (ветка beta) - только на ПК, где их проверяют
     "mode": "hard",              # hard / nightmare
     "force_resolution": "",      # например "1920x1080": выставить разрешение экрана при старте
     "roblox_fullscreen": True,   # держать Roblox на весь экран (F11): ровно 16:9, как в эталоне
@@ -1906,17 +1907,34 @@ def _http_get(url, timeout=8, accept=None):
         return r.read()
 
 
-def update_base():
-    """Адрес файлов последнего коммита. По ветке main GitHub отдаёт файлы из кэша ещё минут пять после
+def update_base(branch="main"):
+    """Адрес файлов последнего коммита ветки. По имени ветки GitHub отдаёт файлы из кэша ещё минут пять после
     выкладки, поэтому сначала узнаю номер последнего коммита и беру файлы именно из него."""
     try:
-        sha = _http_get(f"https://api.github.com/repos/{UPDATE_REPO}/commits/main", timeout=6,
+        sha = _http_get(f"https://api.github.com/repos/{UPDATE_REPO}/commits/{branch}", timeout=6,
                         accept="application/vnd.github.sha").decode("ascii").strip()
         if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):
             return f"https://raw.githubusercontent.com/{UPDATE_REPO}/{sha}/"
     except Exception:
         pass
-    return UPDATE_BASE
+    return f"https://raw.githubusercontent.com/{UPDATE_REPO}/{branch}/"
+
+
+def update_info():
+    """(адрес файлов, version.json) самой новой версии: из main, а при включённых тестовых версиях - ещё и из
+    ветки beta. При равных номерах берётся main."""
+    base = update_base()
+    info = json.loads(_http_get(base + "version.json").decode("utf-8-sig"))
+    if SETTINGS.get("update_beta"):
+        try:
+            b_base = update_base("beta")
+            b_info = json.loads(_http_get(b_base + "version.json").decode("utf-8-sig"))
+            if version_tuple(b_info.get("version", "")) > version_tuple(info.get("version", "")):
+                b_info["beta"] = True
+                return b_base, b_info
+        except Exception:
+            pass                                     # ветки beta нет или она недоступна - обычные обновления
+    return base, info
 
 
 def self_update(quiet=False):
@@ -1927,14 +1945,13 @@ def self_update(quiet=False):
     if not SETTINGS.get("auto_update", True):
         return None
     try:
-        base = update_base()
-        info = json.loads(_http_get(base + "version.json").decode("utf-8-sig"))
+        base, info = update_info()
         new = str(info.get("version", ""))
         if version_tuple(new) <= version_tuple(VERSION):
             if not quiet:
                 log(f"обновлений нет (версия {VERSION.split()[0]} - последняя)")
             return None
-        log(f"на GitHub есть версия {new} (сейчас {VERSION.split()[0]}) - скачиваю"
+        log(f"на GitHub есть {'ТЕСТОВАЯ ' if info.get('beta') else ''}версия {new} (сейчас {VERSION.split()[0]}) - скачиваю"
             + (f": {info.get('notes')}" if info.get("notes") else ""))
         data = _http_get(base + str(info.get("file", "twd_bot.py")), timeout=30)
         import hashlib
@@ -5219,6 +5236,8 @@ class FarmApp:
         self.switch(s, "use_speed", "Включать скорость игры", "Какую именно - выбирается на главной странице (1x / 1.5x / 2x)")
         self.switch(s, "auto_update", "Обновляться автоматически",
                     "При запуске и между матчами бот скачивает новую версию с GitHub и перезапускается")
+        self.switch(s, "update_beta", "Получать тестовые версии",
+                    "Версии, которые ещё не выпущены для всех. Включай только на том ПК, где проверяешь новое")
         s = self.section(p, "Окно Roblox")
         self.entry(s, "focus_after", "Через сколько секунд кликать в Roblox, если окно не активно",
                    "Если переключишься в другое окно, фарм сам вернётся в игру", width=8)
