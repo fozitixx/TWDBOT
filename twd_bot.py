@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.7.0 (выбор скорости игры 1x / 1.5x / 2x; времена боя с боссом подстраиваются под неё)"
+VERSION = "5.8.0 (автоскуп стока Research Shop раз в час между матчами; новая страница «Сток» с выбором предметов)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -913,8 +913,9 @@ def _components(m):
     return out
 
 
-def _read_green_number(m, tol=0.16):
-    """Число из маски зелёного текста одной надписи ($7,500 -> 7500). Запятая отбрасывается."""
+def _read_green_number(m, tol=0.16, dollar=True):
+    """Число из маски зелёного текста одной надписи ($7,500 -> 7500). Запятая отбрасывается.
+    dollar=False - число без знака доллара (цены и жетоны в Research Shop)."""
     comps = _components(m)
     if not comps:
         return None
@@ -922,6 +923,9 @@ def _read_green_number(m, tol=0.16):
     if h < 6:
         return None
     comps = sorted((c for c in comps if c[3] - c[1] >= 0.6 * h), key=lambda c: c[0])
+    if not dollar and comps:
+        top = sorted(c[1] for c in comps)[len(comps) // 2]
+        comps = [c for c in comps if c[1] <= top + 0.3 * h]      # запятая начинается с середины строки
     templates = _get_templates()
     glyphs = []
     for x0, y0, x1, y1 in comps:
@@ -950,12 +954,18 @@ def _read_green_number(m, tol=0.16):
         v = np.asarray(small, dtype=np.float32) / 255.0
         best, score = None, 1e9
         for ch, (tv, ta) in templates.items():
+            if ch == "$" and not dollar:
+                continue
             sc = float(((v - tv) ** 2).mean()) + 0.6 * (asp - ta) ** 2
             if sc < score:
                 best, score = ch, sc
         if score > tol:
             return None
         chars.append(best)
+    if not dollar:
+        if not chars or "$" in chars:
+            return None
+        chars = ["$"] + chars
     if len(chars) < 2 or chars[0] != "$" or "$" in chars[1:]:
         return None
     try:
@@ -1193,6 +1203,156 @@ def _blobs_green_buttons(img):
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
     return [x for x in _blobs((g > 100) & (g - r > 55) & (g - b > 55))
             if 0.07 <= x["w"] <= 0.30 and 0.035 <= x["h"] <= 0.14 and x["cy"] > 0.5]
+
+
+# ---------- Research Shop (сток в хабе) ----------
+
+STOCK_FRAME_W = 0.6422       # ширина фиолетовой рамки окна Sample Exchange / Research Shop в долях экрана (16:9)
+STOCK_TAB = (0.1157, 0.0893)         # кнопка RESEARCH SHOP / SAMPLE EXCHANGE - в долях рамки
+STOCK_ALL = (0.579, 0.867)           # кнопка ALL на вкладке Sample Exchange
+STOCK_EXCHANGE = (0.8025, 0.867)     # кнопка EXCHANGE
+STOCK_TOKENS_BOX = (0.045, 0.195, 0.215, 0.255)   # число YOUR TOKENS
+STOCK_SIG = (96, 10)                 # размер отпечатка названия предмета
+# предметы со скриншота магазина: ключ -> (название, отпечаток названия на снимке 2557x1437)
+STOCK_KNOWN = {
+    "sound_enhancer": ("Sound Enhancer",
+        "158.993:a67f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f97917f8fa77f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f97917f8fa77f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f98927f8fa77f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f98927f8fa87f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f808281807f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f99937f8fa87e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7f8288908a837f7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e99937e8f825763899394845f69838c93897e6997925957899d76a59068609c8b639ea29593897a5f575768a8a399998981a6876369a6786ea6755d639e8a57576a9b9e6d585d92a2755b839f645d7a8791907d6ea5a59a998b7ea79d95907e5e726c57672700239c9f9ba24a91ad595164c071a7bb2d23a0c457f2b6767be99f20dbb751517dc240000032fadfaaa7527bf3a27190f56543f3975b6ce99a0546a6a8a2af4b1ab7e6846dc0e12440bd7c51504539f1e5aba7596ef3a687c79f191710000b7b4e5c829498926d69858a9388805e658791938e766aac745773a38d5ca4a89592887a584e4e64afaa9a988680a8665981aa7769ad75555da48a659c89757585a06d969b566493a45d577b88918f7969acab9b98887dab786a9b89576a644e5dad7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f80839b947f8d"),
+    "detachable_knife": ("Detachable Knife",
+        "166.993:9f8c7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7fa67f7fa08d7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7fa67f7fa08d7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7fa87f7fa08d7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7fa87f7fa08d7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f808182807f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7fa97f7f9f8e7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f81848c8f8682807f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7faa7f7f7da698908c836f6ba69d949483738f97a4978b6665959a6c57586d838b8d80678798605a75a06756597c9f885d566aa09c9595886390985d565667a49e9494845756588996616c867f679c936c58928e639a8d68a59d9392838ca498949256565bed824c5499aa55fbd1a4a14b12275ee55b2c4c9da69cac512e9f98504f4a239adf695896ec35196cb190b5852942ebcca8bdcd49b7d93a261a34f5d5a5a24f000006a1e3839e86382cddc47a6bd8b12ad9ae38f9be817f32aaf3b6a27c00007ead9b8f8a836e67ada29493804d4d64a3626194877171809b6b6b838a8c7d61889d5b5274a7657c9779707494886ca7a19597946d93a997948061aba39493814e4d508a9e60688d8b6aa27f54679b905da09063ac7d56564f8eab9b93934d4da48f807f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f8280ac7f7f"),
+    "amplifier_knives": ("Amplifier Knives",
+        "156.993:8080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080805b5b5b5b5b69989d705c5f8fa1735d5d74a18d7ea49a938f7f86a66b5b5b619b946aa5a19695878ca16997a599979375a19e949187655b5b5d8b99656f89826b9e97705d9492679d916e9b835e5c809692a79c9796746c8a93917c5f5b5b5b5b0606060e46a0ab9fb05920aee78d6b698ae7a979eba582978696f85d2d281fd2bc38f2c887843e9fe635c7eeafa68343e7ba86afc03607060da3e589a28c4032ddc78071d9b630d9b3115ea981769c4a95f8c0a6962f42a19c9e932e06060606555555679a8e787886a174949d5e76735e9f9280a97b68625a81b1a09a9063a29a67ae895d5d578da9669eae9d999573aa886c8c9a6355555890a3686f939171a6875b6d9f9764a596555672a7a4685587b1a2999872688797988d6755555555808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080"),
+    "rocket_launcher": ("Rocket Launcher",
+        "164.993:8080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080807c8e8f8e867a717077818b897e7370757f8a8b80768589717484857a908f8e8e86808d8f908f8c77707c90787070707071828e7d70748c81717087877e8e7f71758d8070737d868c8478808c7670778e7c7d908f8e8e8284908e8c827570707063efb794b8ad3145b7836464a29849a59a64635b34aedc789e893f4dfdd1a9a558315687ec80501d0b64fd5516150d1868bdb5b75231d2961c16c0b677efbd7171e983178dab6a64613886e778547cf06470fdc5a79e4da7e9999fc47c110b0b6ad18667ab9c3d478f878784917649818f8585704ba2c263789b7e69dbc3a9a776282857c74e2828286bdba89287427fad82728ab46e75988a88a27172ce6c518acb812f6f9384887a4f84ca69496cd26b73dbbba8a36a9cc3667fb96f2b28287f827f7e80827f7e7e7f82807e7e7e7e7e80827f7e80827e7e80828083838383827e7e7f827f7e7e7e7f838383827f827f7e7e7e82827e7e80827e7e7f827f7e7e82807e7e7e80827f7e80827f7e7f827f7f838383838080827e7e82827e7e7e"),
+    "toilet_rolls": ("Toilet Rolls x1,000",
+        "169.992:95897f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f997f7f95897f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f997f7f95897f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f997f7f95897f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f9a7f7f95897f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f9b7f7f94887f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f8082888b83807f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f997f7f7c999aa0a09c97976c677e8a90958d887760659da088578ba09b635757575d94a09e98979797697e97989ea09f98988757575773a0a09a97948c7e63575b6d858b93948c866e5c75a0a0705757575788a09c655757575765828c92958c805757495672d7d79d52526eb7c987575460a3c9a15fcfd79d2da5d7ca4b2f2f2e3bbbd7cca19f9f8b38445256bbd7c35e52482d2d2d6ed7d7a07f8bc7c37a387bc1bf6d545469bdc2847ad7d7682f2f2f2e9fd7ce502f2f2e3067adb19992917f3b2f4a3c54c3c3833232487fa3958283869f9b6b54bbc3913298c3be8f85857946abc3bba09f9f9849323236a4c3ad3f323232323269c3c38b729bbf9d4f35548aa68b828389a68d596fc3c39a8585854693c3bf9185857b3e568b8a979daf9252368d7f7988888074747474797e8488827d777478888882748288888888888678858888888888887a7474758488857674747474747c88887c747986887f7574757b808686807c75747c888888888888798288888888888677787e828788808f7474"),
+}
+
+
+def _purple_mask(a):
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    return (b > 140) & (r > 80) & (b - g > 70) & (r - g > 30)
+
+
+def stock_frame(img):
+    """Фиолетовая рамка окна Sample Exchange / Research Shop: (x0, y0, x1, y1) в долях экрана или None."""
+    w, h = img.size
+    a = np.asarray(img.convert("RGB").resize((640, max(1, round(640 * h / w))), Image.BILINEAR)).astype(np.int16)
+    big = [x for x in _blobs(_purple_mask(a)) if x["w"] > 0.3 or x["h"] > 0.3]
+    if not big:
+        return None
+    # на маленьком экране тонкая рамка рвётся на куски - беру общий охват крупных кусков
+    x0 = min(x["cx"] - x["w"] / 2 for x in big)
+    x1 = max(x["cx"] + x["w"] / 2 for x in big)
+    y0 = min(x["cy"] - x["h"] / 2 for x in big)
+    y1 = max(x["cy"] + x["h"] / 2 for x in big)
+    if x1 - x0 < 0.45 or y1 - y0 < 0.4 or x1 - x0 > 0.85:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def stock_point(frame, rel):
+    return (frame[0] + rel[0] * (frame[2] - frame[0]), frame[1] + rel[1] * (frame[3] - frame[1]))
+
+
+def _white_number(a, thr=215):
+    """Число белыми цифрами на тёмном фоне (без знака доллара); полоски рамок по краям отбрасываются."""
+    m = a.min(axis=2) > thr
+    H = m.shape[0]
+    for x0, y0, x1, y1 in _components(m):
+        if y1 - y0 > 0.85 * H or y1 - y0 < 0.25 * H and (x1 - x0) > 3 * (y1 - y0):
+            m[y0:y1, x0:x1] = False
+    if m.sum() < 12 or m.mean() > 0.5:
+        return None
+    return _read_green_number(m, tol=0.22, dollar=False)
+
+
+def stock_tokens(img, frame):
+    """Сколько жетонов (YOUR TOKENS) или None."""
+    w, h = img.size
+    p0, p1 = stock_point(frame, STOCK_TOKENS_BOX[:2]), stock_point(frame, STOCK_TOKENS_BOX[2:])
+    a = np.asarray(img.crop((int(p0[0] * w), int(p0[1] * h), int(p1[0] * w), int(p1[1] * h))).convert("RGB")).astype(np.int16)
+    return _white_number(a)
+
+
+def _name_sig(gray, unit):
+    """Отпечаток названия предмета (белый текст в нижней части картинки): (ширина надписи, вектор).
+    Название всегда растянуто на всю ширину картинки, поэтому полоса берётся целиком, без подгонки."""
+    m = gray > 232
+    lines = m.mean(axis=0) > 0.45                    # вертикальные линии рамки картинки
+    m[:, lines] = False
+    if m.sum() < 20:
+        return None
+    cols = np.nonzero(m.sum(0) >= 2)[0]
+    band = np.clip(gray.astype(np.float32) - 170, 0, 85) * 3
+    band[:, lines] = 0
+    small = Image.fromarray(band.astype(np.uint8)).resize(STOCK_SIG, Image.BILINEAR)
+    v = np.asarray(small, dtype=np.float32)
+    v = (v - v.mean(axis=1, keepdims=True)).ravel()     # без общей «полосы текста»: важен только рисунок букв
+    n = float(np.linalg.norm(v))
+    if n < 1e-3:
+        return None
+    return (cols.max() + 1 - cols.min()) / unit if len(cols) else 0.0, v / n
+
+
+def sig_to_hex(sig):
+    asp, v = sig
+    q = np.clip(np.round(v * 800 + 128), 0, 255).astype(np.uint8)
+    return f"{asp:.3f}:" + q.tobytes().hex()
+
+
+def sig_from_hex(text):
+    try:
+        asp, hx = text.split(":")
+        v = np.frombuffer(bytes.fromhex(hx), dtype=np.uint8).astype(np.float32) - 128
+        return float(asp), v / max(1e-3, float(np.linalg.norm(v)))
+    except Exception:
+        return None
+
+
+def sig_match(a, b):
+    """Похожесть двух отпечатков названий (1 - одинаковые)."""
+    if a is None or b is None:
+        return 0.0
+    # надпись может съехать на пиксель-другой - пробую небольшие сдвиги по горизонтали
+    A = a[1].reshape(STOCK_SIG[1], STOCK_SIG[0])
+    return max(float((np.roll(A, dx, axis=1).ravel() * b[1]).sum()) for dx in (-3, -2, -1, 0, 1, 2, 3))
+
+
+def stock_cards(img, frame):
+    """Карточки Research Shop: список словарей по одной на товар.
+    state: buy (зелёная BUY) / sold (красная SOLD OUT); pt - центр кнопки; price; sig; box - картинка товара (пиксели)."""
+    w, h = img.size
+    sw = 960
+    a = np.asarray(img.convert("RGB").resize((sw, max(1, round(sw * h / w))), Image.BILINEAR)).astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    fw = frame[2] - frame[0]
+    bw = 0.0889 * fw                               # ширина кнопки BUY в долях экрана
+    found = []
+    for state, mask in (("buy", (g > 100) & (g - r > 55) & (g - b > 55)),
+                        ("sold", (r > 150) & (r - g > 80) & (r - b > 60))):
+        for x in _blobs(mask):
+            if (0.6 * bw <= x["w"] <= 1.35 * bw and 0.25 * x["w"] <= x["h"] * h / w <= 0.65 * x["w"]
+                    and frame[0] + 0.3 * fw < x["cx"] < frame[2] and frame[1] < x["cy"] < frame[3]):
+                found.append((state, x))
+    full = np.asarray(img.convert("RGB")).astype(np.int16)
+    u = fw * w / 1642.0                            # масштаб окна относительно снимка 2557x1437
+    cards = []
+    for state, x in found:
+        bx, by = x["cx"] * w, x["cy"] * h
+        card = {"state": state, "pt": (x["cx"], x["cy"]), "price": None, "sig": None}
+        # цена: белые цифры справа от значка жетона, над кнопкой
+        px0, px1, py0, py1 = int(bx - 76 * u), int(bx + 85 * u), int(by - 128 * u), int(by - 84 * u)
+        if py0 >= 0 and px0 >= 0:
+            card["price"] = _white_number(full[py0:py1, px0:px1])
+        # картинка товара слева от кнопки; название - белый текст внизу картинки
+        cx0, cx1, cy0, cy1 = int(bx - 278 * u), int(bx - 82 * u), int(by - 225 * u), int(by + 31 * u)
+        card["box"] = (max(0, cx0), max(0, cy0), cx1, cy1)
+        nx0, nx1, ny0, ny1 = int(bx - 265 * u), int(bx - 92 * u), int(by - 75 * u), int(by - 8 * u)
+        if ny0 >= 0 and nx0 >= 0:
+            card["sig"] = _name_sig(full[ny0:ny1, nx0:nx1].min(axis=2), u)
+        cards.append(card)
+    cards.sort(key=lambda c: (round(c["pt"][1] * 8), c["pt"][0]))
+    return cards
 
 
 def open_private_link():
@@ -1614,8 +1774,61 @@ DEFAULT_SETTINGS = {
     "notify_screens": True,
     "notify_actions": True,      # постановки, прокачки, голосование, Rejoin
     "total_matches": 0,
+    "stock_enabled": False,      # раз в час между матчами заходить в Research Shop и скупать сток
+    "stock_sell_trash": True,    # сдавать все образцы (ALL -> EXCHANGE) перед покупкой
+    "stock_buy_new": False,      # покупать предметы, которых бот раньше не видел
+    "stock_min_tokens": 0,       # сколько жетонов всегда оставлять
+    "stock_last": "",            # час последней проверки стока ("2026-11-15 14")
+    "stock_items": {},           # предметы: ключ -> {name, buy, sigs, price}
 }
 SETTINGS = dict(DEFAULT_SETTINGS)
+
+
+def stock_items():
+    """Список предметов стока из настроек; при первом обращении дополняется известными предметами."""
+    items = SETTINGS.get("stock_items")
+    if not isinstance(items, dict) or items is DEFAULT_SETTINGS["stock_items"]:
+        items = {}                   # не трогаю словарь из DEFAULT_SETTINGS
+    for key, (name, sig) in STOCK_KNOWN.items():
+        it = items.setdefault(key, {"name": name, "buy": True, "sigs": [], "price": None})
+        if sig not in it.setdefault("sigs", []):
+            it["sigs"].insert(0, sig)
+    SETTINGS["stock_items"] = items
+    return items
+
+
+def stock_identify(sig):
+    """Какой это предмет: (ключ, похожесть). Ключ None - такого ещё не видели."""
+    scores = []
+    for key, it in list(stock_items().items()):
+        best = max((sig_match(sig_from_hex(h), sig) for h in it.get("sigs", [])), default=0.0)
+        scores.append((best, key))
+    scores.sort(reverse=True)
+    if not scores or scores[0][0] < 0.55:
+        return None, scores[0][0] if scores else 0.0
+    if len(scores) > 1 and scores[0][0] - scores[1][0] < 0.08:
+        return None, scores[0][0]
+    return scores[0][1], scores[0][0]
+
+
+def stock_circle(img):
+    """Фиолетовый круг под NPC (SAMPLES) в Research Sector: самое большое фиолетовое пятно вне меню и панели."""
+    w, h = img.size
+    a = np.asarray(img.convert("RGB").resize((LOBBY_W, max(1, round(LOBBY_W * h / w))), Image.BOX)).astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    blobs = [x for x in _blobs((b > 150) & (r > 90) & (b - g > 80) & (r - g > 40))
+             if x["area"] > 0.0005 and x["cy"] < 0.78 and x["cy"] > 0.08 and not (x["cx"] < 0.18 and x["cy"] > 0.2)]
+    if not blobs:
+        return None
+    big = blobs[0]
+    # вблизи кольцо распадается на дуги (его перекрывает персонаж) - объединяю куски рядом с самым большим
+    near = [x for x in blobs if abs(x["cx"] - big["cx"]) < 0.16 and abs(x["cy"] - big["cy"]) < 0.14
+            and x["area"] > 0.15 * big["area"]]
+    x0 = min(x["cx"] - x["w"] / 2 for x in near)
+    x1 = max(x["cx"] + x["w"] / 2 for x in near)
+    y0 = min(x["cy"] - x["h"] / 2 for x in near)
+    y1 = max(x["cy"] + x["h"] / 2 for x in near)
+    return {"cx": (x0 + x1) / 2, "cy": (y0 + y1) / 2, "w": x1 - x0, "h": y1 - y0, "area": sum(x["area"] for x in near)}
 
 
 # ---------- автообновление с GitHub ----------
@@ -1921,6 +2134,7 @@ class DiscordLink:
     def stats_fields(self):
         up = time.time() - STATS.started_at if STATS.started_at else 0
         f = [("Состояние", {"idle": "⏸ остановлен", "waiting": "⏳ лобби / загрузка", "running": "▶ фармит",
+                             "stock": "🛒 проверяет сток",
                              "stopping": "⏹ останавливается"}.get(STATS.state, STATS.state)),
              ("Режим", MODES[mode_key()]["title"]),
              ("Матчей", f"{STATS.matches} (всего {STATS.total_matches})"),
@@ -3763,6 +3977,333 @@ class Bot:
             self.sleep(0.5)
         return False
 
+    # --- сток в хабе (Research Shop) ---
+
+    def stock_due(self):
+        """Пора ли проверить сток: он обновляется в начале каждого часа, проверяю раз в час между матчами."""
+        if not SETTINGS.get("stock_enabled"):
+            return False
+        if not SERVER_LINK:
+            if not getattr(self, "stock_nolink", False):
+                self.stock_nolink = True
+                log("сток: не задана ссылка приватного сервера - в хаб зайти не смогу, проверку пропускаю")
+            return False
+        return time.strftime("%Y-%m-%d %H") != SETTINGS.get("stock_last")
+
+    def stock_snap(self, tag):
+        try:
+            d = os.path.join(HERE, "stock_debug")
+            os.makedirs(d, exist_ok=True)
+            self.grab().convert("RGB").save(os.path.join(d, tag + ".jpg"), quality=80)
+        except Exception:
+            pass
+
+    def stock_trip(self):
+        """Между матчами: перезайти на приватку, дойти до NPC с образцами, сдать мусор, скупить сток."""
+        SETTINGS["stock_last"] = time.strftime("%Y-%m-%d %H")     # сразу: при неудаче не повторять каждый матч
+        save_settings()
+        STATS.state = "stock"
+        log("=== сток: перезахожу на приватный сервер и иду в Research Shop ===")
+        t0 = time.perf_counter()
+        try:
+            self.relaunch_private()
+            result = self.stock_run()
+        except Aborted:
+            raise
+        except MatchEnded:
+            result = "игра перезапустилась по дороге"
+        except Exception as e:
+            result = f"ошибка: {e!r}"
+        if result is not True:
+            log(f"сток: не получилось ({result}) - продолжаю фарм, следующая попытка через час")
+            self.stock_snap("fail")
+            LINK.send("🛒 Сток: не получилось", f"{result}. Продолжаю фарм, следующая попытка через час.",
+                      COLOR_WARN, grab_game_window())
+        log(f"сток: заняло {_fmt_dur(time.perf_counter() - t0)}")
+
+    def stock_wait_lobby(self, timeout=200):
+        """Дождаться лобби после перезахода (слева видна иконка TELEPORT)."""
+        end = time.perf_counter() + timeout
+        hits, idle = 0, time.perf_counter()
+        while time.perf_counter() < end:
+            self.check()
+            if self.end_screen() or self.money() is not None or self.vote_screen():
+                return None
+            view = analyze_screen(self.grab())
+            if view["tp_icon"] and not view["button"]:
+                hits += 1
+                if hits >= 3:
+                    return view["tp_icon"]
+            else:
+                hits = 0
+                if time.perf_counter() - idle > 4:
+                    self.click(IDLE_POINT, dwell=0.1)        # окно с наградой / загрузка
+                    idle = time.perf_counter()
+            self.sleep(0.6)
+        return None
+
+    def stock_teleport(self, icon):
+        """Меню TELEPORT -> Research Sector -> Teleport."""
+        self.tp_icon_pt = (icon["cx"], icon["cy"])
+        frame = None
+        for attempt in range(5):
+            frame = _menu_frame(self.grab())
+            if frame:
+                break
+            if attempt == 2 and self.toggle_chat():
+                log("сток: меню телепорта не открывается - закрываю чат Roblox")
+                self.sleep(1.0)
+            self.click(self.tp_icon_pt, dwell=0.35)
+            self.sleep(1.5)
+        if not frame:
+            return False
+        x0, y0 = frame["cx"] - frame["w"] / 2, frame["cy"] - frame["h"] / 2
+        card = (x0 + 0.25 * frame["w"], y0 + 0.297 * frame["h"])      # вторая строка списка: RESEARCH SECTOR
+        log(f"сток: меню телепорта -> Research Sector ({card[0]:.3f}, {card[1]:.3f}) -> Teleport")
+        btn = None
+        for attempt in range(6):
+            if attempt in (0, 3):
+                self.click(card, dwell=0.35)
+                self.sleep(1.0)
+            btn = next((x for x in _blobs_green_buttons(self.grab()) if x["cx"] > 0.5), None)
+            if btn:
+                break
+            self.sleep(0.4)
+        self.stock_snap("1_menu")
+        if btn:
+            self.click((btn["cx"], btn["cy"]), dwell=0.35)
+        else:
+            # зелёной кнопки нет: либо уже стоим в Research Sector, либо её не видно - жму в её место
+            log("сток: зелёной кнопки Teleport не вижу - жму в её место")
+            self.click(self.tp_button_estimate(), dwell=0.35)
+        self.sleep(5.0)
+        if _menu_frame(self.grab()):
+            self.close_tp_menu()
+        return True
+
+    def stock_walk_to_npc(self):
+        """После телепорта: повернуть камеру налево на 90 градусов, найти фиолетовый круг (SAMPLES) и дойти до него.
+        Возвращает рамку открывшегося окна или None."""
+        quarter = abs(self.px_per_deg) * 90
+        self.turn_camera(-quarter)
+        self.stock_snap("2_turned")
+        circle = None
+        for turn in range(4):
+            circle = stock_circle(self.grab())
+            if circle:
+                break
+            log("сток: фиолетового круга не видно - поворачиваю камеру ещё на 90 градусов")
+            self.turn_camera(-quarter)
+        if not circle:
+            return None
+        log(f"сток: вижу круг NPC ({circle['cx']:.2f}, {circle['cy']:.2f}) - иду к нему")
+        lost, prev, talks = 0, None, 0
+        for step in range(45):
+            circle = stock_circle(self.grab())
+            if not circle:
+                lost += 1
+                if lost >= 4:
+                    break
+                self.walk_forward(0.25, jump=True)
+                continue
+            lost = 0
+            dx = circle["cx"] - 0.5
+            close = circle["cy"] > 0.40 or circle["w"] > 0.115
+            if abs(dx) > (0.07 if close else 0.04):
+                self.turn_camera(dx * 100 * abs(self.px_per_deg) * 0.8)
+                if step < 6 and abs(dx) > 0.15:
+                    continue
+            if close:
+                frame = self.stock_talk()
+                if frame:
+                    return frame
+                talks += 1
+                if talks >= 6:
+                    break
+                self.walk_forward(0.25, jump=talks % 2 == 0)
+                continue
+            stuck = prev is not None and abs(circle["cy"] - prev[0]) < 0.004 and abs(circle["w"] - prev[1]) < 0.006
+            prev = (circle["cy"], circle["w"])
+            self.walk_forward(0.4 if circle["cy"] < 0.3 else 0.22, jump=stuck)
+        # круг потерян (стоим прямо на нём или NPC его закрыл) - пробую поговорить там, где стою
+        for _ in range(2):
+            frame = self.stock_talk()
+            if frame:
+                return frame
+            self.walk_forward(0.3)
+        return None
+
+    def stock_talk(self):
+        """Зажать E у NPC, два клика пропустить диалог; вернуть рамку окна Sample Exchange или None."""
+        self.hold_keys("e", 1.6)
+        self.sleep(0.5)
+        for _ in range(2):
+            frame = stock_frame(self.grab())
+            if frame:
+                return frame
+            self.click((0.548, 0.66), dwell=0.12)            # окно диалога «Click to skip»
+            self.sleep(0.6)
+        end = time.perf_counter() + 2.5
+        while time.perf_counter() < end:
+            frame = stock_frame(self.grab())
+            if frame:
+                return frame
+            self.sleep(0.3)
+        return None
+
+    def stock_run(self):
+        """Вся прогулка за стоком. True - дошли до магазина; иначе строка с причиной."""
+        icon = self.stock_wait_lobby()
+        if not icon:
+            return "не дождался лобби после перезахода"
+        self.sleep(2.0)
+        if not self.stock_teleport(icon):
+            return "не открылось меню телепорта"
+        frame = self.stock_walk_to_npc()
+        if not frame:
+            return "не дошёл до NPC с образцами (окно обмена не открылось)"
+        self.sleep(0.8)
+        self.stock_snap("3_exchange")
+        self.hover(IDLE_POINT)
+        self.sleep(0.2)
+        img = self.grab()
+        frame = stock_frame(img) or frame
+        tokens = stock_tokens(img, frame)
+        lines = []
+        in_shop = bool(stock_cards(img, frame))
+        if SETTINGS.get("stock_sell_trash", True) and not in_shop:
+            log("сток: сдаю образцы (ALL -> EXCHANGE)")
+            self.click(stock_point(frame, STOCK_ALL), dwell=0.2)
+            self.sleep(0.7)
+            self.click(stock_point(frame, STOCK_EXCHANGE), dwell=0.2)
+            self.sleep(1.5)
+            self.hover(IDLE_POINT)
+            self.sleep(0.3)
+            after = stock_tokens(self.grab(), frame)
+            if tokens is not None and after is not None and after != tokens:
+                log(f"сток: образцы сданы, жетонов {tokens} -> {after}")
+                lines.append(f"Сдал образцы: +{after - tokens} жетонов")
+            else:
+                log(f"сток: сдавать нечего (жетонов {after if after is not None else '?'})")
+            if after is not None:
+                tokens = after
+        # вкладка Research Shop (та же кнопка в магазине возвращает обратно - жму, только пока карточек нет)
+        cards = []
+        for attempt in range(4):
+            img = self.grab()
+            frame = stock_frame(img) or frame
+            cards = stock_cards(img, frame)
+            if cards:
+                break
+            if attempt in (0, 2):
+                self.click(stock_point(frame, STOCK_TAB), dwell=0.2)
+                self.hover(IDLE_POINT)
+            self.sleep(1.2)
+        if not cards:
+            self.stock_close(frame)
+            return "не открылась вкладка Research Shop"
+        self.sleep(0.5)
+        img = self.grab()
+        cards = stock_cards(img, frame)
+        tokens = stock_tokens(img, frame) or tokens
+        self.stock_snap("4_shop")
+        keep = int(SETTINGS.get("stock_min_tokens") or 0)
+        log(f"сток: магазин открыт, жетонов {tokens if tokens is not None else '?'}, товаров {len(cards)}, "
+            f"оставлять не меньше {keep}")
+        items = stock_items()
+        bought = []
+        for n, card in enumerate(cards, 1):
+            key = None
+            if card["sig"] is not None:
+                key, score = stock_identify(card["sig"])
+                if key is None:
+                    num = 1 + sum(1 for k in items if k.startswith("item"))
+                    key = f"item{num}"
+                    while key in items:
+                        num += 1
+                        key = f"item{num}"
+                    items[key] = {"name": f"Новый предмет {num}", "buy": bool(SETTINGS.get("stock_buy_new")),
+                                  "sigs": [sig_to_hex(card["sig"])], "price": card["price"]}
+                    log(f"сток: товар {n} - новый предмет (похожесть на известные {score:.2f}), записал как "
+                        f"«{items[key]['name']}»; картинка: stock\\{key}.png")
+                elif score < 0.85 and len(items[key]["sigs"]) < 4:
+                    items[key]["sigs"].append(sig_to_hex(card["sig"]))   # так название выглядит на этом экране
+                try:
+                    d = os.path.join(HERE, "stock")
+                    os.makedirs(d, exist_ok=True)
+                    path = os.path.join(d, key + ".png")
+                    if not os.path.exists(path):
+                        img.crop(card["box"]).convert("RGB").save(path)
+                except Exception:
+                    pass
+            it = items.get(key) if key else None
+            name = it["name"] if it else f"товар {n} (название не прочиталось)"
+            price = card["price"]
+            if it is not None and price is not None:
+                it["price"] = price
+            ptxt = f"{price}" if price is not None else "?"
+            if card["state"] != "buy":
+                log(f"сток: {name} - уже куплен (SOLD OUT)")
+                continue
+            want = bool(it["buy"]) if it else bool(SETTINGS.get("stock_buy_new"))
+            if not want:
+                log(f"сток: {name} за {ptxt} - пропускаю (выключен в настройках)")
+                continue
+            if keep > 0 and (tokens is None or price is None):
+                log(f"сток: {name} за {ptxt} - не покупаю: не прочитал жетоны или цену, а задан минимальный запас")
+                lines.append(f"✖ {name}: не прочитал цену/жетоны")
+                continue
+            if tokens is not None and price is not None and tokens - price < keep:
+                log(f"сток: {name} за {price} - не покупаю: останется {tokens - price}, а нужно не меньше {keep}")
+                lines.append(f"✖ {name} ({price}): не хватает жетонов сверх запаса")
+                continue
+            ok = False
+            for attempt in range(2):
+                self.click(card["pt"], dwell=0.2)
+                self.hover(IDLE_POINT)
+                self.sleep(1.2)
+                now = stock_cards(self.grab(), frame)
+                same = [c for c in now if abs(c["pt"][0] - card["pt"][0]) < 0.03 and abs(c["pt"][1] - card["pt"][1]) < 0.04]
+                if same and same[0]["state"] == "sold":
+                    ok = True
+                    break
+            left = stock_tokens(self.grab(), frame)
+            if not ok and left is not None and tokens is not None and left < tokens:
+                ok = True
+            if ok:
+                log(f"сток: КУПИЛ {name} за {ptxt}" + (f", жетонов осталось {left}" if left is not None else ""))
+                bought.append(name)
+                lines.append(f"✔ {name} ({ptxt})")
+            else:
+                log(f"сток: {name} за {ptxt} - нажал BUY, но кнопка не стала SOLD OUT (не хватило жетонов?)")
+                lines.append(f"✖ {name} ({ptxt}): покупка не прошла")
+            if left is not None:
+                tokens = left
+            elif ok and tokens is not None and price is not None:
+                tokens -= price
+        SETTINGS["stock_items"] = items
+        save_settings()
+        self.stock_snap("5_done")
+        shot = grab_game_window()
+        self.stock_close(frame)
+        title = f"🛒 Сток: куплено {len(bought)}" if bought else "🛒 Сток: ничего не купил"
+        if tokens is not None:
+            lines.append(f"Жетонов: {tokens}")
+        LINK.send(title, "\n".join(lines), COLOR_OK if bought else COLOR_INFO, shot)
+        return True
+
+    def stock_close(self, frame):
+        """Закрыть окно магазина крестиком в правом верхнем углу рамки."""
+        for _ in range(3):
+            self.click((frame[2] - 0.002, frame[1] + 0.005), dwell=0.25)
+            self.hover(IDLE_POINT)
+            self.sleep(1.0)
+            now = stock_frame(self.grab())
+            if not now:
+                return True
+            frame = now
+        return False
+
     def press_rejoin(self):
         self.rejoined_at = time.perf_counter()
         report("🔁 Rejoin", "Перезапускаю матч", COLOR_INFO)
@@ -4116,6 +4657,9 @@ class Bot:
                     LINK.send("Обновление", f"Установлена версия {new}, перезапускаюсь и продолжаю фарм.", COLOR_OK)
                     time.sleep(1.5)
                     restart_app(resume=True)
+            if done and self.stock_due():
+                self.stock_trip()
+                STATS.state = "waiting"
             self.check()
             if not self.to_match_start():
                 stuck = getattr(self, "stuck", 0) + 1
@@ -4286,7 +4830,7 @@ class FarmApp:
         self.mode_sub = self.label(t, "Invaded City", 8, "muted", bg="side")
         self.mode_sub.pack(anchor="w")
         for key, icon, name in [("home", "⌂", "Главная"), ("settings", "⚙", "Настройки"),
-                                ("discord", "✉", "Discord"), ("log", "≡", "Журнал")]:
+                                ("stock", "🛒", "Сток"), ("discord", "✉", "Discord"), ("log", "≡", "Журнал")]:
             b = tk.Label(side, text=f"  {icon}   {name}", anchor="w", font=(FONT, 11), fg=C["muted"],
                          bg=C["side"], padx=14, pady=10, cursor="hand2")
             b.pack(fill="x", padx=10, pady=2)
@@ -4302,6 +4846,7 @@ class FarmApp:
         self.current = None
         self._page_home()
         self._page_settings()
+        self._page_stock()
         self._page_discord()
         self._page_log()
 
@@ -4611,6 +5156,103 @@ class FarmApp:
         self.saved_lbl = self.label(bar, "", 9, "accent", bg="bg")
         self.saved_lbl.pack(side="left", padx=12)
 
+    # --- Сток ---
+    def _page_stock(self):
+        p = self.scroll_page("stock")
+        self.header(p, "Сток", "Research Shop в хабе: сток обновляется в начале каждого часа")
+        s = self.section(p, "Автоскуп")
+        self.switch(s, "stock_enabled", "Проверять сток",
+                    "Раз в час между матчами бот перезаходит на приватный сервер, идёт в Research Sector "
+                    "к NPC с образцами и покупает отмеченные ниже предметы. Нужна ссылка приватного сервера.")
+        self.switch(s, "stock_sell_trash", "Сдавать образцы перед покупкой",
+                    "На вкладке Sample Exchange нажимает ALL и EXCHANGE - все образцы меняются на жетоны")
+        self.switch(s, "stock_buy_new", "Покупать новые предметы",
+                    "Предметы, которых бот ещё не видел. Выключено - он только добавит их в список ниже")
+        self.entry(s, "stock_min_tokens", "Сколько жетонов оставлять",
+                   "Бот не купит предмет, если после покупки останется меньше. 0 — тратить всё", width=10)
+        bar = self.tk.Frame(s, bg=C["card"])
+        bar.pack(fill="x", padx=18, pady=(4, 16))
+        self.flat_button(bar, "Сохранить", self.save).pack(side="left")
+        self.flat_button(bar, "Проверить после этого матча", self.stock_now, color="card2", fg=C["text"]).pack(
+            side="left", padx=10)
+        self.stock_lbl = self.label(bar, "", 9, "muted")
+        self.stock_lbl.pack(side="left", padx=4)
+        s = self.section(p, "Предметы")
+        self.label(s, "Галочка — покупать. Новые предметы появляются здесь после того, как бот увидит их в магазине; "
+                   "название можно исправить (Enter — сохранить).", 8, "muted", wraplength=600,
+                   justify="left").pack(anchor="w", padx=18, pady=(0, 8))
+        self.stock_box = self.tk.Frame(s, bg=C["card"])
+        self.stock_box.pack(fill="x", padx=18, pady=(0, 14))
+        self.stock_imgs = {}
+        self.stock_shown = None
+        self._stock_rows()
+
+    def stock_now(self):
+        SETTINGS["stock_last"] = ""
+        save_settings()
+        self.stock_lbl.configure(text="проверю сток после ближайшего матча" if SETTINGS.get("stock_enabled")
+                                 else "сначала включи «Проверять сток» и сохрани")
+
+    def _stock_rows(self):
+        """Перерисовать список предметов стока (галочка «покупать», картинка, название, цена)."""
+        tk = self.tk
+        items = stock_items()
+        self.stock_shown = tuple((k, v.get("price")) for k, v in items.items())
+        for w in self.stock_box.winfo_children():
+            w.destroy()
+        for key, it in list(items.items()):
+            row = tk.Frame(self.stock_box, bg=C["card2"])
+            row.pack(fill="x", pady=3)
+            var = tk.BooleanVar(value=bool(it.get("buy")))
+
+            def flip(*_, k=key, v=var):
+                cur = stock_items()
+                if k in cur:
+                    cur[k]["buy"] = bool(v.get())
+                    save_settings()
+            cb = tk.Checkbutton(row, variable=var, command=flip, bg=C["card2"], activebackground=C["card2"],
+                                selectcolor=C["entry"], fg=C["accent"], activeforeground=C["accent"],
+                                bd=0, highlightthickness=0, cursor="hand2")
+            cb.pack(side="left", padx=(10, 6), pady=6)
+            pic = self.stock_imgs.get(key)
+            if pic is None:
+                try:
+                    from PIL import ImageTk
+                    im = Image.open(os.path.join(HERE, "stock", key + ".png")).convert("RGB")
+                    im.thumbnail((58, 76))
+                    pic = self.stock_imgs[key] = ImageTk.PhotoImage(im)
+                except Exception:
+                    pic = None
+            if pic is not None:
+                tk.Label(row, image=pic, bg=C["card2"]).pack(side="left", padx=(0, 10), pady=4)
+            name = tk.StringVar(value=str(it.get("name", key)))
+
+            def rename(*_, k=key, v=name):
+                cur = stock_items()
+                text = v.get().strip()
+                if k in cur and text and text != cur[k].get("name"):
+                    cur[k]["name"] = text
+                    save_settings()
+            e = tk.Entry(row, textvariable=name, width=30, font=(FONT, 10), bg=C["card2"], fg=C["text"],
+                         insertbackground=C["text"], bd=0, relief="flat", highlightthickness=0)
+            e.pack(side="left", pady=6)
+            e.bind("<Return>", rename)
+            e.bind("<FocusOut>", rename)
+            price = it.get("price")
+            self.label(row, f"{price} жетонов" if price else "цена ещё неизвестна", 9, "muted", bg="card2").pack(
+                side="right", padx=12)
+
+            def remove(k=key):
+                cur = stock_items()
+                if k in cur and k not in STOCK_KNOWN:
+                    del cur[k]
+                    save_settings()
+                    self._stock_rows()
+            if key not in STOCK_KNOWN:
+                x = tk.Label(row, text="✕", bg=C["card2"], fg=C["dim"], cursor="hand2", font=(FONT, 10))
+                x.pack(side="right")
+                x.bind("<Button-1>", lambda ev, f=remove: f())
+
     # --- Discord ---
     def _page_discord(self):
         p = self.scroll_page("discord")
@@ -4685,6 +5327,8 @@ class FarmApp:
         apply_settings()
         self.saved_lbl.configure(text="✓ сохранено")
         self.root.after(2500, lambda: self.saved_lbl.configure(text=""))
+        self.stock_lbl.configure(text="✓ сохранено")
+        self.root.after(2500, lambda: self.stock_lbl.configure(text=""))
         self.restart_discord()
 
     def restart_discord(self):
@@ -4758,11 +5402,21 @@ class FarmApp:
             line = _gui_queue.popleft()
             self._append(self.log_txt, line, 3000)
             self._append(self.mini_log, line, 200)
+        try:
+            if self.stock_shown != tuple((k, v.get("price")) for k, v in stock_items().items()):
+                self._stock_rows()                      # бот увидел в магазине новый предмет или цену
+            last = SETTINGS.get("stock_last")
+            if last and self.stock_lbl.cget("text") in ("", getattr(self, "_stock_last_txt", "")):
+                self._stock_last_txt = f"последняя проверка: {last[-2:]}:00"
+                self.stock_lbl.configure(text=self._stock_last_txt)
+        except Exception:
+            pass
         running = self.thread is not None and self.thread.is_alive()
         if not running and STATS.state != "idle":
             STATS.state = "idle"
         state = STATS.state if running else "idle"
         col, txt = {"idle": (C["dim"], "остановлен"), "waiting": (C["yellow"], "в лобби, иду в матч"),
+                    "stock": (C["blue"], "проверяю сток в хабе"),
                     "running": (C["accent"], "фармит"), "stopping": (C["red"], "останавливается…")}.get(
             state, (C["dim"], state))
         self.dot.itemconfigure(self.dot_id, fill=col)
