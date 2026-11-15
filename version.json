@@ -1,6 +1,6 @@
 {
-  "version": "5.8.0",
+  "version": "5.8.1",
   "file": "twd_bot.py",
-  "sha256": "291b5c7f5ec5bc2248df87b7192f37dd08af900d12c5fce321fe7e4e284e13a5",
-  "notes": "автоскуп стока Research Shop раз в час между матчами; новая страница «Сток» с выбором предметов"
+  "sha256": "f8ada21ead887f812c5a68aa4987d8c90639d274ad6ac0ed852c7bacc586adc0",
+  "notes": "сток проверяется каждые полчаса; покупает все штуки товара; добавлены Plunger, Spikes, Yellow Energy, Stun Gun, Toilet Rolls x100"
 }
