@@ -1,6 +1,6 @@
 {
-  "version": "5.8.8",
+  "version": "5.8.9",
   "file": "twd_bot.py",
-  "sha256": "bf8d13f0523cf3fa1cd2490b6df917e98dae1d432aa359c93380981cc17eaf26",
-  "notes": "окно DAILY REWARDS в лобби: бот забирает награду и закрывает окно, поход за стоком больше не срывается"
+  "sha256": "93150245d5187c805f2672199df95982c70ffe6cf314eed4f856e854a5fc1b76",
+  "notes": "дубли «Новый предмет N» сливаются с известными; добавлены Head Cannon, Jetpack Thruster, Dart Gun, Toilet Rolls x200"
 }
