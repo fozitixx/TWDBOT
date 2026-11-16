@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.13 (снова в приоритете пара Titan Amplifierman + Titan Screen Man; Camcorderman вторым - только если Amplifierman не надет)"
+VERSION = "5.8.14 (Titan Amplifierman снова обязателен: без него бот матч не начинает)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -208,24 +208,15 @@ def _u(*units):
 
 def titan_roles(slots):
     """Кто из титанов что делает: (главный, второй).
-    Главный (имя юнита tcam: щит или крюк, переезд к 3-му повороту), второй (имя юнита tspk: у 2-го поворота).
-    Лучшая пара - Titan Screen Man + Titan Amplifierman: если надет Amplifierman, вторым всегда идёт он,
-    главным - Screen Man, а если его нет - Camcorderman. Без Amplifierman вторым встаёт Camcorderman
-    (запасной вариант, он слабее)."""
-    if "tspk" in slots:
-        return ("ttv" if "ttv" in slots else "tcam"), "tspk"
-    if "tcam" in slots and "ttv" in slots:
-        return "ttv", "tcam"
+    Второй (имя юнита tspk, стоит у 2-го поворота) - всегда Titan Amplifierman: без него босса не пройти.
+    Главный (имя юнита tcam: крюк или щит, переезд к 3-му повороту) - Titan Screen Man, а если его нет -
+    Titan Camcorderman."""
     return ("ttv" if "ttv" in slots else "tcam"), "tspk"
 
 
 def titan_groups(slots):
     """Группы «нужен один из» для двух титанов - для проверки слотов и для окна."""
-    if "tspk" in slots:
-        return [["tspk"], ["ttv", "tcam"]]
-    if "tcam" in slots or "ttv" in slots:
-        return [["tcam"], ["ttv"]]                   # без Amplifierman нужны оба остальных
-    return [["tspk", "tcam"], ["ttv", "tcam"]]
+    return [["tspk"], ["ttv", "tcam"]]
 
 
 def build_plan(mode, slots):
@@ -1214,10 +1205,9 @@ def detect_slots(img):
 def missing_units(slots, mode):
     md = MODES[mode]
     miss = [UNITS[t]["title"] for t in md["need"] if t not in slots]
-    titans = [t for t in ("tspk", "tcam", "ttv") if t in slots]
-    if len(titans) < 2:                              # нужны два разных титана из трёх
-        rest = [UNITS[t]["title"] for t in ("tspk", "tcam", "ttv") if t not in slots]
-        miss.append(("второй титан: " if titans else "два титана из: ") + (" или " if titans else ", ").join(rest))
+    for group in titan_groups(slots):                # Amplifierman обязателен, плюс Screen Man или Camcorderman
+        if not any(t in slots for t in group):
+            miss.append(" или ".join(UNITS[t]["title"] for t in group))
     for group in md["need_any"]:
         if not any(t in slots for t in group):
             miss.append(" или ".join(UNITS[t]["title"] for t in group))

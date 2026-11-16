@@ -1,6 +1,6 @@
 {
-  "version": "5.8.13",
+  "version": "5.8.14",
   "file": "twd_bot.py",
-  "sha256": "b9de31faafc01d9db513c8bc203e2d81997a9b1d1c8e1d8ca6631d931e959330",
-  "notes": "снова в приоритете пара Titan Amplifierman + Titan Screen Man; Camcorderman вторым - только если Amplifierman не надет"
+  "sha256": "95dad32d07f7c0210bada9d3f0580bb370f104bf1b1636f9b18809f52f763a91",
+  "notes": "Titan Amplifierman снова обязателен: без него бот матч не начинает"
 }
