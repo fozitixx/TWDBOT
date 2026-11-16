@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.7 (предметы стока узнаются по названию и количеству на любом разрешении; команда /stock в Discord)"
+VERSION = "5.8.8 (окно DAILY REWARDS в лобби: бот забирает награду и закрывает окно, поход за стоком больше не срывается)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -1285,6 +1285,27 @@ def stock_frame(img):
         return None
     x0, x1 = int(cols[0]), int(cols[-1])
     if not (0.45 * W < x1 - x0 < 0.85 * W):
+        return None
+    return (x0 / W, y0 / H, (x1 + 1) / W, (y1 + 1) / H)
+
+
+def daily_frame(img):
+    """Золотая рамка окна DAILY REWARDS: (x0, y0, x1, y1) в долях экрана или None."""
+    w, h = img.size
+    sw = min(w, 1280)
+    a = np.asarray(img.convert("RGB").resize((sw, max(1, round(sw * h / w))), Image.BILINEAR)).astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    m = (r > 185) & (g > 140) & (b < 140) & (r - b > 70)
+    H, W = m.shape
+    rows = np.nonzero(m.mean(axis=1) > 0.38)[0]
+    if len(rows) < 2 or rows[-1] - rows[0] < 0.3 * H:
+        return None
+    y0, y1 = int(rows[0]), int(rows[-1])
+    cols = np.nonzero(m[y0:y1 + 1].mean(axis=0) > 0.38)[0]
+    if len(cols) < 2:
+        return None
+    x0, x1 = int(cols[0]), int(cols[-1])
+    if not (0.35 * W < x1 - x0 < 0.75 * W):
         return None
     return (x0 / W, y0 / H, (x1 + 1) / W, (y1 + 1) / H)
 
@@ -4253,6 +4274,30 @@ class Bot:
                       COLOR_WARN, grab_game_window())
         log(f"сток: заняло {_fmt_dur(time.perf_counter() - t0)}")
 
+    def claim_daily(self):
+        """Окно DAILY REWARDS в лобби: забрать награду (зелёная CLAIM) и закрыть окно крестиком.
+        True - окно было."""
+        img = self.grab()
+        frame = daily_frame(img)
+        if not frame:
+            return False
+        btn = next((x for x in _blobs_green_buttons(img)
+                    if frame[0] < x["cx"] < frame[2] and frame[1] < x["cy"] < frame[3] and x["w"] > 0.1), None)
+        if btn:
+            log("лобби: окно DAILY REWARDS - забираю ежедневную награду")
+            self.click((btn["cx"], btn["cy"]), dwell=0.3)
+            self.sleep(2.0)
+        else:
+            log("лобби: окно DAILY REWARDS - закрываю")
+        for _ in range(3):
+            frame = daily_frame(self.grab())
+            if not frame:
+                break
+            self.click((frame[2] - 0.001, frame[1] + 0.003), dwell=0.25)      # крестик в правом верхнем углу
+            self.hover(IDLE_POINT)
+            self.sleep(1.2)
+        return True
+
     def stock_wait_lobby(self, timeout=200):
         """Дождаться лобби после перезахода (слева видна иконка TELEPORT)."""
         end = time.perf_counter() + timeout
@@ -4266,6 +4311,9 @@ class Bot:
                 hits += 1
                 if hits >= 3:
                     return view["tp_icon"]
+            elif view["button"] and self.claim_daily():
+                hits = 0
+                idle = time.perf_counter()
             else:
                 hits = 0
                 if time.perf_counter() - idle > 4:
@@ -4746,6 +4794,8 @@ class Bot:
             vote_done, vote_tries = False, 0
             view = analyze_screen(self.grab())
             btn = view["button"]
+            if btn and self.claim_daily():
+                continue
             # лобби узнаём только по меню слева (иконка TELEPORT) и только если видим его
             # несколько раз подряд; сразу после Rejoin загрузочные экраны не считаем лобби
             in_lobby = bool(view["tp_icon"] or view["deploy_card"]) and not view["button"]
