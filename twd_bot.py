@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.10 (окно DAILY REWARDS закрывается и после того, как награда уже забрана; крестик нажимается настойчивее)"
+VERSION = "5.8.11 (вторым титаном может идти Titan Camcorderman; пара Titan Screen Man + Titan Camcorderman в приоритете; новые названия титанов)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -206,16 +206,38 @@ def _u(*units):
     return [{"do": "upgrade", "unit": u} for u in units]
 
 
+def titan_roles(slots):
+    """Кто из титанов что делает: (главный, второй).
+    Главный (имя юнита tcam: щит или крюк, переезд к 3-му повороту), второй (имя юнита tspk: у 2-го поворота).
+    В приоритете пара Titan Screen Man + Titan Camcorderman: если в слотах есть оба, играют они, даже когда
+    надет и Titan Amplifierman. Иначе вторым идёт Amplifierman, главным - тот из двух, что есть."""
+    if "tcam" in slots and "ttv" in slots:
+        return "ttv", "tcam"
+    return ("ttv" if "ttv" in slots else "tcam"), "tspk"
+
+
+def titan_groups(slots):
+    """Группы «нужен один из» для двух титанов - для проверки слотов и для окна."""
+    if "tcam" in slots and "ttv" in slots:
+        return [["ttv"], ["tcam"]]
+    if "tspk" in slots:
+        return [["tspk"], ["tcam", "ttv"]]
+    if "tcam" in slots or "ttv" in slots:
+        return [["tcam"], ["ttv"]]                   # без Amplifierman нужны оба остальных
+    return [["ttv", "tspk"], ["tcam", "tspk"]]
+
+
 def build_plan(mode, slots):
-    """План матча. Если в слотах Titan TV Man, а Titan Cameraman нет - он встаёт на его место
-    (имя юнита в плане остаётся tcam, меняется только тип)."""
-    global MAIN_TITAN
-    MAIN_TITAN = "ttv" if ("ttv" in slots and "tcam" not in slots) else "tcam"
+    """План матча. Имена юнитов в плане постоянные (tcam - главный титан, tspk - второй),
+    а какой титан стоит под каждым именем, решает titan_roles."""
+    global MAIN_TITAN, SECOND_TITAN
+    MAIN_TITAN, SECOND_TITAN = titan_roles(slots)
     plan = _build_plan(mode, slots)
-    if MAIN_TITAN == "ttv":
-        for st in plan:
-            if st.get("type") == "tcam":
-                st["type"] = "ttv"
+    for st in plan:
+        if st.get("type") == "tcam":
+            st["type"] = MAIN_TITAN
+        elif st.get("type") == "tspk":
+            st["type"] = SECOND_TITAN
     return plan
 
 
@@ -242,7 +264,7 @@ def _build_plan(mode, slots):
             # на их доход ставятся оба титана и копится запас к боссу
             *[_p(f, "farm", "f" + f[-1]) for f in farms],
             *_u(*farms), *_u(*farms), *_u(*farms),
-            # 12-я волна: Titan Speakerman внутри 2-го поворота, ради него продаются только два TV
+            # 12-я волна: Titan Amplifierman внутри 2-го поворота, ради него продаются только два TV
             _p("tspk", "tspk", "t1n", sell_first=["tv3", "tv4"], margin=30),
             *_u("tspk", "tspk"),
             # 13-я волна: два TV у 3-го поворота (лимит TV - 4), без прокачки. g1 и g3 не заслоняют друг друга
@@ -272,21 +294,21 @@ def _build_plan(mode, slots):
 
 
 # Бой с боссом 30-й волны (времена - секунды после появления полосы босса, из видео):
-#   +3    Shield Mode у Titan Cameraman - сразу, как с него спадёт стартовое оглушение
+#   +3    Shield Mode у Titan Camcorderman - сразу, как с него спадёт стартовое оглушение
 #   +5    Motivation первого плунжера, +15 - второго
 #   +25   новый плунжер у 2-го поворота, качается до максимума, +34 - его Motivation
-#   +37   Aerial Attack у Titan Speakerman
-#   ~+51  босс дошёл до 2-го поворота (оглушил Titan Speakerman): Titan Cameraman продаётся
+#   +37   Aerial Attack у Titan Amplifierman
+#   ~+51  босс дошёл до 2-го поворота (оглушил Titan Amplifierman): Titan Camcorderman продаётся
 #         и ставится дальше по пути, у 3-го поворота
 #   +76   плунжеры продаются - деньги в нового титана
 # Каждое нажатие способности проверяется по кнопке (появился отсчёт - сработало) и повторяется.
-# Перестановка Titan Cameraman в бою с боссом: когда босс дошёл до 2-го поворота (там он оглушает
-# Titan Speakerman), титан у первого угла уже не нужен - он продаётся и ставится впереди по пути
+# Перестановка Titan Camcorderman в бою с боссом: когда босс дошёл до 2-го поворота (там он оглушает
+# Titan Amplifierman), титан у первого угла уже не нужен - он продаётся и ставится впереди по пути
 # босса, у 3-го поворота. Заодно продаются фермы и два плунжера из первого угла - деньги в нового титана.
 NIGHTMARE_START_CASH = 800                   # с этой суммой начинается матч на NIGHTMARE (на EASY - $650)
 # Бой с боссом после патча (100 000 HP), времена - секунды после появления полосы босса, из видео:
-BOSS_SHIELD_AT = 16.0          # Shield Mode у Titan Cameraman
-BOSS_AERIAL_AT = 40.0          # 8-й уровень и Aerial Attack у Titan Speakerman (в видео Aerial на +54)
+BOSS_SHIELD_AT = 16.0          # Shield Mode у Titan Camcorderman
+BOSS_AERIAL_AT = 40.0          # 8-й уровень и Aerial Attack у Titan Amplifierman (в видео Aerial на +54)
 BOSS_MOVE_TCAM = True
 BOSS_TCAM_MOVE_MIN = 52.0      # раньше этого Cameraman не переставлять (в видео +61)
 BOSS_TCAM_MOVE_MAX = 56.0      # с этого момента переезд начинается в любом случае
@@ -366,7 +388,7 @@ def base_hp_fraction(img):
     return min(1.0, float(idx[-1] + 3) / n)
 
 
-ABILITY_LEVEL = {"tcam": 8, "ttv": 7, "tspk": 7, "plunger": 7}   # у Titan Speakerman кнопка способности есть уже на 7 ур.
+ABILITY_LEVEL = {"tcam": 8, "ttv": 7, "tspk": 7, "plunger": 7}   # у Titan Amplifierman кнопка способности есть уже на 7 ур.
 
 VOTE_SIG = [183,164,159,159,158,157,156,167,174,155,152,153,152,117,62,114,153,135,135,144,141,131,117,99,145,146,146,148,149,151,140,130,170,73,52,52,47,52,51,110,152,61,67,80,88,68,47,71,68,34,41,53,45,36,35,124,92,34,45,70,57,34,49,148,171,53,29,28,26,30,28,98,149,43,82,86,88,90,42,114,88,15,35,41,36,25,22,122,74,14,34,88,60,15,36,147,176,50,25,34,35,30,23,98,151,41,79,86,85,89,42,117,109,19,33,42,42,30,23,104,65,12,38,87,64,14,32,138,180,47,24,42,35,28,19,87,131,47,77,80,84,82,51,106,103,31,46,51,46,39,48,118,69,9,26,70,47,10,19,59,180,54,37,48,49,46,32,99,121,42,59,63,61,61,44,105,94,24,35,43,46,33,32,129,77,24,30,47,35,25,26,37,184,68,77,109,114,101,57,109,109,79,112,115,113,109,91,91,77,41,92,107,110,85,39,78,58,84,89,93,92,89,70,83,187,56,42,60,87,44,37,104,126,40,47,79,90,48,39,70,67,24,37,88,79,33,22,37,31,28,49,95,72,31,43,157,184,60,78,83,146,76,67,107,165,52,81,124,144,92,55,75,77,43,69,129,126,73,34,52,40,55,76,145,118,71,47,170,186,54,35,75,110,57,31,105,161,39,41,99,107,49,32,69,68,18,38,102,93,29,21,75,53,18,50,104,79,23,41,174,193,84,70,83,87,78,59,112,133,71,70,87,82,69,46,78,77,61,65,85,69,48,28,72,60,62,68,85,74,60,56,179,194,128,121,61,66,71,75,120,107,128,98,66,55,38,41,62,66,138,79,69,41,30,25,55,76,141,66,69,54,67,58,177,192,108,101,63,67,70,71,104,97,101,87,68,61,51,48,50,48,102,71,68,44,39,35,58,67,105,63,67,55,60,63,184,188,76,79,79,75,71,70,111,121,45,62,65,70,75,41,44,33,27,37,42,63,55,25,55,41,33,42,44,57,61,47,176,185,77,93,97,96,98,86,118,149,61,87,89,92,97,66,44,32,44,73,74,83,84,46,56,36,58,78,77,85,86,59,174,186,106,100,102,90,91,100,136,174,90,77,74,61,67,71,51,38,45,54,50,41,53,58,56,40,65,82,74,66,78,85,173,177,83,112,110,54,65,104,114,161,81,110,102,41,78,91,46,33,72,100,88,29,82,70,58,56,88,104,70,30,95,75,162,188,155,151,151,148,148,151,168,186,146,76,48,43,43,43,50,46,36,42,40,42,49,46,134,152,134,134,132,128,133,138,175]
 
@@ -851,14 +873,14 @@ def read_money_image(img):
 
 # цена постановки, цены прокачек (ур.0->1, 1->2, ...) и выручка от продажи по уровням
 UNITS = {
-    "tcam":    {"title": "Titan Cameraman", "short": "Titan Cam",       "icon": "🎥", "price": 7500,
+    "tcam":    {"title": "Titan Camcorderman", "short": "Titan Camcorder",      "icon": "🎥", "price": 7500,
                 "up": [3250, 5000, 13650, 13600, 21025, 20975, 25000, 17500],
                 "sell": [3750, 5375, 7875, 14700, 21500, 32015, 42500, 55000, 63750]},
-    # Titan TV Man - замена Titan Cameraman (цены из видео): Teleport с 4 ур., Hook and Punch с 7 ур.
-    "ttv":     {"title": "Titan TV Man", "short": "Titan TV",        "icon": "📺", "price": 8000,
+    # Titan Screen Man - замена Titan Camcorderman (цены из видео): Teleport с 4 ур., Hook and Punch с 7 ур.
+    "ttv":     {"title": "Titan Screen Man", "short": "Titan Screen",      "icon": "📺", "price": 8000,
                 "up": [3250, 5250, 14400, 14350, 22275, 22225, 26500, 18750],
                 "sell": [4000, 5625, 8250, 15450, 22625, 33765, 44875, 58125, 67500]},
-    "tspk":    {"title": "Titan Speakerman", "short": "Titan Speaker",      "icon": "📢", "price": 7250,
+    "tspk":    {"title": "Titan Amplifierman", "short": "Titan Amplifier",     "icon": "📢", "price": 7250,
                 "up": [3000, 4750, 13400, 13350, 20650, 20600, 24500, 17500],
                 "sell": [3625, 5125, 7500, 14200, 20875, 31200, 41500, 53750, 62500]},
     "tv":      {"title": "Scientist TV Man", "short": "TV Man",      "icon": "📺", "price": 750,
@@ -874,8 +896,8 @@ UNITS = {
 PRICE_TO_TYPE = {u["price"]: t for t, u in UNITS.items()}
 
 MODES = {
-    "hard":      {"title": "HARD",      "waves": 25, "need": ["tspk", "tv"], "need_any": [["tcam", "ttv"], ["plunger", "speaker"]]},
-    "nightmare": {"title": "NIGHTMARE", "waves": 30, "need": ["tspk", "tv", "plunger", "farm"], "need_any": [["tcam", "ttv"]]},
+    "hard":      {"title": "HARD",      "waves": 25, "need": ["tv"], "need_any": [["plunger", "speaker"]]},
+    "nightmare": {"title": "NIGHTMARE", "waves": 30, "need": ["tv", "plunger", "farm"], "need_any": []},
 }
 
 
@@ -1132,6 +1154,10 @@ def detect_slots(img):
 def missing_units(slots, mode):
     md = MODES[mode]
     miss = [UNITS[t]["title"] for t in md["need"] if t not in slots]
+    titans = [t for t in ("tspk", "tcam", "ttv") if t in slots]
+    if len(titans) < 2:                              # нужны два разных титана из трёх
+        rest = [UNITS[t]["title"] for t in ("tspk", "tcam", "ttv") if t not in slots]
+        miss.append(("второй титан: " if titans else "два титана из: ") + (" или " if titans else ", ").join(rest))
     for group in md["need_any"]:
         if not any(t in slots for t in group):
             miss.append(" или ".join(UNITS[t]["title"] for t in group))
@@ -2271,15 +2297,18 @@ def apply_settings():
 
 
 UNIT_TITLES = {"gtv": "📺 ТВ-сторож", "tv": "📺 ТВ", "sp": "🔊 Спикер", "sup": "🪠 Поддержка", "pl": "🪠 Плунжер", "farm": "💰 Ферма",
-               "tcam": "🎥 Титан-Камера", "tspk": "📢 Титан-Спикер"}
+               "tcam": "🎥 Титан-Камкордер", "tspk": "📢 Титан-Амплифаер"}
 
 
-MAIN_TITAN = "tcam"          # какой титан стоит на месте Titan Cameraman в этом матче: "tcam" или "ttv"
+MAIN_TITAN = "tcam"          # главный титан этого матча (имя юнита tcam): "tcam" или "ttv"
+SECOND_TITAN = "tspk"        # второй титан (имя юнита tspk): "tspk" или "tcam"
 
 
 def unit_title(name):
     if name.startswith("tcam") and MAIN_TITAN == "ttv":
-        return "📺 Титан-ТВ" + name[4:]
+        return "📺 Титан-Скрин" + name[4:]
+    if name.startswith("tspk") and SECOND_TITAN == "tcam":
+        return "🎥 Титан-Камкордер" + name[4:]
     for pre in sorted(UNIT_TITLES, key=len, reverse=True):
         if name.startswith(pre):
             num = name[len(pre):]
@@ -3936,7 +3965,7 @@ class Bot:
         return "stunned" if self.unit_stunned(name) else False
 
     def teleport(self, name, at):
-        """Teleport у Titan TV Man: способность работает как постановка - навести и кликнуть, Q - отмена.
+        """Teleport у Titan Screen Man: способность работает как постановка - навести и кликнуть, Q - отмена.
         Стоит половину цены продажи; титан переезжает со всеми уровнями. -> получилось ли."""
         if name not in self.units or self.types.get(name) != "ttv":
             return False
@@ -4176,11 +4205,11 @@ class Bot:
                 if hp_now is not None:
                     log(f"БОСС +{el():.0f}с: здоровье босса {hp_now:.0%}")
 
-            # 1. Shield Mode у Titan Cameraman (в видео после патча - на +17 с, когда босс уже под огнём)
+            # 1. Shield Mode у Titan Camcorderman (в видео после патча - на +17 с, когда босс уже под огнём)
             ttv = self.types.get("tcam") == "ttv"
             mt = "ttv" if ttv else "tcam"
             if ttv:
-                # Titan TV Man: Hook and Punch (14 320 урона, перезарядка 35 с) - пока босс в его радиусе
+                # Titan Screen Man: Hook and Punch (14 320 урона, перезарядка 35 с) - пока босс в его радиусе
                 if "move" not in done:
                     if el() >= BOSS_SHIELD_AT:
                         ability("hook1", "tcam", 3)
@@ -4194,23 +4223,24 @@ class Bot:
                         ability("hook4", "tcam", 3)
             elif el() >= BOSS_SHIELD_AT:
                 ability("shield1", "tcam", 3)
-            # 2. Aerial Attack у Titan Speakerman (удар по области ~10 000) - когда босс у 2-го поворота
+            # 2. Aerial Attack у Titan Amplifierman (удар по области ~10 000) - когда босс у 2-го поворота
             #    Переезд Cameraman важнее: пока он не сделан, на Aerial не больше двух попыток.
             if (el() >= BOSS_AERIAL_AT and el() < 84.0 and "move2" not in done and "aerial" not in done
                     and "tspk" in self.units
                     and ("move" in done or el() < BOSS_TCAM_MOVE_MIN or tries.get("aerial", 0) < 2)):
                 if self.levels.get("tspk", 0) < 8 and not self.unit_stunned("tspk"):
                     self.drop()
-                    log(f"БОСС +{el():.0f}с: Speakerman -> 8 ур. и сразу Aerial Attack")
+                    log(f"БОСС +{el():.0f}с: {UNITS[SECOND_TITAN]['title']} -> 8 ур. и сразу "
+                        + ("Shield Mode" if SECOND_TITAN == "tcam" else "Aerial Attack"))
                     self.upgrade_now("tspk")          # выделение остаётся на нём - способность жмётся без нового клика
                 ability("aerial", "tspk", 4)
-            # 6. босс дошёл до 2-го поворота - Titan Cameraman переезжает вперёд, к 3-му повороту.
-            #    Признак: босс оглушил Titan Speakerman, стоящего у 2-го поворота. Оглушённого юнита
+            # 6. босс дошёл до 2-го поворота - Titan Camcorderman переезжает вперёд, к 3-му повороту.
+            #    Признак: босс оглушил Titan Amplifierman, стоящего у 2-го поворота. Оглушённого юнита
             #    игра продать не даёт, поэтому если сам Cameraman ещё оглушён - жду, пока очнётся.
             if BOSS_MOVE_TCAM and "move" not in done and el() >= BOSS_TCAM_MOVE_MIN and "tcam" in self.units:
                 if not getattr(self, "boss_at_turn", False) and self.unit_stunned("tspk"):
                     self.boss_at_turn = True
-                    log(f"БОСС +{el():.0f}с: босс у 2-го поворота (оглушил Titan Speakerman)")
+                    log(f"БОСС +{el():.0f}с: босс у 2-го поворота (оглушил {UNITS[SECOND_TITAN]['title']})")
                 ready = getattr(self, "boss_at_turn", False) or el() >= BOSS_TCAM_MOVE_MAX
                 if ready and self.unit_stunned("tcam"):
                     if "tcam_wait" not in self.boss_waiting:
@@ -4225,7 +4255,7 @@ class Bot:
                         done.add("move")
                         log("БОСС: титан-камера ниже 6 ур. - не переставляю (не хватит денег вернуть уровень)")
                     elif ttv and attempt("tp_try", 2) and self.teleport("tcam", "c3"):
-                        # Titan TV Man переезжает телепортом: без продажи, со всеми уровнями
+                        # Titan Screen Man переезжает телепортом: без продажи, со всеми уровнями
                         done.add("move")
                         self.boss_upgrade = "tcam"
                         self.boss_moved_at = time.perf_counter()
@@ -4283,23 +4313,23 @@ class Bot:
             #    Титан, который не достаёт до босса, бесполезен, поэтому переезд не откладывается ни из-за
             #    непроданных ферм, ни из-за недокачанного Cameraman: у Speakerman свои деньги от продажи.
             if ("move" in done and "move2" not in done and el() >= BOSS_TSPK_MOVE_AT and "tspk" in self.units
-                    and "tspk" in self.slots):
+                    and SECOND_TITAN in self.slots):
                 hp = self.boss_hp()
                 if hp is not None and hp < 0.08:
                     done.add("move2")
-                    log(f"БОСС +{el():.0f}с: у босса осталось {hp:.0%} - Speakerman не переставляю")
+                    log(f"БОСС +{el():.0f}с: у босса осталось {hp:.0%} - {UNITS[SECOND_TITAN]['title']} не переставляю")
                 elif self.unit_stunned("tspk"):
                     pass
                 elif attempt("move2_try", 2):
-                    log(f"БОСС +{el():.0f}с: переставляю Titan Speakerman к 3-му повороту"
+                    log(f"БОСС +{el():.0f}с: переставляю {UNITS[SECOND_TITAN]['title']} к 3-му повороту"
                         + (f" (у босса {hp:.0%})" if hp is not None else ""))
                     self.drop()
                     if self.sell_unit("tspk"):
                         done.add("move2")
                         self.sleep(0.3)
-                        if not self.place({"unit": "tspk", "type": "tspk", "at": "c3b", "quick": 12, "nowait": True}):
-                            log("  у третьего поворота не встал - возвращаю Speakerman на прежнее место")
-                            self.place({"unit": "tspk", "type": "tspk", "at": "t1n", "nowait": True})
+                        if not self.place({"unit": "tspk", "type": SECOND_TITAN, "at": "c3b", "quick": 12, "nowait": True}):
+                            log("  у третьего поворота не встал - возвращаю второго титана на прежнее место")
+                            self.place({"unit": "tspk", "type": SECOND_TITAN, "at": "t1n", "nowait": True})
                         self.upgrade_now("tspk")
                         self.boss_upgrade2 = "tspk"
         finally:
@@ -5400,7 +5430,7 @@ class FarmApp:
         for w in self.units_row.winfo_children():
             w.destroy()
         checked = bool(STATS.prices)
-        groups = [[t] for t in MODES[mode]["need"]] + MODES[mode]["need_any"]
+        groups = titan_groups(slots) + [[t] for t in MODES[mode]["need"]] + MODES[mode]["need_any"]
         self.label(self.units_row, "Юниты [слот]:" if checked else "Нужны:", 9, "muted").pack(side="left", padx=(0, 8))
         for group in groups:
             have = [t for t in group if t in slots]
