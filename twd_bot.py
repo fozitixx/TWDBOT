@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.9 (дубли «Новый предмет N» сливаются с известными; добавлены Head Cannon, Jetpack Thruster, Dart Gun, Toilet Rolls x200)"
+VERSION = "5.8.10 (окно DAILY REWARDS закрывается и после того, как награда уже забрана; крестик нажимается настойчивее)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -4371,6 +4371,8 @@ class Bot:
     def claim_daily(self):
         """Окно DAILY REWARDS в лобби: забрать награду (зелёная CLAIM) и закрыть окно крестиком.
         True - окно было."""
+        if getattr(self, "daily_fail", 0) >= 3 and time.perf_counter() - getattr(self, "daily_fail_at", 0) < 600:
+            return False                             # не закрывается - не зацикливаюсь, иду дальше как есть
         img = self.grab()
         frame = daily_frame(img)
         if not frame:
@@ -4383,13 +4385,27 @@ class Bot:
             self.sleep(2.0)
         else:
             log("лобби: окно DAILY REWARDS - закрываю")
-        for _ in range(3):
+        # крестик - ромб на правом верхнем углу рамки; пробую его центр и точки чуть в стороны
+        for dx, dy in ((-0.001, 0.003), (-0.004, 0.008), (0.003, -0.003), (-0.001, 0.003), (-0.006, 0.003)):
             frame = daily_frame(self.grab())
             if not frame:
+                log("лобби: окно DAILY REWARDS закрыто")
+                self.daily_fail = 0
                 break
-            self.click((frame[2] - 0.001, frame[1] + 0.003), dwell=0.25)      # крестик в правом верхнем углу
+            pt = (frame[2] + dx, frame[1] + dy)
+            self.hover(pt)
+            self.sleep(0.25)
+            self.click(pt, dwell=0.3)
             self.hover(IDLE_POINT)
-            self.sleep(1.2)
+            self.sleep(1.5)
+        else:
+            if daily_frame(self.grab()):
+                self.daily_fail = getattr(self, "daily_fail", 0) + 1
+                self.daily_fail_at = time.perf_counter()
+                log(f"лобби: окно DAILY REWARDS не закрылось крестиком (попытка {self.daily_fail} из 3)")
+                self.stock_snap("daily_not_closed")
+            else:
+                self.daily_fail = 0
         return True
 
     def stock_wait_lobby(self, timeout=200):
@@ -4405,7 +4421,7 @@ class Bot:
                 hits += 1
                 if hits >= 3:
                     return view["tp_icon"]
-            elif view["button"] and self.claim_daily():
+            elif self.claim_daily():                 # окно ежедневной награды (и уже забранной тоже)
                 hits = 0
                 idle = time.perf_counter()
             else:
@@ -4888,7 +4904,7 @@ class Bot:
             vote_done, vote_tries = False, 0
             view = analyze_screen(self.grab())
             btn = view["button"]
-            if btn and self.claim_daily():
+            if (btn or view["dialog"] or not view["tp_icon"]) and self.claim_daily():
                 continue
             # лобби узнаём только по меню слева (иконка TELEPORT) и только если видим его
             # несколько раз подряд; сразу после Rejoin загрузочные экраны не считаем лобби
