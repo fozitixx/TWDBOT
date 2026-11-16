@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.11 (вторым титаном может идти Titan Camcorderman; пара Titan Screen Man + Titan Camcorderman в приоритете; новые названия титанов)"
+VERSION = "5.8.12 (поддержка шайни-юнитов: цена на 5% ниже, например ферма за $238)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -894,6 +894,52 @@ UNITS = {
                 "up": [375, 625, 1000, 2000], "sell": [125, 315, 625, 1125, 2125]},
 }
 PRICE_TO_TYPE = {u["price"]: t for t, u in UNITS.items()}
+# цены из таблицы (без скидок). У юнита с трейтом Shiny цена ниже на 5% (ферма $238 вместо $250):
+# тогда цена постановки берётся со слота, а выручка от продажи пересчитывается в той же пропорции
+UNIT_BASE = {t: {"price": u["price"], "sell": list(u["sell"])} for t, u in UNITS.items()}
+PRICE_SLACK = 0.06           # насколько цена на карточке может отличаться от табличной
+SHINY_DISCOUNT = 0.05
+# цена шайни-юнита -> тип (округление в игре вверх: 237.5 -> 238; на всякий случай беру и вниз)
+def _shiny_prices():
+    out = {}
+    for t, u in UNITS.items():
+        v = u["price"] * (1 - SHINY_DISCOUNT)
+        for p in (int(v + 0.5), int(v), int(v) + (1 if v != int(v) else 0)):
+            if p not in PRICE_TO_TYPE:
+                out.setdefault(p, t)
+    return out
+
+
+SHINY_TO_TYPE = _shiny_prices()
+
+
+def fuzzy_type(price, taken=()):
+    """Тип юнита по цене, близкой к табличной (в пределах PRICE_SLACK), если такой тип один."""
+    near = sorted((abs(price - b["price"]) / b["price"], t) for t, b in UNIT_BASE.items() if t not in taken)
+    near = [t for d, t in near if d <= PRICE_SLACK]
+    return near[0] if len(near) == 1 else None
+
+
+def apply_slot_prices(slots, prices):
+    """Подстроить цены юнитов под то, что написано на карточках в этом матче. Возвращает список отличий."""
+    notes = []
+    for t, base in UNIT_BASE.items():
+        actual = base["price"]
+        if t in slots and 0 < slots[t] <= len(prices) and prices[slots[t] - 1]:
+            actual = prices[slots[t] - 1]
+        k = actual / base["price"]
+        UNITS[t]["price"] = actual
+        UNITS[t]["sell"] = [int(round(v * k)) for v in base["sell"]]
+        if actual != base["price"]:
+            shiny = SHINY_TO_TYPE.get(actual) == t
+            notes.append(f"{UNITS[t]['title']} ${actual} вместо ${base['price']}" + (" (шайни)" if shiny else ""))
+    return notes
+
+
+def _nearest(values, x, slack=PRICE_SLACK, floor=4):
+    """Индекс единственного значения списка, близкого к x; None, если такого нет или их несколько."""
+    near = [i for i, v in enumerate(values) if abs(v - x) <= max(floor, slack * v)]
+    return near[0] if len(near) == 1 else None
 
 MODES = {
     "hard":      {"title": "HARD",      "waves": 25, "need": ["tv"], "need_any": [["plunger", "speaker"]]},
@@ -1098,7 +1144,11 @@ def disconnect_dialog(img):
 def level_by_sell(utype, price):
     """Уровень юнита по цене продажи; None - цена не из таблицы этого юнита."""
     sells = UNITS.get(utype, {}).get("sell", [])
-    return sells.index(price) if price in sells else None
+    if price in sells:
+        return sells.index(price)
+    if any(price in u["sell"] for t, u in UNITS.items() if t != utype):
+        return None                                  # это точная цена другого юнита
+    return _nearest(sells, price)                    # со скидкой цены продажи чуть отличаются от таблицы
 
 
 HOTBAR_BOX = (0.25, 0.885, 0.75, 0.965)
@@ -1148,6 +1198,15 @@ def detect_slots(img):
         t = PRICE_TO_TYPE.get(p)
         if t and t not in slots:
             slots[t] = i
+    for i, p in enumerate(prices, 1):                # шайни-юнит: цена ровно на 5% ниже табличной
+        t = SHINY_TO_TYPE.get(p)
+        if t and t not in slots:
+            slots[t] = i
+    for i, p in enumerate(prices, 1):                # другая небольшая скидка - ближайший свободный тип
+        if p and p not in PRICE_TO_TYPE and i not in slots.values():
+            t = fuzzy_type(p, taken=slots)
+            if t:
+                slots[t] = i
     return slots, prices
 
 
@@ -3505,10 +3564,8 @@ class Bot:
         ups = UNITS.get(utype, {}).get("up", [])
         lvl_s = level_by_sell(utype, price) if price is not None else None
         lvl_u = ups.index(up) if up is not None and up in ups else None
-        if lvl_u is None and up is not None and price is None:
-            near = [i for i, u in enumerate(ups) if abs(u - up) <= 4]
-            if len(near) == 1:
-                lvl_u = near[0]
+        if lvl_u is None and up is not None:
+            lvl_u = _nearest(ups, up)                # одна неточная цифра или скидка на прокачку
         if lvl_s is not None:
             return lvl_s, price, False
         if lvl_u is not None:
@@ -3803,7 +3860,8 @@ class Bot:
                 slots, prices = detect_slots(self.grab())
             except Exception:
                 slots, prices = {}, []
-            known = [PRICE_TO_TYPE.get(p) for p in prices if p in PRICE_TO_TYPE]
+            known = [PRICE_TO_TYPE.get(p) or SHINY_TO_TYPE.get(p) for p in prices
+                     if p in PRICE_TO_TYPE or p in SHINY_TO_TYPE]
             clean = len(known) == len(set(known))          # один юнит не может быть в двух слотах
             if clean and len(slots) >= len(best[0]):
                 best = (slots, prices)
@@ -5126,6 +5184,8 @@ class Bot:
             STATS.mode = mode
             self.slots, prices = self.read_slots()
             STATS.slots, STATS.prices = dict(self.slots), list(prices)
+            for note in apply_slot_prices(self.slots, prices):
+                log(f"цена не как в таблице: {note} - считаю по цене с карточки")
             found = ", ".join(f"{n}: {UNITS[t]['title']}" for t, n in sorted(self.slots.items(), key=lambda x: x[1]))
             log(f"режим {MODES[mode]['title']}; слоты: {found or 'ничего не распознал'} (цены: {prices})")
             cash0 = self.money_stable()

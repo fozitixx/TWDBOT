@@ -1,6 +1,6 @@
 {
-  "version": "5.8.11",
+  "version": "5.8.12",
   "file": "twd_bot.py",
-  "sha256": "726f0feb9363685e69e0b92cdd49095da2b978ed40fec940938d936dc2982987",
-  "notes": "вторым титаном может идти Titan Camcorderman; пара Titan Screen Man + Titan Camcorderman в приоритете; новые названия титанов"
+  "sha256": "318dd7e3a1cf103c8181426dc805f3f6aeb4c5f038693033a7dc73d9c1c81b7f",
+  "notes": "поддержка шайни-юнитов: цена на 5% ниже, например ферма за $238"
 }
