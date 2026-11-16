@@ -1,6 +1,6 @@
 {
-  "version": "5.8.12",
+  "version": "5.8.13",
   "file": "twd_bot.py",
-  "sha256": "318dd7e3a1cf103c8181426dc805f3f6aeb4c5f038693033a7dc73d9c1c81b7f",
-  "notes": "поддержка шайни-юнитов: цена на 5% ниже, например ферма за $238"
+  "sha256": "b9de31faafc01d9db513c8bc203e2d81997a9b1d1c8e1d8ca6631d931e959330",
+  "notes": "снова в приоритете пара Titan Amplifierman + Titan Screen Man; Camcorderman вторым - только если Amplifierman не надет"
 }

@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.12 (поддержка шайни-юнитов: цена на 5% ниже, например ферма за $238)"
+VERSION = "5.8.13 (снова в приоритете пара Titan Amplifierman + Titan Screen Man; Camcorderman вторым - только если Amplifierman не надет)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -209,8 +209,11 @@ def _u(*units):
 def titan_roles(slots):
     """Кто из титанов что делает: (главный, второй).
     Главный (имя юнита tcam: щит или крюк, переезд к 3-му повороту), второй (имя юнита tspk: у 2-го поворота).
-    В приоритете пара Titan Screen Man + Titan Camcorderman: если в слотах есть оба, играют они, даже когда
-    надет и Titan Amplifierman. Иначе вторым идёт Amplifierman, главным - тот из двух, что есть."""
+    Лучшая пара - Titan Screen Man + Titan Amplifierman: если надет Amplifierman, вторым всегда идёт он,
+    главным - Screen Man, а если его нет - Camcorderman. Без Amplifierman вторым встаёт Camcorderman
+    (запасной вариант, он слабее)."""
+    if "tspk" in slots:
+        return ("ttv" if "ttv" in slots else "tcam"), "tspk"
     if "tcam" in slots and "ttv" in slots:
         return "ttv", "tcam"
     return ("ttv" if "ttv" in slots else "tcam"), "tspk"
@@ -218,13 +221,11 @@ def titan_roles(slots):
 
 def titan_groups(slots):
     """Группы «нужен один из» для двух титанов - для проверки слотов и для окна."""
-    if "tcam" in slots and "ttv" in slots:
-        return [["ttv"], ["tcam"]]
     if "tspk" in slots:
-        return [["tspk"], ["tcam", "ttv"]]
+        return [["tspk"], ["ttv", "tcam"]]
     if "tcam" in slots or "ttv" in slots:
         return [["tcam"], ["ttv"]]                   # без Amplifierman нужны оба остальных
-    return [["ttv", "tspk"], ["tcam", "tspk"]]
+    return [["tspk", "tcam"], ["ttv", "tcam"]]
 
 
 def build_plan(mode, slots):
