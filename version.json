@@ -1,6 +1,6 @@
 {
-  "version": "5.8.15",
+  "version": "5.8.16",
   "file": "twd_bot.py",
-  "sha256": "cea25300cff1b21f7b8a688be9ebe7ab7fc124012c30925f68432d702e2e59b9",
-  "notes": "новые цены титанов после ребаланса: Amplifierman $6975, Camcorderman $7650, Screen Man $8600"
+  "sha256": "2230d3d87f51de57609ebf91c5978f9bdf6f2e914d0c535c3b6be826f1deb94a",
+  "notes": "AFK CHECK: ответ кнопками в Discord или автоматический выбор в настройках"
 }

@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.15 (новые цены титанов после ребаланса: Amplifierman $6975, Camcorderman $7650, Screen Man $8600)"
+VERSION = "5.8.16 (AFK CHECK и ответы через Discord)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2000,6 +2000,7 @@ DEFAULT_SETTINGS = {
     "force_resolution": "",      # например "1920x1080": выставить разрешение экрана при старте
     "roblox_fullscreen": True,   # держать Roblox на весь экран (F11): ровно 16:9, как в эталоне
     "discord_enabled": False,
+    "afk_auto": False,
     "discord_token": "",
     "discord_channel": "",
     "discord_allowed": "",       # ID через запятую; пусто - все в канале
@@ -2525,6 +2526,13 @@ class DiscordLink:
         self.queue.append(({"content": content, "embeds": [self.embed(title, desc, color, fields)]}, image))
         self.wake.set()
 
+    def afk_prompt(self, key, panel):
+        if self.ok:
+            buttons = [{"type": 2, "style": 1, "label": str(i+1), "custom_id": f"afk:{key}:{i}"} for i in range(4)]
+            self.queue.append(({"content": "AFK CHECK — выбери позицию слева направо",
+                                "components": [{"type": 1, "components": buttons}]}, panel))
+            self.wake.set()
+
     def stats_fields(self):
         up = time.time() - STATS.started_at if STATS.started_at else 0
         f = [("Состояние", {"idle": "⏸ остановлен", "waiting": "⏳ лобби / загрузка", "running": "▶ фармит",
@@ -2654,6 +2662,15 @@ class DiscordLink:
             if self.allowed and str(user.get("id")) not in self.allowed:
                 self._reply(it, {"content": "Нет доступа к этому боту.", "flags": 64})
                 return
+            if it.get("type") == 3 and data.get("custom_id", "").startswith("afk:"):
+                _, key, index = data["custom_id"].split(":")
+                bot = self.app.bot
+                valid = (str(it.get("channel_id")) == str(self.channel) and bot
+                         and key == getattr(bot, "afk_id", None) and index in ("0","1","2","3"))
+                if valid:
+                    bot.afk_answer = (key, int(index))
+                self._reply(it, {"content": "Ответ принят" if valid else "Проверка завершена", "flags": 64})
+                return
             if name == "status":
                 self._reply(it, {"embeds": [self.embed("Состояние фарма", "", COLOR_INFO, self.stats_fields())]})
             elif name == "screen":
@@ -2725,6 +2742,36 @@ class DiscordLink:
 
 LINK = NullLink()
 
+
+
+AFK_HEADER = np.frombuffer(bytes.fromhex("2c2b1b1b25171d1d1d1b21281e1c1a2020211b1c231c1b1c211e252d291c6a6e239e987b65832f19789d7c505f4e9897378a917858801f292624ccca38de7287fb8c0f4dbb3691cac973dc8f86a436adf4621f2b1c62dedc85d56d82d9b4253ec174a5aeb574e09c74b270b6d29d1d2a1a493c3b594f0d3f3a5731164b7052384037696e255a66522f642022201617181414201715151a2018121518181a13121e1614161a142024"), dtype=np.uint8)
+
+def afk_panel(img):
+    gray = img.convert("L")
+    edges = np.diff(np.asarray(gray) > 150, axis=1, prepend=False, append=False)
+    ys, xs = np.nonzero(edges)
+    widths = xs[1::2] - xs[::2]
+    for i in np.flatnonzero((widths >= 115) & (widths <= 900)):
+        x, y = int(xs[2*i]), int(ys[2*i])
+        scale = widths[i] / 239
+        def crop(a,b,c,d):
+            return gray.crop((x+round(a*scale), y+round(b*scale),
+                              x+round(c*scale), y+round(d*scale)))
+        title = np.asarray(crop(8,9,64,20).resize((28,6))).ravel()
+        if title.std() < 18 or np.corrcoef(title, AFK_HEADER)[0,1] < .75:
+            continue
+        def digits(box):
+            mask = crop(*box).point(lambda v: 255 if v > 160 else 0)
+            return np.asarray(mask.crop(mask.getbbox()).resize((32,20))) > 127
+        target = digits((22,49,65,70))
+        centers = (98,132,166,200)
+        options = [digits((c-12,55,c+12,70)) for c in centers]
+        scores = [np.count_nonzero(target & o)/max(1,np.count_nonzero(target | o)) for o in options]
+        second, best = np.argsort(scores)[-2:]
+        choice = best if scores[best] > .68 and scores[best]-scores[second] > .10 else None
+        points = [((x+c*scale)/img.width,(y+62*scale)/img.height) for c in centers]
+        signature = tuple(np.packbits(o).tobytes() for o in [target]+options)
+        return crop(0,0,242,112), points, signature, choice
 
 class Bot:
     def __init__(self, use_speed=True, hotkeys=True):
@@ -2812,6 +2859,9 @@ class Bot:
                 log("Roblox был перезапущен посреди матча - начинаю заново")
                 self.bar_missing = 0
                 raise MatchEnded
+        if time.monotonic() >= getattr(self, "afk_next", 0):
+            self.afk_next = time.monotonic() + 3
+            self.handle_afk()
         self.timelapse()
         self.check_disconnect()
         if getattr(self, "bar_missing", 0) >= 3 and STATS.match_started:
@@ -2820,6 +2870,40 @@ class Bot:
             self.bar_missing = 0
             log("полосы здоровья базы нет уже 45 с - матч закончился (окно награды или лобби)")
             raise MatchEnded
+
+    def handle_afk(self):
+        stamp, bounds, cached = getattr(self, "afk_capture", (0, None, None))
+        fresh = time.monotonic() - stamp < .2 and bounds == self.rect()
+        frame = afk_panel(cached if fresh else self.grab())
+        previous = None
+        try:
+            while frame and is_game_window(foreground_window()):
+                panel, points, signature, automatic = frame
+                if signature != previous:
+                    previous = signature
+                    clicked = False
+                    self.afk_answer = None
+                    self.afk_id = str(time.monotonic_ns())
+                    if isinstance(LINK, DiscordLink):
+                        LINK.afk_prompt(self.afk_id, panel)
+                answer = self.afk_answer
+                choice = automatic if SETTINGS.get("afk_auto") else None
+                if answer and answer[0] == self.afk_id:
+                    choice = answer[1]
+                if choice is not None and not clicked:
+                    self.m.position = self.to_screen(points[choice])
+                    self.sleep(.12)
+                    if is_game_window(foreground_window()):
+                        self.m.click(mouse.Button.left)
+                        clicked = True
+                self.sleep(.5)
+                frame = afk_panel(self.grab())
+            while frame and not is_game_window(foreground_window()):
+                self.sleep(.25)
+            if frame:
+                self.afk_next = 0
+        finally:
+            self.afk_id = None
 
     def relaunch_private(self):
         """Закрыть Roblox и зайти заново по ссылке приватного сервера. Ждёт ~25 с, пока клиент запустится."""
@@ -2899,9 +2983,13 @@ class Bot:
         w, h = r - l, b - t
         bbox = (int(l + box[0] * w), int(t + box[1] * h), int(l + box[2] * w), int(t + box[3] * h))
         try:
-            return ImageGrab.grab(bbox=bbox, all_screens=True)
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
         except TypeError:
-            return ImageGrab.grab(bbox=bbox)
+            img = ImageGrab.grab(bbox=bbox)
+
+        if box == (0, 0, 1, 1):
+            self.afk_capture = (time.monotonic(), bbox, img)
+        return img
 
     def to_screen(self, pt):
         l, t, r, b = self.rect()
@@ -5765,6 +5853,7 @@ class FarmApp:
         p = self.scroll_page("discord")
         self.header(p, "Discord", "Уведомления о матчах и управление слэш-командами")
         s = self.section(p, "Подключение")
+        self.switch(s, "afk_auto", "Автоматически отвечать на AFK CHECK")
         self.switch(s, "discord_enabled", "Включить Discord-бота")
         self.entry(s, "discord_token", "Токен бота", "Developer Portal → твоё приложение → Bot → Reset Token. "
                    "Никому не показывай.", secret=True)
