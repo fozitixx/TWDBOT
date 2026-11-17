@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.16 (AFK CHECK и ответы через Discord)"
+VERSION = "5.8.17 (AFK CHECK и ответы через Discord)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2876,10 +2876,25 @@ class Bot:
         fresh = time.monotonic() - stamp < .2 and bounds == self.rect()
         frame = afk_panel(cached if fresh else self.grab())
         previous = None
+        misses = 0
         try:
-            while frame and is_game_window(foreground_window()):
+            while frame or (previous is not None and misses < 4):
+                if not is_game_window(foreground_window()):
+                    self.sleep(.25)
+                    frame = None
+                    continue
+                if frame is None:
+                    self.sleep(.25)
+                    frame = afk_panel(self.grab())
+                    misses = 0 if frame else misses + 1
+                    continue
+                misses = 0
                 panel, points, signature, automatic = frame
-                if signature != previous:
+                # Small changes in antialiasing should not invalidate Discord buttons.
+                if previous is None or any(
+                    sum(bin(a ^ b).count("1") for a, b in zip(old, new)) > 64
+                    for old, new in zip(previous, signature)
+                ):
                     previous = signature
                     clicked = False
                     self.afk_answer = None
@@ -2894,14 +2909,15 @@ class Bot:
                     self.m.position = self.to_screen(points[choice])
                     self.sleep(.12)
                     if is_game_window(foreground_window()):
-                        self.m.click(mouse.Button.left)
+                        self.m.press(mouse.Button.left)
+                        try:
+                            time.sleep(.12)
+                        finally:
+                            self.m.release(mouse.Button.left)
+                        log(f'AFK CHECK: нажата кнопка {choice + 1}')
                         clicked = True
                 self.sleep(.5)
                 frame = afk_panel(self.grab())
-            while frame and not is_game_window(foreground_window()):
-                self.sleep(.25)
-            if frame:
-                self.afk_next = 0
         finally:
             self.afk_id = None
 
