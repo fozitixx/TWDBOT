@@ -1,6 +1,6 @@
 {
-  "version": "5.8.14",
+  "version": "5.8.15",
   "file": "twd_bot.py",
-  "sha256": "95dad32d07f7c0210bada9d3f0580bb370f104bf1b1636f9b18809f52f763a91",
-  "notes": "Titan Amplifierman снова обязателен: без него бот матч не начинает"
+  "sha256": "cea25300cff1b21f7b8a688be9ebe7ab7fc124012c30925f68432d702e2e59b9",
+  "notes": "новые цены титанов после ребаланса: Amplifierman $6975, Camcorderman $7650, Screen Man $8600"
 }

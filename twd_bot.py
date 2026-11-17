@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.14 (Titan Amplifierman снова обязателен: без него бот матч не начинает)"
+VERSION = "5.8.15 (новые цены титанов после ребаланса: Amplifierman $6975, Camcorderman $7650, Screen Man $8600)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -865,16 +865,17 @@ def read_money_image(img):
 
 # цена постановки, цены прокачек (ур.0->1, 1->2, ...) и выручка от продажи по уровням
 UNITS = {
-    "tcam":    {"title": "Titan Camcorderman", "short": "Titan Camcorder",      "icon": "🎥", "price": 7500,
-                "up": [3250, 5000, 13650, 13600, 21025, 20975, 25000, 17500],
-                "sell": [3750, 5375, 7875, 14700, 21500, 32015, 42500, 55000, 63750]},
-    # Titan Screen Man - замена Titan Camcorderman (цены из видео): Teleport с 4 ур., Hook and Punch с 7 ур.
-    "ttv":     {"title": "Titan Screen Man", "short": "Titan Screen",      "icon": "📺", "price": 8000,
-                "up": [3250, 5250, 14400, 14350, 22275, 22225, 26500, 18750],
-                "sell": [4000, 5625, 8250, 15450, 22625, 33765, 44875, 58125, 67500]},
-    "tspk":    {"title": "Titan Amplifierman", "short": "Titan Amplifier",     "icon": "📢", "price": 7250,
-                "up": [3000, 4750, 13400, 13350, 20650, 20600, 24500, 17500],
-                "sell": [3625, 5125, 7500, 14200, 20875, 31200, 41500, 53750, 62500]},
+    "tcam":    {"title": "Titan Camcorderman", "short": "Titan Camcorder",      "icon": "🎥", "price": 7650,
+                "up": [3325, 5100, 13925, 13875, 21425, 21375, 25475, 17850],
+                "sell": [3825, 5490, 8040, 15000, 21940, 32650, 43340, 56075, 65000]},
+    # Titan Screen Man - замена Titan Camcorderman: Teleport с 4 ур., Hook and Punch с 7 ур.
+    # цены трёх титанов - после ребаланса 17.11.2026 (видео меню юнитов); продажа = половина вложенного
+    "ttv":     {"title": "Titan Screen Man", "short": "Titan Screen",      "icon": "📺", "price": 8600,
+                "up": [3500, 5650, 15475, 15425, 23925, 23875, 28400, 20150],
+                "sell": [4300, 6050, 8875, 16615, 24325, 36290, 48225, 62425, 72500]},
+    "tspk":    {"title": "Titan Amplifierman", "short": "Titan Amplifier",     "icon": "📢", "price": 6975,
+                "up": [2875, 4575, 12850, 12800, 19825, 19775, 23525, 16800],
+                "sell": [3490, 4925, 7215, 13640, 20040, 29950, 39840, 51600, 60000]},
     "tv":      {"title": "Scientist TV Man", "short": "TV Man",      "icon": "📺", "price": 750,
                 "up": [450, 800], "sell": [375, 600, 1000]},
     "plunger": {"title": "Plunger Cameraman 2.0", "short": "Plunger", "icon": "🪠", "price": 700,
