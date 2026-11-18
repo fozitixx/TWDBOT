@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.17 (AFK CHECK и ответы через Discord)"
+VERSION = "5.8.18 (AFK CHECK и ответы через Discord)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2529,7 +2529,8 @@ class DiscordLink:
     def afk_prompt(self, key, panel):
         if self.ok:
             buttons = [{"type": 2, "style": 1, "label": str(i+1), "custom_id": f"afk:{key}:{i}"} for i in range(4)]
-            self.queue.append(({"content": "AFK CHECK — выбери позицию слева направо",
+            mention = f"<@{self.ping}> " if self.ping else ""
+            self.queue.append(({"content": mention + "AFK CHECK — выбери позицию слева направо",
                                 "components": [{"type": 1, "components": buttons}]}, panel))
             self.wake.set()
 

@@ -1,6 +1,6 @@
 {
-  "version": "5.8.17",
+  "version": "5.8.18",
   "file": "twd_bot.py",
-  "sha256": "33703104cf60f8865e5c1043139ac444d44ec8e91a6ffa5544da8b2d168b202b",
-  "notes": "Исправлены устаревающие кнопки AFK CHECK в Discord и обработка клика в Roblox"
+  "sha256": "0908195a35c6483a2801928b95456058048bb2ff35a6fc4b966db8b6d4b0172d",
+  "notes": "При AFK CHECK бот упоминает пользователя, указанного в настройках Discord"
 }
