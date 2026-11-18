@@ -1,6 +1,6 @@
 {
-  "version": "5.8.18",
+  "version": "5.8.19",
   "file": "twd_bot.py",
-  "sha256": "0908195a35c6483a2801928b95456058048bb2ff35a6fc4b966db8b6d4b0172d",
-  "notes": "При AFK CHECK бот упоминает пользователя, указанного в настройках Discord"
+  "sha256": "6082e3c77014ef0b2e8efe9828e930b7b227c9f0d55fc8cb02a2f6db477aa7e4",
+  "notes": "После ответа в Discord макрос возвращает фокус в Roblox и позволяет повторить клик AFK CHECK"
 }

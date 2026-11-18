@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.18 (AFK CHECK и ответы через Discord)"
+VERSION = "5.8.19 (AFK CHECK и ответы через Discord)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2670,7 +2670,7 @@ class DiscordLink:
                          and key == getattr(bot, "afk_id", None) and index in ("0","1","2","3"))
                 if valid:
                     bot.afk_answer = (key, int(index))
-                self._reply(it, {"content": "Ответ принят" if valid else "Проверка завершена", "flags": 64})
+                self._reply(it, {"content": f"Выбрана кнопка {int(index)+1}. Ответ передан макросу." if valid else "Проверка завершена", "flags": 64})
                 return
             if name == "status":
                 self._reply(it, {"embeds": [self.embed("Состояние фарма", "", COLOR_INFO, self.stats_fields())]})
@@ -2878,9 +2878,13 @@ class Bot:
         frame = afk_panel(cached if fresh else self.grab())
         previous = None
         misses = 0
+        focus_retry = 0
         try:
             while frame or (previous is not None and misses < 4):
                 if not is_game_window(foreground_window()):
+                    if getattr(self, "afk_answer", None) and time.monotonic() >= focus_retry:
+                        focus_retry = time.monotonic() + 3
+                        bring_to_front(self.hwnd, IDLE_POINT)
                     self.sleep(.25)
                     frame = None
                     continue
@@ -2898,6 +2902,7 @@ class Bot:
                 ):
                     previous = signature
                     clicked = False
+                    handled_answer = None
                     self.afk_answer = None
                     self.afk_id = str(time.monotonic_ns())
                     if isinstance(LINK, DiscordLink):
@@ -2906,9 +2911,12 @@ class Bot:
                 choice = automatic if SETTINGS.get("afk_auto") else None
                 if answer and answer[0] == self.afk_id:
                     choice = answer[1]
-                if choice is not None and not clicked:
+                if choice is not None and (not clicked or answer is not handled_answer):
                     self.m.position = self.to_screen(points[choice])
-                    self.sleep(.12)
+                    self.sleep(.03)
+                    relative_move(self.m, 1, 0)
+                    relative_move(self.m, -1, 0)
+                    self.sleep(.15)
                     if is_game_window(foreground_window()):
                         self.m.press(mouse.Button.left)
                         try:
@@ -2917,6 +2925,7 @@ class Bot:
                             self.m.release(mouse.Button.left)
                         log(f'AFK CHECK: нажата кнопка {choice + 1}')
                         clicked = True
+                        handled_answer = answer
                 self.sleep(.5)
                 frame = afk_panel(self.grab())
         finally:
