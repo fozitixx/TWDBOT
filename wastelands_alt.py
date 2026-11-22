@@ -7,7 +7,7 @@ from PIL import ImageGrab
 from pynput import mouse
 
 import twd_bot as farm
-from wastelands_team import ABILITIES, UNITS, Wait, position
+from wastelands_team import ABILITIES, PLACEMENT_ORDER, Wait, placement_label, position, private_server_links
 from wastelands_view import OCR, color_boxes, label, map_point, preview, road_pose, scene, screen_point, tracked_pose
 
 
@@ -117,6 +117,7 @@ class Alt:
         self.stop,self.notify = stop,notify
         self.run = ""
         self.status = "Подключение"
+        self.last_summon = None
         self.ocr = OCR()
         self.game = Game(self.guard)
         self.last_checked = 0
@@ -131,7 +132,8 @@ class Alt:
         if self.deadline is not None and time.monotonic()>=self.deadline:
             raise Wait("Время команды истекло")
         if time.monotonic()-self.last_checked>.45:
-            if self.exchange()["run"] != self.run:
+            state = self.exchange()
+            if state.get("summon") or state["run"] != self.run:
                 raise Wait("Матч остановлен")
             self.last_checked = time.monotonic()
 
@@ -143,7 +145,7 @@ class Alt:
         self.invited = state["progress"].get("invited",False)
         self.last_invite = 0
         self.placed = set()
-        self.attempt = {u:0 for u in UNITS}
+        self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
         self.retry = state["progress"].get("retry",0)
         self.levels = {"amplifier":0,"screen":0}
         self.wait_cash = 0
@@ -192,6 +194,8 @@ class Alt:
 
     def update_places(self,state):
         own = {p["unit"]:p for p in state["places"] if p["player"]==self.player}
+        if not all(unit in own for unit in PLACEMENT_ORDER):
+            raise Wait("Основа не передала десять мест. Обнови основу до 6.0.4.")
         self.placed = {u for u,p in own.items() if p["state"]=="placed"}
         self.points = {u:p["point"] for u,p in own.items() if u in self.placed}
         if self.confirm:
@@ -205,15 +209,16 @@ class Alt:
 
     def place(self, unit, img):
         prices = farm.read_hotbar(img)
-        slot = self.slots[unit]
+        slot = self.slots[unit.partition("_")[0]]
+        name = placement_label(unit)
         # Associate the physical card with its slot even when another price is unreadable.
         center = (.313 + (slot-1)*.072)
         price = next((v for x,v in prices if abs(x-center)<.032 and v),None)
         cash = self.game.money()
         if price is None or cash is None or cash < price:
-            return f"Жду {unit} · баланс {cash}, цена слота {slot}: {price}"
+            return f"Жду {name} · баланс {cash}, цена слота {slot}: {price}"
         if self.attempt[unit]>=5:
-            return f"{unit}: пять точек заняты; проверь разметку"
+            return f"{name}: пять точек заняты; проверь разметку"
         if not self.game.take(slot):
             return "Не появилась подсветка дороги"
         try:
@@ -229,7 +234,7 @@ class Alt:
             try:
                 self.exchange("reserve",unit=unit,point=point)
             except Wait as e:
-                if "занят" in str(e):
+                if "занят" in str(e) or "Зона ранней защиты основы" in str(e):
                     self.attempt[unit]+=1
                 raise
             self.game.click(pt)
@@ -246,14 +251,14 @@ class Alt:
                 self.confirm = None
                 self.placed.add(unit)
                 self.pose,self.reference = pose,self.game.grab()
-                return f"Поставил {unit}"
+                return f"Поставил {name}"
             if not gone and after is not None and after>=cash:
                 self.confirm = ("release",unit,point)
                 self.exchange("release",unit=unit,point=point)
                 self.confirm = None
                 self.attempt[unit]+=1
                 return "Точка занята · пробую рядом"
-            return f"Проверь {unit}: результат клика не подтверждён"
+            return f"Проверь {name}: результат клика не подтверждён"
         finally:
             self.game.drop()
 
@@ -412,7 +417,7 @@ class Alt:
         if self.update_places(state):
             return "Состояние постановки синхронизировано"
         if state["progress"]["retry"]!=self.retry:
-            self.attempt = {u:0 for u in UNITS}
+            self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
             self.retry = state["progress"]["retry"]
         if self.phase=="lobby":
             return self.lobby(state,img)
@@ -436,7 +441,7 @@ class Alt:
             self.ready = True
             self.exchange("ready")
             return "Plunger поставлен · READY"
-        for unit in UNITS:
+        for unit in PLACEMENT_ORDER:
             if unit not in self.placed:
                 return self.place(unit,img)
         if min(self.levels.values())<8 and time.monotonic()>self.next_upgrade:
@@ -447,6 +452,19 @@ class Alt:
                 return self.manager(unit,"Upgrade")
         return f"Amplifier {self.levels['amplifier']}/8 · Screen {self.levels['screen']}/8"
 
+    def join_private(self, request):
+        # An ACK can be lost after Windows has already opened the link.
+        if self.last_summon is None or self.last_summon[0] != request["id"]:
+            try:
+                targets = private_server_links(request.get("link"))
+                opened = farm.open_private_link(targets)
+            except ValueError:
+                opened = False
+            self.last_summon = (request["id"], opened)
+        request_id, opened = self.last_summon
+        self.exchange("summon_result", id=request_id, opened=opened)
+        return "Ссылка на приватку открыта" if opened else "Не удалось открыть ссылку на приватку"
+
     def loop(self):
         try:
             while not self.stop.is_set():
@@ -454,7 +472,9 @@ class Alt:
                     state = self.exchange()
                     if state["run"]!=self.run:
                         self.reset(state)
-                    if self.run:
+                    if state.get("summon"):
+                        self.status = self.join_private(state["summon"])
+                    elif self.run:
                         self.status = self.tick(state)
                     else:
                         self.status = "На связи · жду матч"

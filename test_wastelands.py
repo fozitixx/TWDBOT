@@ -16,9 +16,10 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from wastelands_alt import Alt, Wait, level, manager_card, countdown
-from wastelands_team import AltConnection, Match, PAIR_LIFETIME, PLAYERS, UNITS, connect_by_pin, position, serve
+from wastelands_team import AltConnection, Match, PAIR_LIFETIME, PLACEMENT_ORDER, PLAYERS, UNITS, connect_by_pin, position, serve
 from wastelands_view import OCR, label, road_pose, screen_point
 
+PRIVATE_LINK = "https://www.roblox.com/share?code=Test123&type=Server"
 
 class IntegrationTest(unittest.TestCase):
     def test_peer_address(self):
@@ -39,7 +40,8 @@ class IntegrationTest(unittest.TestCase):
         workers = []
         slots = dict(zip(UNITS,(4,5,1,3)))
         with patch("wastelands.connect_by_pin", partial(connect_by_pin, port=server.server_port)), \
-             patch("wastelands.AltConnection", partial(AltConnection, port=server.server_port)):
+             patch("wastelands.AltConnection", partial(AltConnection, port=server.server_port)), \
+             patch("twd_bot.os.startfile",create=True) as launch:
             try:
                 for player in PLAYERS:
                     panel = App.__new__(App)
@@ -54,6 +56,14 @@ class IntegrationTest(unittest.TestCase):
                     self.assertEqual(panel.messages.get(timeout=5), "На связи · жду матч")
                 with match.lock:
                     self.assertEqual(set(match.clients), set(PLAYERS))
+                for player in PLAYERS:
+                    match.summon(player,PRIVATE_LINK)
+                for panel,_ in workers:
+                    deadline = time.monotonic()+5
+                    while panel.messages.get(timeout=max(.01,deadline-time.monotonic())) != "Ссылка на приватку открыта":
+                        self.assertLess(time.monotonic(), deadline)
+                self.assertEqual([c.args for c in launch.call_args_list],
+                                 [("roblox://navigation/share_links?code=Test123&type=Server",)]*3)
             finally:
                 for panel,worker in workers:
                     panel.stop.set()
@@ -91,6 +101,20 @@ class IntegrationTest(unittest.TestCase):
                 self.assertEqual(panel.match_fields.winfo_manager(),"")
                 self.assertEqual(panel.command_buttons[1][0].cget("state"),"normal")
                 self.assertEqual(panel.command_buttons[2][0].cget("state"),"disabled")
+                panel.reservations(1)
+                popup = next(w for w in panel.root.winfo_children() if w.winfo_class()=="Toplevel")
+                widgets = [popup]
+                labels = []
+                while widgets:
+                    widget = widgets.pop()
+                    widgets.extend(widget.winfo_children())
+                    if widget.winfo_class()=="Label":
+                        labels.append(widget.cget("text"))
+                for kind in ("Plunger","TV"):
+                    self.assertTrue(all(f"{kind} {n}/4" in labels for n in range(1,5)))
+                self.assertIn("Amplifier",labels)
+                self.assertIn("Screen",labels)
+                popup.destroy()
                 panel.group_attack.invoke()
                 panel.render_players()
                 self.assertEqual(set(panel.match.pending),{1})
@@ -98,6 +122,13 @@ class IntegrationTest(unittest.TestCase):
                 panel.run_button.invoke()
                 self.assertEqual(panel.match_fields.winfo_manager(),"pack")
                 self.assertEqual(panel.player_actions[1].winfo_manager(),"")
+                panel.summon_buttons[1].invoke()
+                self.assertIn("Ссылка приватного сервера",panel.note.cget("text"))
+                farm.SETTINGS["server_link"] = PRIVATE_LINK
+                panel.match.clients[1].update(can_summon=True, instance="test")
+                panel.summon_all.invoke()
+                self.assertEqual(set(panel.match.summons), {1})
+                self.assertIn("вызов в приватку", panel.player_results[1].cget("text"))
             finally:
                 app.on_close()
                 app.root.mainloop()
@@ -177,22 +208,29 @@ class NetworkTest(unittest.TestCase):
             self.assertEqual(self.match.redeem_pin(code)["player"],3)
 
     def test_three_clients_and_contested_teleport(self):
-        for unit in UNITS:
+        for unit in PLACEMENT_ORDER:
             for a in self.alts:
                 p = position(a.player,unit)
                 a.exchange("reserve",unit=unit,point=p)
                 a.exchange("commit",unit=unit,point=p)
                 a.exchange("commit",unit=unit,point=p)
-        self.assertEqual(len(self.alts[2].exchange()["places"]),12)
+        places = self.alts[2].exchange()["places"]
+        self.assertEqual(len({tuple(row["point"]) for row in places}),30)
+        for player in PLAYERS:
+            own = [r for r in places if r["player"] == player and r["state"] == "placed"]
+            kinds = [r["unit"].partition("_")[0] for r in own]
+            self.assertCountEqual(kinds, ["plunger"]*4 + ["tv"]*4 + ["amplifier", "screen"])
         def compete(a):
             try:
-                a.exchange("reserve",unit="screen",point=[1150,540])
+                a.exchange("reserve",unit="screen",point=[1200,540])
                 return True
             except Wait:
                 return False
         with ThreadPoolExecutor(3) as pool:
             self.assertEqual(sum(pool.map(compete,self.alts)),1)
         for a in self.alts:
+            with self.assertRaises(Wait):
+                a.exchange("reserve",unit="screen",point=position(3,"tv_3"))
             with self.assertRaises(Wait):
                 a.exchange("reserve",unit="screen",point=[765,528])
         self.match.command(2,"Aerial Attack")
@@ -221,6 +259,38 @@ class NetworkTest(unittest.TestCase):
         with self.assertRaises(Wait):
             a.guard()
 
+    def test_individual_summon_and_ack_retry_during_match(self):
+        a, other, _ = self.alts
+        self.match.summon(1,PRIVATE_LINK)
+        with self.assertRaisesRegex(ValueError,"уже отправлен"):
+            self.match.summon(1,PRIVATE_LINK)
+        request = a.exchange()["summon"]
+        self.assertIsNone(other.exchange()["summon"])
+        with patch("twd_bot.os.startfile",create=True) as launch:
+            with patch.object(a,"exchange",side_effect=Wait("временный обрыв")), self.assertRaises(Wait):
+                a.join_private(request)
+            a.join_private(a.exchange()["summon"])
+            launch.assert_called_once()
+        self.assertIsNone(a.exchange()["summon"])
+        self.assertEqual(a.exchange()["run"],"")
+        self.assertTrue(other.exchange()["run"])
+        self.match.start("nightmare","S4R")
+        self.assertEqual(a.exchange()["run"], self.match.run)
+
+    def test_private_link_validation_and_failure(self):
+        a = self.alts[0]
+        for invalid in ("", "file:///test.exe", PRIVATE_LINK.replace(".com/",".com.example/"),
+                        PRIVATE_LINK.replace("Server","ExperienceDetails"), "roblox://other"):
+            with self.assertRaises(ValueError):
+                self.match.summon(1,invalid)
+        legacy = "https://www.roblox.com/games/123/TWD?privateServerLinkCode=Test123"
+        self.match.summon(1,legacy)
+        with patch("twd_bot.os.startfile",side_effect=OSError,create=True) as launch, patch("twd_bot.log"):
+            a.join_private(a.exchange()["summon"])
+            launch.assert_called_once_with(legacy.replace("/TWD",""))
+        self.assertEqual(a.exchange()["run"],self.match.run)
+        self.assertIn("Не удалось",self.match.results[1])
+
     def test_battle_order(self):
         a=self.alts[0]
         a.phase="battle"
@@ -238,10 +308,11 @@ class NetworkTest(unittest.TestCase):
         with patch.object(a,"place",side_effect=place),patch.object(a,"manager",side_effect=improve), \
              patch.object(a.game,"grab",return_value=frame),patch.object(a.game,"ready_visible",return_value=True), \
              patch.object(a.game,"click",side_effect=lambda _:calls.append("ready")),patch.object(a.game,"money",return_value=100000):
-            for _ in range(21):
+            for _ in range(27):
                 a.next_upgrade=0
                 a.tick(a.exchange())
-        self.assertEqual(calls,["plunger","ready","tv","amplifier","screen"]+["amplifier","screen"]*8)
+        self.assertEqual(calls,["plunger","ready","plunger_2","plunger_3","plunger_4",
+                                "tv","tv_2","tv_3","tv_4","amplifier","screen"]+["amplifier","screen"]*8)
 
     def test_blocked_then_paid_placement(self):
         alt=self.alts[0]
@@ -254,10 +325,12 @@ class NetworkTest(unittest.TestCase):
         pose=(np.array([.41,.41]),np.diag([1/2048,1/1152]))
         with patch.object(alt,"game",game),patch("wastelands_alt.road_pose",return_value=pose), \
              patch("twd_bot.read_hotbar",return_value=[(.532,700)]):
-            self.assertIn("занята",alt.place("plunger",frame))
-            self.assertNotIn("target",self.match.places[1,"plunger"])
-            self.assertIn("Поставил",alt.place("plunger",frame))
-        self.assertEqual(self.match.places[1,"plunger"]["point"],position(1,"plunger",1))
+            self.assertIn("занята",alt.place("plunger_2",frame))
+            self.assertNotIn("target",self.match.places[1,"plunger_2"])
+            self.assertIn("Поставил Plunger 2/4",alt.place("plunger_2",frame))
+        self.assertEqual(self.match.places[1,"plunger_2"]["point"],position(1,"plunger_2",1))
+        self.assertEqual(self.match.places[1,"plunger"]["state"],"reserved")
+        self.assertEqual([call.args for call in game.take.call_args_list], [(4,), (4,)])
         self.assertEqual(game.click.call_count,2)
 
     def test_teleport_frame_and_ack(self):

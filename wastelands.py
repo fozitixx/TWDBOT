@@ -12,8 +12,8 @@ from tkinter import messagebox, ttk
 
 from PIL import Image, ImageTk
 
-from twd_bot import C, FONT
-from wastelands_team import ABILITIES, AltConnection, Match, PLAYERS, PORT, UNITS, Wait, connect_by_pin, serve
+from twd_bot import C, FONT, SETTINGS
+from wastelands_team import ABILITIES, AltConnection, Match, PLAYERS, PORT, UNITS, Wait, connect_by_pin, placement_label, serve
 
 
 def peer_host(value):
@@ -178,6 +178,9 @@ class App:
         top.pack(fill="x", pady=(2, 4))
         text(top, "Твинки", size=12, bold=True).pack(side="left")
         self.group_attack = button(top,"Aerial Attack — всем",self.send_all)
+        self.summon_all = button(top, "Всех в приватку", lambda: self.summon(PLAYERS))
+        self.summon_all.pack(side="right", padx=4)
+        self.summon_buttons = {}
         self.player_status, self.player_actions, self.command_buttons, self.player_results = {}, {}, {}, {}
         self.pin_labels = {}
         for player in PLAYERS:
@@ -190,6 +193,8 @@ class App:
             self.player_status[player].pack(side="left", padx=9)
             button(head,"Скопировать код",lambda i=player:self.pair(i)).pack(side="right")
             button(head,"Показать PIN",lambda i=player:self.show_pin(i)).pack(side="right",padx=5)
+            self.summon_buttons[player] = button(head, "В приватку", lambda i=player: self.summon((i,)))
+            self.summon_buttons[player].pack(side="right")
             self.pin_labels[player] = text(row,"",bold=True,color="accent")
             self.rows[player] = text(row,"",size=9,color="muted",wraplength=470)
             self.player_results[player] = text(row,"",size=9,color="blue",wraplength=470)
@@ -282,6 +287,8 @@ class App:
         self.server = None
         with self.match.lock:
             self.match.pins.clear()
+            self.match.summons.clear()
+            self.match.clients.clear()
         self.render_players()
         self.listen.configure(text="Включить связь",command=self.start_server)
         self.ip_entry.configure(state="normal")
@@ -408,6 +415,22 @@ class App:
         except Exception as exc:
             self.messages.put(f"Твинк остановлен: {exc}")
 
+    def summon(self, players):
+        link = SETTINGS.get("server_link")
+        if not link:
+            self.note.configure(text="В настройках основы заполни «Ссылка приватного сервера» и сохрани настройки.")
+            return
+        sent, skipped = [], []
+        for i in players:
+            try:
+                self.match.summon(i, link)
+                sent.append(str(i))
+            except ValueError as exc:
+                skipped.append(f"Твинк {i} · {exc}")
+        messages = ["Вызов в приватку отправлен: " + ", ".join(sent)] if sent else []
+        self.note.configure(text=". ".join(messages + skipped))
+        self.render_players()
+
     def send(self,player,name):
         try:
             self.match.command(player,"snapshot" if name=="Teleport" else name)
@@ -434,14 +457,27 @@ class App:
         win.title(f"Твинк {player} · места")
         win.configure(bg=C["bg"],padx=14,pady=12)
         text(win,f"Места юнитов · твинк {player}",size=14,bold=True).pack(anchor="w",pady=(0,8))
+        body = tk.Frame(win, bg=C["bg"])
+        body.pack(fill="both", expand=True)
+        canvas = tk.Canvas(body, bg=C["bg"], highlightthickness=0,
+                           width=420, height=min(480, win.winfo_screenheight()//2))
+        scroll = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        scroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.configure(yscrollcommand=scroll.set)
+        listing = tk.Frame(canvas, bg=C["bg"])
+        content = canvas.create_window(0, 0, window=listing, anchor="nw")
+        listing.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda ev: canvas.itemconfigure(content, width=ev.width))
+        win.bind("<MouseWheel>", lambda ev: canvas.yview_scroll(-int(ev.delta/120), "units"))
         for row in rows:
             unit = row["unit"]
             placed = row["state"]=="placed"
-            area = card(win)
+            area = card(listing)
             area.pack(fill="x",pady=(0,4))
             line = tk.Frame(area,bg=C["card"])
             line.pack(fill="x")
-            text(line,"TV" if unit=="tv" else unit.title(),bold=True).pack(side="left")
+            text(line,placement_label(unit),bold=True).pack(side="left")
             text(line,"Поставлен" if placed else "Место занято под юнита",size=9,
                  color="accent" if placed else "muted").pack(side="left",padx=9)
             x,y = row["point"]
@@ -512,6 +548,7 @@ class App:
                 self.listen.configure(state="disabled" if running else "normal")
             connected = 0
             for i in PLAYERS:
+                self.match.expire_summon(i, now)
                 c = self.match.clients.get(i,{})
                 pin = self.match.pins.get(i)
                 if self.server and pin and now < pin[1]:
@@ -526,16 +563,17 @@ class App:
                     self.pin_labels[i].pack_forget()
                 online = bool(self.server and now-c.get("seen",-1e8)<8)
                 connected += int(online)
+                self.summon_buttons[i].configure(state="normal" if online and i not in self.match.summons else "disabled")
                 self.player_status[i].configure(text="●  На связи" if online else "●  Вне связи",
                                                 fg=C["accent" if online else "muted"])
                 if running:
                     self.player_actions[i].pack(fill="x",pady=(5,0))
                     for b in self.command_buttons[i]:
-                        b.configure(state="normal" if online else "disabled")
+                        b.configure(state="normal" if online and i not in self.match.recalled and i not in self.match.summons else "disabled")
                 else:
                     self.player_actions[i].pack_forget()
                 activity = c.get("status","") if online else ""
-                result = self.match.results.get(i,"") if running else ""
+                result = self.match.results.get(i,"")
                 for widget,value in ((self.rows[i],activity),(self.player_results[i],f"Команда · {result}" if result else "")):
                     if value:
                         widget.configure(text=value)
@@ -552,6 +590,7 @@ class App:
             self.connection_count.configure(text=f"На связи   {connected} / {len(PLAYERS)}"
                                             if self.tabs.select()==str(self.main) else "")
             self.group_attack.configure(state="normal" if connected else "disabled")
+            self.summon_all.configure(state="normal" if connected else "disabled")
 
     def tick(self):
         while not self.messages.empty():
@@ -583,6 +622,7 @@ class App:
 if __name__=="__main__":
     import twd_bot
     twd_bot.enable_dpi_awareness()
+    twd_bot.load_settings()
     window=tk.Tk()
     App(window)
     window.mainloop()
