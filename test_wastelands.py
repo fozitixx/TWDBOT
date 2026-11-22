@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from wastelands_alt import Alt, Wait, level, manager_card, countdown
-from wastelands_team import Match, PLAYERS, UNITS, position, serve
+from wastelands_team import Match, PAIR_LIFETIME, PLAYERS, UNITS, connect_by_pin, position, serve
 from wastelands_view import OCR, label, road_pose, screen_point
 
 
@@ -93,6 +93,47 @@ class NetworkTest(unittest.TestCase):
         self.match.start("nightmare","S4R")
         for a in self.alts:
             a.reset(a.exchange())
+
+    def test_manual_pairing_for_all_three_players(self):
+        codes = [self.match.issue_pin(i) for i in PLAYERS]
+        self.assertEqual(len(set(codes)),3)
+        for alt,code in zip(self.alts,codes):
+            self.assertEqual(self.match.issue_pin(alt.player),code)
+            number,key = connect_by_pin("127.0.0.1",code,self.server.server_port)
+            self.assertEqual(number,alt.player)
+            alt.key = key
+            self.assertEqual(alt.exchange()["run"],self.match.run)
+            with self.assertRaisesRegex(ValueError,"PIN"):
+                connect_by_pin("127.0.0.1",code,self.server.server_port)
+
+    def test_duplicate_pin_requests_and_expiry(self):
+        with patch("wastelands_team.secrets.randbelow",return_value=54321):
+            code = self.match.issue_pin(1)
+        self.assertEqual(code,"00054321")
+        def redeem():
+            try:
+                return connect_by_pin("127.0.0.1",code,self.server.server_port)[0]
+            except ValueError:
+                return None
+        with ThreadPoolExecutor(2) as pool:
+            futures = [pool.submit(redeem) for _ in range(2)]
+            self.assertCountEqual([f.result() for f in futures],[1,None])
+        with patch("wastelands_team.time.monotonic",return_value=10):
+            old = self.match.issue_pin(2)
+        with patch("wastelands_team.time.monotonic",return_value=10+PAIR_LIFETIME):
+            with self.assertRaisesRegex(ValueError,"PIN"):
+                self.match.redeem_pin(old)
+
+    def test_wrong_pin_is_throttled(self):
+        code=self.match.issue_pin(3)
+        for _ in range(12):
+            with self.assertRaisesRegex(ValueError,"PIN неверен"):
+                self.match.redeem_pin("invalid")
+        with self.assertRaisesRegex(ValueError,"через минуту"):
+            self.match.redeem_pin(code)
+        later=time.monotonic()+61
+        with patch("wastelands_team.time.monotonic",return_value=later):
+            self.assertEqual(self.match.redeem_pin(code)["player"],3)
 
     def test_three_clients_and_contested_teleport(self):
         for unit in UNITS:

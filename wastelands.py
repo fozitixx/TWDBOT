@@ -1,6 +1,7 @@
 """Desktop entry point for the main account and three RDP workers."""
 import base64
 import io
+import ipaddress
 import queue
 import socket
 import threading
@@ -11,7 +12,7 @@ from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 
 from twd_bot import C, FONT
-from wastelands_team import ABILITIES, Match, PLAYERS, PORT, UNITS, serve
+from wastelands_team import ABILITIES, Match, PLAYERS, PORT, UNITS, connect_by_pin, serve
 
 
 def text(parent, value, *, size=10, color="text", bold=False, **options):
@@ -86,6 +87,7 @@ class App:
         except OSError:
             addr = "127.0.0.1"
         self.addr = tk.StringVar(value=prefs.get("address") or addr)
+        self.peer_addr = tk.StringVar(value=prefs.get("peer_address",""))
         self.host = tk.StringVar(value=prefs.get("host",""))
         self.mode = tk.StringVar(value="hard" if prefs.get("mode")=="hard" else "nightmare")
         self._build_main()
@@ -99,7 +101,7 @@ class App:
 
     def _build_main(self):
         # Keep connection feedback in view while scrolling the three players on short RDP desktops.
-        self.note = text(self.main, "Передай каждому твинку его код подключения из списка ниже.",
+        self.note = text(self.main, "Нажми «Показать PIN» у нужного твинка и введи IP и PIN в его RDP-сеансе.",
                          size=9, color="muted", wraplength=530)
         self.note.pack(fill="x", pady=(7, 5))
         canvas = tk.Canvas(self.main, bg=C["bg"], highlightthickness=0, width=1, height=1)
@@ -158,6 +160,7 @@ class App:
         text(top, "Твинки", size=12, bold=True).pack(side="left")
         self.group_attack = button(top,"Aerial Attack — всем",self.send_all)
         self.player_status, self.player_actions, self.command_buttons, self.player_results = {}, {}, {}, {}
+        self.pin_labels = {}
         for player in PLAYERS:
             row = card(body)
             row.pack(fill="x", pady=(0, 5))
@@ -167,6 +170,8 @@ class App:
             self.player_status[player] = text(head, "●  Вне связи", size=9, color="muted")
             self.player_status[player].pack(side="left", padx=9)
             button(head,"Скопировать код",lambda i=player:self.pair(i)).pack(side="right")
+            button(head,"Показать PIN",lambda i=player:self.show_pin(i)).pack(side="right",padx=5)
+            self.pin_labels[player] = text(row,"",bold=True,color="accent")
             self.rows[player] = text(row,"",size=9,color="muted",wraplength=470)
             self.player_results[player] = text(row,"",size=9,color="blue",wraplength=470)
             actions = tk.Frame(row, bg=C["card"])
@@ -182,9 +187,18 @@ class App:
         conn = card(self.client)
         conn.pack(fill="x",pady=(10,8))
         text(conn,"Подключение к основе",size=12,bold=True).pack(anchor="w")
-        text(conn,"Вставь код, скопированный на основе для этого твинка.",size=9,color="muted").pack(anchor="w",pady=(3,5))
-        self.token = field(conn,show="•")
-        self.token.pack(fill="x",ipady=5)
+        text(conn,"На основе нажми «Показать PIN» в строке этого твинка.",size=9,color="muted").pack(anchor="w",pady=(3,5))
+        fields = tk.Frame(conn,bg=C["card"])
+        fields.pack(fill="x")
+        text(fields,"IP основы",size=9,color="muted").grid(row=0,column=0,sticky="w")
+        text(fields,"PIN из 8 цифр или скопированный код",size=9,color="muted").grid(row=0,column=1,sticky="w")
+        field(fields,textvariable=self.peer_addr,width=17).grid(row=1,column=0,sticky="ew",ipady=4,padx=(0,12))
+        self.connection_code = tk.StringVar()
+        self.token = field(fields,textvariable=self.connection_code)
+        self.token.grid(row=1,column=1,sticky="ew",ipady=4)
+        fields.columnconfigure(1,weight=1)
+        self.connection_code.trace_add("write",lambda *_:self.token.configure(
+            show="•" if "|" in self.connection_code.get() else ""))
         group = card(self.client)
         group.pack(fill="x",pady=(0,8))
         text(group,"Слоты юнитов",size=12,bold=True).pack(anchor="w")
@@ -214,7 +228,7 @@ class App:
 
     def remember(self):
         if self.save_prefs:
-            self.save_prefs(dict(address=self.addr.get().strip(),host=self.host.get().strip(),
+            self.save_prefs(dict(address=self.addr.get().strip(),peer_address=self.peer_addr.get().strip(),host=self.host.get().strip(),
                                  mode=self.mode.get(),slots={u:v.get() for u,v in self.slot_vars.items()},
                                  role="alt" if self.tabs.select()==str(self.client) else "main"))
 
@@ -240,13 +254,16 @@ class App:
         self.ip_entry.configure(state="readonly")
         self.network_state.configure(text="●  Включено",fg=C["accent"])
         self.refresh_tabs()
-        self.note.configure(text="Связь включена. Скопируй код для каждого твинка и передай его в нужный RDP-сеанс.")
+        self.note.configure(text="Связь включена. Покажи PIN нужного твинка и введи его вместе с IP в RDP.")
 
     def disconnect_server(self):
         self.match.stop()
         self.server.shutdown()
         self.server.server_close()
         self.server = None
+        with self.match.lock:
+            self.match.pins.clear()
+        self.render_players()
         self.listen.configure(text="Включить связь",command=self.start_server)
         self.ip_entry.configure(state="normal")
         self.network_state.configure(text="Выключено",fg=C["muted"])
@@ -292,6 +309,14 @@ class App:
             self.root.clipboard_append(f"{self.server.server_address[0]}|{player}|{self.match.keys[player]}")
             self.note.configure(text=f"Код скопирован. В RDP-сеансе твинка {player} открой «Твинк» и вставь код.")
 
+    def show_pin(self,player):
+        if not self.server:
+            self.start_server()
+        if self.server:
+            self.match.issue_pin(player)
+            self.note.configure(text=f"Твинк {player}: введи IP и PIN вручную. Новый PIN можно получить после входа или истечения таймера.")
+            self.render_players()
+
     def join(self):
         with self.mode_lock:
             if self.farm_busy():
@@ -303,41 +328,55 @@ class App:
         if self.worker and self.worker.is_alive():
             return
         try:
-            from wastelands_alt import Alt
             from pynput import keyboard
-            parts = self.token.get().strip().split("|")
-            if len(parts)!=3 or parts[1] not in ("1","2","3") or not parts[0] or not parts[2]:
-                self.status.configure(text="Скопируй код на основе и вставь его целиком.")
-                return
-            host,num,key = parts
-            number=int(num)
+            raw = self.token.get().strip()
+            pin = None
+            if "|" in raw:
+                parts = raw.split("|")
+                if len(parts)!=3 or parts[1] not in ("1","2","3") or not parts[0] or not parts[2]:
+                    self.status.configure(text="Скопируй полный код на основе или введи IP и PIN вручную.")
+                    return
+                host,num,key = parts
+                number = int(num)
+            else:
+                try:
+                    host = str(ipaddress.IPv4Address(self.peer_addr.get().strip()))
+                except ValueError:
+                    self.status.configure(text="Введи IP, показанный рядом с PIN на основе.")
+                    return
+                pin = raw.replace(" ","")
+                if len(pin)!=8 or not pin.isascii() or not pin.isdigit():
+                    self.status.configure(text="Введи все 8 цифр PIN, включая начальные нули.")
+                    return
+                number = key = None
             slots = {u:int(v.get()) for u,v in self.slot_vars.items()}
             if len(set(slots.values()))!=4:
                 self.status.configure(text="У двух юнитов выбран один слот. Укажи четыре разных номера.")
                 return
             self.stop.clear()
-            alt = Alt(host,number,key,slots,self.stop,self.messages.put)
             if self.standalone:
                 self.listener = keyboard.Listener(on_press=lambda k:self.stop.set() if k==keyboard.Key.f6 else None)
                 self.listener.start()
-            self.worker = threading.Thread(target=self.worker_loop,args=(alt,),daemon=True)
+            self.worker = threading.Thread(target=self.worker_loop,args=(host,number,key,pin,slots),daemon=True)
             self.worker.start()
             self.refresh_tabs()
-            self.status.configure(text=f"Подключаюсь к {host} как твинк {number}…")
+            self.status.configure(text=f"Подключаюсь к {host}…")
             self.remember()
-        except ModuleNotFoundError as exc:
-            if exc.name=="cv2":
-                messagebox.showerror("Твинк","Для твинка нужен OpenCV. Установи opencv-python-headless "
-                                     "в тот же Python, которым запускается TWD Farm.")
-            else:
-                messagebox.showerror("Твинк",str(exc))
         except (ValueError,ImportError,OSError) as exc:
             messagebox.showerror("Твинк",str(exc))
 
-    def worker_loop(self,alt):
+    def worker_loop(self,host,number,key,pin,slots):
         try:
-            alt.loop()
+            from wastelands_alt import Alt
+            if pin is not None:
+                number,key = connect_by_pin(host,pin)
+            if not self.stop.is_set():
+                self.messages.put(f"Подключаюсь к {host} как твинк {number}…")
+                Alt(host,number,key,slots,self.stop,self.messages.put).loop()
             self.messages.put("Твинк остановлен")
+        except ModuleNotFoundError as exc:
+            self.messages.put("Для твинка установи opencv-python-headless в Python приложения."
+                              if exc.name=="cv2" else f"Твинк остановлен: {exc}")
         except Exception as exc:
             self.messages.put(f"Твинк остановлен: {exc}")
 
@@ -446,6 +485,17 @@ class App:
             connected = 0
             for i in PLAYERS:
                 c = self.match.clients.get(i,{})
+                pin = self.match.pins.get(i)
+                if self.server and pin and now < pin[1]:
+                    digits, deadline = pin
+                    ip = self.server.server_address[0]
+                    if ip == "0.0.0.0":
+                        ip = "локальный адрес ПК"
+                    seconds = int(deadline - now)
+                    self.pin_labels[i].configure(text=f"IP  {ip}      PIN  {digits[:4]} {digits[4:]}      {seconds//60}:{seconds%60:02}")
+                    self.pin_labels[i].pack(fill="x",pady=(4,0))
+                else:
+                    self.pin_labels[i].pack_forget()
                 online = bool(self.server and now-c.get("seen",-1e8)<8)
                 connected += int(online)
                 self.player_status[i].configure(text="●  На связи" if online else "●  Вне связи",

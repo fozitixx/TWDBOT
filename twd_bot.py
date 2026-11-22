@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "6.0.1 (Wastelands: подключение и управление твинками)"
+VERSION = "6.0.2 (Wastelands: подключение твинков по IP и PIN)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2204,9 +2204,9 @@ _update_checked = 0.0
 # 5.x updates only the entry script. These Git blob IDs identify the exact
 # companion files for this version, even after the release branch moves on.
 TEAM_FILES = {
-    "wastelands.py": "5a50df5c55b0581105fa2e9f6e2adc93e5aac9c4",
+    "wastelands.py": "0362bf455a7831773041eaaa7880d535a0ed6ea2",
     "wastelands_alt.py": "cf6ad1fd6f346215fb5330964252057b9298c44a",
-    "wastelands_team.py": "9e4fc1200f0f7925740ed5454cd234800583f8ba",
+    "wastelands_team.py": "f84bfde5b758be2881d889daa20856276bc4b254",
     "wastelands_view.py": "aa407b68979d3e741649929435579cb79f6c9f6b",
     "wastelands_ocr.ps1": "496e34e723f8a27cd6993fc72f826f398459b5b9",
 }

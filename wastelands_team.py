@@ -5,10 +5,14 @@ import math
 import secrets
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.error import HTTPError, URLError
+from urllib.request import ProxyHandler, Request, build_opener
 
 
 PORT = 47631
+PAIR_LIFETIME = 300
 PLAYERS = (1, 2, 3)
 UNITS = ("plunger", "tv", "amplifier", "screen")
 ABILITIES = ("Aerial Attack", "Hook and Punch", "Teleport")
@@ -45,6 +49,8 @@ class Match:
     def __init__(self):
         self.lock = threading.RLock()
         self.keys = {i: secrets.token_urlsafe(18) for i in PLAYERS}
+        self.pins = {}
+        self.pair_failures = deque(maxlen=12)
         self.clients = {}
         self.run = ""
         self.mode = "nightmare"
@@ -54,6 +60,36 @@ class Match:
         self.frames = {}
         self.results = {}
         self.progress = {}
+
+    def issue_pin(self, player):
+        with self.lock:
+            if player not in PLAYERS:
+                raise ValueError("Неизвестный номер твинка")
+            now = time.monotonic()
+            existing = self.pins.get(player)
+            if existing and existing[1] > now:
+                return existing[0]
+            occupied = {pin for pin, until in self.pins.values() if until > now}
+            while True:
+                pin = f"{secrets.randbelow(100_000_000):08d}"
+                if pin not in occupied:
+                    self.pins[player] = (pin, now + PAIR_LIFETIME)
+                    return pin
+
+    def redeem_pin(self, code):
+        with self.lock:
+            now = time.monotonic()
+            while self.pair_failures and now - self.pair_failures[0] >= 60:
+                self.pair_failures.popleft()
+            if len(self.pair_failures) == self.pair_failures.maxlen:
+                raise ValueError("Слишком много неверных PIN. Повтори через минуту.")
+            if isinstance(code,str) and len(code)==8 and code.isascii() and code.isdigit():
+                for player, (pin, until) in self.pins.items():
+                    if until > now and hmac.compare_digest(pin, code):
+                        del self.pins[player]
+                        return {"player":player, "key":self.keys[player]}
+            self.pair_failures.append(now)
+            raise ValueError("PIN неверен, уже использован или истёк. Проверь PIN на основе.")
 
     def start(self, mode, host):
         if mode not in ("hard", "nightmare") or not host.strip():
@@ -182,18 +218,23 @@ def serve(match, address):
 
         def do_POST(self):
             try:
-                player = int(self.path.removeprefix("/alt/"))
-                secret = self.headers.get("Authorization","")
-                if player not in PLAYERS or not hmac.compare_digest(secret, "Bearer " + match.keys[player]):
-                    self.send_error(403)
-                    return
+                pairing = self.path == "/pair"
+                if not pairing:
+                    if self.path not in ("/alt/1", "/alt/2", "/alt/3"):
+                        self.send_error(404)
+                        return
+                    player = int(self.path[-1])
+                    secret = self.headers.get("Authorization","")
+                    if not hmac.compare_digest(secret, "Bearer " + match.keys[player]):
+                        self.send_error(403)
+                        return
                 length = int(self.headers.get("Content-Length","0"))
-                if not 0 < length <= 800_000:
+                if not 0 < length <= (128 if pairing else 800_000):
                     self.send_error(413)
                     return
                 self.connection.settimeout(4)
                 req = json.loads(self.rfile.read(length))
-                body = match.exchange(player, req)
+                body = match.redeem_pin(req["pin"]) if pairing else match.exchange(player, req)
                 code = 200
             except (ValueError, KeyError, TypeError) as exc:
                 body, code = {"error":str(exc)}, 409
@@ -207,3 +248,26 @@ def serve(match, address):
     server = ThreadingHTTPServer(address, Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
+
+
+def connect_by_pin(host, pin, port=PORT):
+    req = Request(f"http://{host}:{port}/pair", data=json.dumps({"pin":pin}).encode(),
+                  headers={"Content-Type":"application/json"})
+    try:
+        with build_opener(ProxyHandler({})).open(req,timeout=4) as res:
+            data = json.load(res)
+    except HTTPError as exc:
+        with exc:
+            if exc.code == 409:
+                try:
+                    reason = json.load(exc).get("error","")
+                except ValueError:
+                    reason = ""
+                if "PIN" in reason:
+                    raise ValueError(reason) from exc
+            raise ValueError("Проверь, что на основе запущена версия 6.0.2 или новее.") from exc
+    except (URLError, OSError) as exc:
+        raise ValueError(f"Основа {host} недоступна. Проверь IP и кнопку «Включить связь».") from exc
+    if not isinstance(data,dict) or data.get("player") not in PLAYERS or not data.get("key"):
+        raise ValueError("Неверный ответ от основы. Проверь адрес и версию приложения.")
+    return data["player"], data["key"]
