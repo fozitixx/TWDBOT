@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "5.8.19 (AFK CHECK и ответы через Discord)"
+VERSION = "6.0.1 (Wastelands: подключение и управление твинками)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -567,7 +567,9 @@ _res_failed = None
 
 
 def apply_resolution():
-    want = str(SETTINGS.get("force_resolution", "")).lower().replace(" ", "").replace("×", "x")
+    want = str(SETTINGS.get("force_resolution", "")).lower().replace(" ", "").replace("×", "x").replace("х", "x")
+    if want == "1366":
+        want = "1366x768"
     if "x" not in want:
         return
     try:
@@ -575,7 +577,7 @@ def apply_resolution():
     except ValueError:
         return
     cur = screen_size()
-    if cur == (w, h):
+    if cur is None or cur == (w, h):
         return
     try:
         import ctypes
@@ -2199,6 +2201,53 @@ UPDATE_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/"
 UPDATE_EVERY = 20 * 60          # между матчами проверять не чаще, чем раз в 20 минут
 _update_checked = 0.0
 
+# 5.x updates only the entry script. These Git blob IDs identify the exact
+# companion files for this version, even after the release branch moves on.
+TEAM_FILES = {
+    "wastelands.py": "5a50df5c55b0581105fa2e9f6e2adc93e5aac9c4",
+    "wastelands_alt.py": "cf6ad1fd6f346215fb5330964252057b9298c44a",
+    "wastelands_team.py": "9e4fc1200f0f7925740ed5454cd234800583f8ba",
+    "wastelands_view.py": "aa407b68979d3e741649929435579cb79f6c9f6b",
+    "wastelands_ocr.ps1": "496e34e723f8a27cd6993fc72f826f398459b5b9",
+}
+
+
+def team_directory(download=False):
+    import hashlib
+    import tempfile
+    from pathlib import Path
+
+    def matches(data, blob):
+        return hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest() == blob
+
+    local = Path(HERE)
+    cache = local / ".twd-wastelands" / VERSION.split()[0]
+    for directory in (local, cache):
+        if all((directory / name).is_file() and matches((directory / name).read_bytes(), blob)
+               for name, blob in TEAM_FILES.items()):
+            return str(directory)
+    if not download:
+        return None
+    cache.mkdir(parents=True, exist_ok=True)
+    for name, blob in TEAM_FILES.items():
+        dest = cache / name
+        src = local / name
+        if dest.is_file() and matches(dest.read_bytes(), blob):
+            continue
+        data = src.read_bytes() if src.is_file() else b""
+        if not matches(data, blob):
+            response = _http_get(f"https://api.github.com/repos/{UPDATE_REPO}/git/blobs/{blob}", timeout=15)
+            data = base64.b64decode(json.loads(response)["content"])
+            if not matches(data, blob):
+                raise ValueError(f"Не совпала контрольная сумма {name}")
+        with tempfile.NamedTemporaryFile(dir=cache, delete=False) as tmp:
+            tmp.write(data)
+        try:
+            os.replace(tmp.name, dest)
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
+    return str(cache)
+
 
 def version_tuple(text):
     """'5.6.0 (описание)' -> (5, 6, 0)"""
@@ -3094,7 +3143,8 @@ class Bot:
         a = np.asarray(img.convert("RGB").resize((LOBBY_W, max(1, round(LOBBY_W * h / w))), Image.BOX)).astype(np.int16)
         r, g, b = a[..., 0], a[..., 1], a[..., 2]
         if mode == "nightmare":
-            mask, lo, hi = (b > 30) & (b > 2 * g + 8) & (b > 1.25 * r + 4) & (r > g), 0.6, 0.95
+            # Wastelands: центр правой из двух карточек находится на 58.6% ширины окна.
+            mask, lo, hi = (b > 30) & (b > 2 * g + 8) & (b > 1.25 * r + 4) & (r > g), 0.52, 0.95
         else:
             mask, lo, hi = (r > 35) & (r > 3 * g + 5) & (r > 3 * b + 5), 0.4, 0.75
         blobs = _blobs(mask)
@@ -5374,6 +5424,9 @@ class FarmApp:
         self.bot = None
         self.thread = None
         self.link = None
+        self.team = None
+        self.team_install = None
+        self.mode_lock = threading.RLock()
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.configure(bg=C["bg"])
@@ -5438,7 +5491,7 @@ class FarmApp:
         self.label(t, "TWD Farm", 13, "text", "bold", bg="side").pack(anchor="w")
         self.mode_sub = self.label(t, "Invaded City", 8, "muted", bg="side")
         self.mode_sub.pack(anchor="w")
-        for key, icon, name in [("home", "⌂", "Главная"), ("settings", "⚙", "Настройки"),
+        for key, icon, name in [("home", "⌂", "Главная"), ("wastelands", "◈", "Wastelands"), ("settings", "⚙", "Настройки"),
                                 ("stock", "🛒", "Сток"), ("discord", "✉", "Discord"), ("log", "≡", "Журнал")]:
             b = tk.Label(side, text=f"  {icon}   {name}", anchor="w", font=(FONT, 11), fg=C["muted"],
                          bg=C["side"], padx=14, pady=10, cursor="hand2")
@@ -5454,6 +5507,7 @@ class FarmApp:
         self.main.pack(side="left", fill="both", expand=True)
         self.current = None
         self._page_home()
+        self.pages["wastelands"] = tk.Frame(self.main, bg=C["bg"])
         self._page_settings()
         self._page_stock()
         self._page_discord()
@@ -5462,10 +5516,67 @@ class FarmApp:
     def show(self, key):
         for k, p in self.pages.items():
             p.pack_forget()
-        self.pages[key].pack(fill="both", expand=True, padx=26, pady=22)
+        padding = 6 if key=="wastelands" else 26
+        self.pages[key].pack(fill="both", expand=True, padx=padding, pady=12 if key=="wastelands" else 22)
         for k, b in self.nav.items():
             b.configure(bg=C["card"] if k == key else C["side"], fg=C["text"] if k == key else C["muted"])
         self.current = key
+        if key == "wastelands":
+            self.mode_sub.configure(text="Wastelands", fg=C["accent"])
+            self.hk.configure(text="F6 — остановить помощника")
+            if self.team is None and self.team_install is None:
+                self.open_team()
+        else:
+            self._units_sig = None
+            self._draw_units()
+            self.hk.configure(text="F8 — старт   F6 — стоп")
+
+    def open_team(self):
+        page = self.pages["wastelands"]
+        for widget in page.winfo_children():
+            widget.destroy()
+        try:
+            directory = team_directory()
+            if directory:
+                self.mount_team(directory)
+                return
+        except (OSError, ImportError) as exc:
+            self.team_error(exc)
+            return
+        import queue
+        result = queue.SimpleQueue()
+        self.team_install = result
+        self.label(page, "Загружаю компоненты Wastelands…", bg="bg").pack(anchor="w", padx=10)
+
+        def fetch():
+            try:
+                result.put(team_directory(download=True))
+            except Exception as exc:
+                result.put(exc)
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def mount_team(self, directory):
+        if directory not in sys.path[:1]:
+            sys.path.insert(0, directory)
+        from wastelands import App
+        page = self.pages["wastelands"]
+        for widget in page.winfo_children():
+            widget.destroy()
+        self.team = App(page, prefs=SETTINGS.get("wastelands"), save_prefs=self.save_team,
+                        farm_busy=lambda: self.thread is not None and self.thread.is_alive(),
+                        mode_lock=self.mode_lock)
+
+    def save_team(self, prefs):
+        if SETTINGS.get("wastelands") != prefs:
+            SETTINGS["wastelands"] = prefs
+            save_settings()
+
+    def team_error(self, error):
+        page = self.pages["wastelands"]
+        for widget in page.winfo_children():
+            widget.destroy()
+        self.label(page, f"Не удалось открыть Wastelands: {error}", bg="bg", wraplength=480).pack(anchor="w")
+        self.flat_button(page, "Повторить", self.open_team).pack(anchor="w", pady=10)
 
     def header(self, page, title, sub):
         h = self.tk.Frame(page, bg=C["bg"])
@@ -5591,7 +5702,8 @@ class FarmApp:
         for k, b in self.mode_btn.items():
             b.configure(bg=C["accent"] if k == mode else C["entry"], fg="#0f1115" if k == mode else C["muted"])
         col = C["red"] if mode == "hard" else "#b07cff"
-        self.mode_sub.configure(text=f"Invaded City · {MODES[mode]['title']}", fg=col)
+        if self.current != "wastelands":
+            self.mode_sub.configure(text=f"Invaded City · {MODES[mode]['title']}", fg=col)
         self.mode_note.configure(text=f"{MODES[mode]['waves']} волн")
         for w in self.units_row.winfo_children():
             w.destroy()
@@ -5742,6 +5854,7 @@ class FarmApp:
     def _page_settings(self):
         p = self.scroll_page("settings")
         self.header(p, "Настройки", "Сохраняются в settings.json рядом с приложением")
+        self.flat_button(p, "Wastelands · основа и твинки", lambda: self.show("wastelands")).pack(anchor="w", pady=(0, 10))
         s = self.section(p, "Матчи")
         self.entry(s, "loops", "Сколько матчей сыграть", "0 — без ограничений", width=8)
         self.switch(s, "use_speed", "Включать скорость игры", "Какую именно - выбирается на главной странице (1x / 1.5x / 2x)")
@@ -5758,7 +5871,8 @@ class FarmApp:
         self.switch(s, "roblox_fullscreen", "Держать Roblox на весь экран (F11)",
                     "Бот рассчитан на картинку 16:9 — в окне с панелью задач клики смещаются")
         self.entry(s, "force_resolution", "Разрешение экрана при старте фарма",
-                   "Например 1920x1080. Пусто — не трогать. Полезно на ПК без монитора (RDP/tscon)", width=14)
+                   "1366 = 1366×768. Можно указать другой размер, например 1920x1080. "
+                   "Для активного RDP размер задаётся при подключении. Пусто — оставить текущий.", width=14)
         bar = self.tk.Frame(p, bg=C["bg"])
         bar.pack(fill="x", pady=(4, 20))
         self.flat_button(bar, "Сохранить", self.save).pack(side="left")
@@ -5968,6 +6082,13 @@ class FarmApp:
 
     def start_farm(self):
         """Можно вызывать из любого потока (кнопка, F8, /start)."""
+        with self.mode_lock:
+            if self.team and self.team.active():
+                log("Сначала останови помощника Wastelands")
+                return False
+            return self._start_farm()
+
+    def _start_farm(self):
         if self.thread is not None and self.thread.is_alive():
             return False
         self.bot = Bot(use_speed=bool(SETTINGS.get("use_speed", True)), hotkeys=False)
@@ -6015,12 +6136,26 @@ class FarmApp:
             save_settings()
 
     def _on_hotkey(self, key):
-        if key == START_KEY:
+        if key == START_KEY and self.current != "wastelands":
             self.start_farm()
         elif key == ABORT_KEY:
             self.stop_farm()
+            if self.team and self.team.active():
+                self.team.stop.set()
+                if self.team.match.run:
+                    self.root.after(0, self.team.stop_match)
 
     def tick(self):
+        if self.team_install is not None and not self.team_install.empty():
+            result = self.team_install.get()
+            self.team_install = None
+            if isinstance(result, Exception):
+                self.team_error(result)
+            else:
+                try:
+                    self.mount_team(result)
+                except (OSError, ImportError) as exc:
+                    self.team_error(exc)
         while _gui_queue:
             line = _gui_queue.popleft()
             self._append(self.log_txt, line, 3000)
@@ -6077,6 +6212,9 @@ class FarmApp:
 
     def on_close(self):
         self.stop_farm()
+        self.hotkeys.stop()
+        if self.team:
+            self.team.close()
         try:
             self.save_quiet()
         finally:
@@ -6100,7 +6238,7 @@ def diag():
     bot.check()
     img = bot.grab()
     img.save(os.path.join(HERE, "diag_screen.png"))
-    log(f"окно: {bot.rect()}")
+    log(f"игровая область: {img.width}×{img.height} пикселей; границы окна: {bot.rect()}")
     log(f"деньги: {bot.money()}")
     log(f"финальный экран: {bot.end_screen()}; выбор сложности: {bot.vote_screen()} "
         f"(отличие {vote_diff(bot.grab(VOTE_BOX)):.1f}); READY: {bot.ready_visible()}")
@@ -6118,7 +6256,7 @@ def diag():
 
 def main():
     parser = argparse.ArgumentParser(description="TWD Farm - бот для Toilet Warfare Defense (HARD)")
-    parser.add_argument("cmd", nargs="?", default="app", choices=["app", "run", "diag"],
+    parser.add_argument("cmd", nargs="?", default="app", choices=["app", "wastelands", "run", "diag"],
                         help="app - окно приложения (по умолчанию), run - консольный режим, diag - диагностика")
     parser.add_argument("--loops", type=int, default=None, help="сколько матчей сыграть (0 - бесконечно)")
     parser.add_argument("--no-speed", action="store_true", help="не нажимать 1.5x")
@@ -6126,10 +6264,12 @@ def main():
     args = parser.parse_args()
     enable_dpi_awareness()
     load_settings()
-    if args.cmd in ("app", "run") and self_update():
+    if args.cmd in ("app", "wastelands", "run") and self_update():
         restart_app(resume=args.resume)
-    if args.cmd == "app":
+    if args.cmd in ("app", "wastelands"):
         app = FarmApp()
+        if args.cmd == "wastelands":
+            app.show("wastelands")
         if args.resume:
             app.root.after(2500, app.start_farm)
         app.run()
@@ -6147,4 +6287,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.modules.setdefault("twd_bot", sys.modules[__name__])
     main()

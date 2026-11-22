@@ -17,4 +17,8 @@ if not defined PY (
 )
 for %%D in ("%PY%") do set "PYW=%%~dpDpythonw.exe"
 if not exist "%PYW%" set "PYW=%PY%"
-start "" "%PYW%" "%~dp0twd_bot.py"
+if /i "%~1"=="wastelands" (
+  start "" "%PYW%" "%~dp0twd_bot.py" wastelands
+) else (
+  start "" "%PYW%" "%~dp0twd_bot.py"
+)

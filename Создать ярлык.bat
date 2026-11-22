@@ -26,7 +26,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo Ставлю библиотеки...
-"%PY%" -m pip install --upgrade pynput numpy pillow websocket-client
+"%PY%" -m pip install --upgrade pynput numpy pillow websocket-client opencv-python-headless
 if errorlevel 1 (echo Не удалось поставить библиотеки - пришли скриншот этого окна & pause & exit /b 1)
 echo Создаю ярлык "TWD Farm" на рабочем столе...
 set "TWD_DIR=%~dp0"
