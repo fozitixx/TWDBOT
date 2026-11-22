@@ -3,6 +3,7 @@ import base64
 import io
 import ipaddress
 import queue
+import re
 import socket
 import threading
 import time
@@ -12,7 +13,24 @@ from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 
 from twd_bot import C, FONT
-from wastelands_team import ABILITIES, Match, PLAYERS, PORT, UNITS, connect_by_pin, serve
+from wastelands_team import ABILITIES, AltConnection, Match, PLAYERS, PORT, UNITS, Wait, connect_by_pin, serve
+
+
+def peer_host(value):
+    value = value.strip().rstrip(".")
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ValueError:
+        try:
+            value = value.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError("Проверь сетевое имя компьютера основы.") from None
+        labels = value.split(".")
+        if (len(value) <= 253 and not all(part.isdigit() for part in labels)
+                and all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", part)
+                        for part in labels)):
+            return value
+        raise ValueError("Введи IP или сетевое имя компьютера основы.") from None
 
 
 def text(parent, value, *, size=10, color="text", bold=False, **options):
@@ -132,6 +150,7 @@ class App:
         text(line, "IP основы", size=9, color="muted").pack(side="left")
         self.ip_entry = field(line, textvariable=self.addr, width=16)
         self.ip_entry.pack(side="left", padx=8, ipady=3)
+        text(line, "Имя ПК: " + socket.gethostname(), size=9, color="muted").pack(side="left")
 
         match = card(body)
         match.pack(fill="x", pady=(0, 6))
@@ -190,7 +209,7 @@ class App:
         text(conn,"На основе нажми «Показать PIN» в строке этого твинка.",size=9,color="muted").pack(anchor="w",pady=(3,5))
         fields = tk.Frame(conn,bg=C["card"])
         fields.pack(fill="x")
-        text(fields,"IP основы",size=9,color="muted").grid(row=0,column=0,sticky="w")
+        text(fields,"IP или имя ПК основы",size=9,color="muted").grid(row=0,column=0,sticky="w")
         text(fields,"PIN из 8 цифр или скопированный код",size=9,color="muted").grid(row=0,column=1,sticky="w")
         field(fields,textvariable=self.peer_addr,width=17).grid(row=1,column=0,sticky="ew",ipady=4,padx=(0,12))
         self.connection_code = tk.StringVar()
@@ -340,9 +359,9 @@ class App:
                 number = int(num)
             else:
                 try:
-                    host = str(ipaddress.IPv4Address(self.peer_addr.get().strip()))
-                except ValueError:
-                    self.status.configure(text="Введи IP, показанный рядом с PIN на основе.")
+                    host = peer_host(self.peer_addr.get())
+                except ValueError as exc:
+                    self.status.configure(text=str(exc))
                     return
                 pin = raw.replace(" ","")
                 if len(pin)!=8 or not pin.isascii() or not pin.isdigit():
@@ -367,16 +386,25 @@ class App:
 
     def worker_loop(self,host,number,key,pin,slots):
         try:
-            from wastelands_alt import Alt
             if pin is not None:
+                try:
+                    host = socket.gethostbyname(host)
+                except OSError as exc:
+                    raise ValueError("Не удалось найти основу по имени. Введи IP из её окна.") from exc
                 number,key = connect_by_pin(host,pin)
-            if not self.stop.is_set():
-                self.messages.put(f"Подключаюсь к {host} как твинк {number}…")
-                Alt(host,number,key,slots,self.stop,self.messages.put).loop()
+            connection = AltConnection(host, number, key)
+            while not self.stop.is_set():
+                try:
+                    connection.exchange(status="Загружаю распознавание")
+                except Wait as exc:
+                    self.messages.put(str(exc))
+                    self.stop.wait(1)
+                    continue
+                self.messages.put(f"Твинк {number} на связи. Загружаю распознавание…")
+                from wastelands_alt import Alt
+                Alt(connection,slots,self.stop,self.messages.put).loop()
+                break
             self.messages.put("Твинк остановлен")
-        except ModuleNotFoundError as exc:
-            self.messages.put("Для твинка установи opencv-python-headless в Python приложения."
-                              if exc.name=="cv2" else f"Твинк остановлен: {exc}")
         except Exception as exc:
             self.messages.put(f"Твинк остановлен: {exc}")
 

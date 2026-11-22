@@ -6,6 +6,8 @@ import unittest
 import base64
 import json
 import tempfile
+import queue
+from functools import partial
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
@@ -14,11 +16,50 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from wastelands_alt import Alt, Wait, level, manager_card, countdown
-from wastelands_team import Match, PAIR_LIFETIME, PLAYERS, UNITS, connect_by_pin, position, serve
+from wastelands_team import AltConnection, Match, PAIR_LIFETIME, PLAYERS, UNITS, connect_by_pin, position, serve
 from wastelands_view import OCR, label, road_pose, screen_point
 
 
 class IntegrationTest(unittest.TestCase):
+    def test_peer_address(self):
+        from wastelands import peer_host
+        self.assertEqual(peer_host(" main-pc.lan "), "main-pc.lan")
+        self.assertEqual(peer_host("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(peer_host("основа"), "основа".encode("idna").decode("ascii"))
+        for value in ("", "192.168.0.999", "http://main", "main:47631", "main/path"):
+            with self.assertRaises(ValueError):
+                peer_host(value)
+
+    def test_three_workers_pair_and_wait_for_match(self):
+        from wastelands import App
+        match = Match()
+        server = serve(match,("127.0.0.1",0))
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        workers = []
+        slots = dict(zip(UNITS,(4,5,1,3)))
+        with patch("wastelands.connect_by_pin", partial(connect_by_pin, port=server.server_port)), \
+             patch("wastelands.AltConnection", partial(AltConnection, port=server.server_port)):
+            try:
+                for player in PLAYERS:
+                    panel = App.__new__(App)
+                    panel.stop = threading.Event()
+                    panel.messages = queue.SimpleQueue()
+                    worker = threading.Thread(target=panel.worker_loop,
+                        args=("localhost",None,None,match.issue_pin(player),slots))
+                    workers.append((panel,worker))
+                    worker.start()
+                for panel,_ in workers:
+                    self.assertIn("на связи", panel.messages.get(timeout=5))
+                    self.assertEqual(panel.messages.get(timeout=5), "На связи · жду матч")
+                with match.lock:
+                    self.assertEqual(set(match.clients), set(PLAYERS))
+            finally:
+                for panel,worker in workers:
+                    panel.stop.set()
+                    worker.join(5)
+                    self.assertFalse(worker.is_alive())
+
     def test_page_in_regular_farm_window(self):
         import twd_bot as farm
         with patch.object(farm,"log"), patch.object(farm.keyboard,"Listener"), \
@@ -86,9 +127,9 @@ class NetworkTest(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
         self.alts = []
         for i in PLAYERS:
-            a = Alt("127.0.0.1",i,self.match.keys[i],dict(zip(UNITS,(4,5,1,3))),
+            connection = AltConnection("127.0.0.1", i, self.match.keys[i], self.server.server_port)
+            a = Alt(connection,dict(zip(UNITS,(4,5,1,3))),
                     threading.Event(),lambda status:None)
-            a.url = f"http://127.0.0.1:{self.server.server_port}/alt/{i}"
             self.alts.append(a)
         self.match.start("nightmare","S4R")
         for a in self.alts:
@@ -101,7 +142,7 @@ class NetworkTest(unittest.TestCase):
             self.assertEqual(self.match.issue_pin(alt.player),code)
             number,key = connect_by_pin("127.0.0.1",code,self.server.server_port)
             self.assertEqual(number,alt.player)
-            alt.key = key
+            alt.connection.key = key
             self.assertEqual(alt.exchange()["run"],self.match.run)
             with self.assertRaisesRegex(ValueError,"PIN"):
                 connect_by_pin("127.0.0.1",code,self.server.server_port)
@@ -169,9 +210,9 @@ class NetworkTest(unittest.TestCase):
 
     def test_identity_and_lease(self):
         a=self.alts[0]
-        with patch.object(a,"key",self.alts[1].key),self.assertRaises(Wait):
+        with patch.object(a.connection,"key",self.alts[1].connection.key),self.assertRaises(Wait):
             a.exchange()
-        with patch.object(a,"instance","another"),self.assertRaises(Wait):
+        with patch.object(a.connection,"instance","another"),self.assertRaises(Wait):
             a.exchange()
         self.match.command(1,"Hook and Punch")
         self.match.pending[1]["until"] = time.monotonic()-1
@@ -254,6 +295,17 @@ class VisionTest(unittest.TestCase):
                 pixel=np.array(screen_point(pose,p))*frame.size
                 self.assertLess(np.linalg.norm(pixel-point(p)),19,(angle,p,pixel,point(p)))
         self.assertIsNone(road_pose(Image.new("RGB",(1366,768))))
+
+    def test_stationary_terrain_without_opencv(self):
+        from wastelands_view import tracked_pose
+        terrain = np.random.default_rng(12).integers(0,256,(180,320),dtype=np.uint8)
+        frame = Image.fromarray(terrain)
+        pose = (np.array([.41,.41]),np.diag([1/2048,1/1152]))
+        with patch("wastelands_view.cv2", None):
+            self.assertIs(tracked_pose(frame,pose,frame),pose)
+            self.assertIsNone(tracked_pose(frame,pose,Image.fromarray(np.roll(terrain,4,axis=1))))
+            blank = Image.new("L",frame.size)
+            self.assertIsNone(tracked_pose(blank,pose,blank))
 
     @unittest.skipUnless(sys.platform=="win32","Windows OCR")
     def test_windows_manager_ocr(self):

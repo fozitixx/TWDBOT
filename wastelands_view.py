@@ -6,12 +6,71 @@ import math
 from pathlib import Path
 import subprocess
 
-import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
+
+try:
+    import cv2
+except (ImportError, OSError):
+    cv2 = None
 
 
 ANCHOR = np.array([835., 475.])
+
+
+def color_boxes(mask):
+    if cv2 is not None:
+        contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        return [cv2.boundingRect(contour) for contour in contours]
+    # A UI border and the space enclosed by it can each delimit a card.
+    boxes = []
+    for foreground in (mask, 1-mask):
+        runs = np.diff(np.pad(foreground, ((0, 0), (1, 1))).astype(np.int8), axis=1)
+        parents, bounds, previous = [], [], []
+
+        def root(i):
+            while parents[i] != i:
+                parents[i] = parents[parents[i]]
+                i = parents[i]
+            return i
+
+        for y, row in enumerate(runs):
+            current = []
+            index = 0
+            for left, right in zip(np.flatnonzero(row == 1), np.flatnonzero(row == -1)):
+                node = len(parents)
+                parents.append(node)
+                bounds.append((left, y, right, y+1))
+                while index < len(previous) and previous[index][1] < left:
+                    index += 1
+                j = index
+                while j < len(previous) and previous[j][0] <= right:
+                    parents[root(previous[j][2])] = node
+                    j += 1
+                current.append((left, right, node))
+            previous = current
+        merged = {}
+        for i, (left, top, right, bottom) in enumerate(bounds):
+            key = root(i)
+            x, y, r, b = merged.get(key, (left, top, right, bottom))
+            merged[key] = (min(x,left), min(y,top), max(r,right), max(b,bottom))
+        boxes.extend((x,y,r-x,b-y) for x,y,r,b in merged.values())
+    return boxes
+
+
+def _binary_match(template, spectrum, integral, shape):
+    """Normalized correlation of binary images over fully visible placements."""
+    h, w = template.shape
+    totals = integral[h:,w:] - integral[:-h,w:] - integral[h:,:-w] + integral[:-h,:-w]
+    freq = np.fft.rfft2(template, s=shape, axes=(0,1))
+    hits = np.fft.irfft2(spectrum * freq.conj(), s=shape, axes=(0,1))
+    area = template.size
+    count = float(template.sum())
+    norm = np.sqrt(totals*(1-totals/area) * count*(1-count/area))
+    covariance = hits[:totals.shape[0], :totals.shape[1]] - totals*(count/area)
+    scores = np.divide(covariance, norm, out=np.zeros_like(covariance), where=norm>0)
+    y,x = np.unravel_index(scores.argmax(), scores.shape)
+    return scores[y,x], (x,y)
 
 
 def road_pose(img):
@@ -25,6 +84,10 @@ def road_pose(img):
     mask[:int(.14*h),int(.31*w):int(.67*w)] = 0
     if mask.mean() < .014:
         return None
+    if cv2 is None:
+        shape = (math.ceil(h/32)*32, w)
+        spectrum = np.fft.rfft2(mask, s=shape, axes=(0,1))
+        integral = np.pad(mask.cumsum(0,dtype=np.int32).cumsum(1,dtype=np.int32), ((1,0),(1,0)))
     # Lines entering/leaving the junction, including the second bend above it.
     edges = [((570,295),(1085,645)), ((835,475),(990,246)), ((990,246),(805,125))]
     best = None
@@ -36,11 +99,23 @@ def road_pose(img):
             pts = (np.asarray(edges)-ANCHOR) @ mat.T
             lo = np.floor(pts.min(axis=(0,1))-5).astype(int)
             hi = np.ceil(pts.max(axis=(0,1))+5).astype(int)
-            template = np.zeros(tuple((hi-lo+1)[::-1]),np.uint8)
-            for a,bp in np.rint(pts-lo).astype(int):
-                cv2.line(template,tuple(a),tuple(bp),1,max(3,round(46*k)))
-            scores = cv2.matchTemplate(mask,template,cv2.TM_CCOEFF_NORMED)
-            _,score,_,xy = cv2.minMaxLoc(scores)
+            width, height = hi-lo+1
+            if width>w or height>h:
+                continue
+            lines = np.rint(pts-lo).astype(int).tolist()
+            stroke = max(3,round(46*k))
+            if cv2 is None:
+                template = Image.new("L", (width, height))
+                draw = ImageDraw.Draw(template)
+                for a,bp in lines:
+                    draw.line((tuple(a),tuple(bp)), fill=1, width=stroke)
+                score,xy = _binary_match(np.asarray(template), spectrum, integral, shape)
+            else:
+                template = np.zeros((height,width),np.uint8)
+                for a,bp in lines:
+                    cv2.line(template,tuple(a),tuple(bp),1,stroke)
+                scores = cv2.matchTemplate(mask,template,cv2.TM_CCOEFF_NORMED)
+                _,score,_,xy = cv2.minMaxLoc(scores)
             if best is None or score>best[0]:
                 best = score, np.asarray(xy)-lo, mat
     if best is None or best[0] < .62:
@@ -107,6 +182,22 @@ def scene(img):
 
 def tracked_pose(reference, pose, img):
     """Update a known map pose from terrain when all unit slots are already full."""
+    if cv2 is None:
+        # Reuse the pose only if textured terrain in separate quadrants is stationary.
+        # On camera movement the caller can take a new measurement from the road.
+        if img.size != reference.size:
+            return None
+        def terrain(frame):
+            return np.asarray(frame.convert("L").resize((320,180), Image.Resampling.BILINEAR), dtype=np.int16)
+        old, new = terrain(reference), terrain(img)
+        matches = 0
+        for y in (48, 92):
+            for x in (40, 192):
+                patch = old[y:y+36, x:x+76]
+                changed = abs(new[y:y+36, x:x+76] - patch)
+                if patch.std() > 8 and np.mean(changed < 5) > .92:
+                    matches += 1
+        return pose if matches >= 3 else None
     def features(frame):
         a=np.asarray(frame.convert("L").resize((640,360),Image.Resampling.BILINEAR))
         mask=np.zeros_like(a)

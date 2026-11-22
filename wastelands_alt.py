@@ -1,23 +1,14 @@
 """One foreground Roblox client. All game input is serialized in this worker."""
-import json
 import re
-import secrets
 import time
-from urllib.error import HTTPError
-from urllib.request import ProxyHandler, Request, build_opener
 
-import cv2
 import numpy as np
 from PIL import ImageGrab
 from pynput import mouse
 
 import twd_bot as farm
-from wastelands_team import ABILITIES, PORT, UNITS, position
-from wastelands_view import OCR, label, map_point, preview, road_pose, scene, screen_point, tracked_pose
-
-
-class Wait(Exception):
-    pass
+from wastelands_team import ABILITIES, UNITS, Wait, position
+from wastelands_view import OCR, color_boxes, label, map_point, preview, road_pose, scene, screen_point, tracked_pose
 
 
 class Game(farm.Bot):
@@ -71,11 +62,9 @@ def manager_card(img, words, unit):
     rgb = np.asarray(img.convert("RGB")).astype(np.int16)
     r,g,b = rgb.transpose(2,0,1)
     mask = ((r>140)&(r-g>85)&(r-b>75)).astype(np.uint8)
-    contours,_ = cv2.findContours(mask,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
     w,h = img.size
     choices = []
-    for c in contours:
-        x,y,cw,ch = cv2.boundingRect(c)
+    for x,y,cw,ch in color_boxes(mask):
         if not (.09*w<cw<.49*w and .09*h<ch<.8*h):
             continue
         if x<title[0]*w<x+cw and y<title[1]*h<y+.27*ch:
@@ -101,8 +90,7 @@ def manager_bounds(img):
     rgb=np.asarray(img.convert("RGB")).astype(np.int16)
     r,g,b=rgb.transpose(2,0,1)
     cyan=((g>130)&(b>140)&(g-r>65)&(b-r>65)).astype(np.uint8)
-    contours,_=cv2.findContours(cyan,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
-    boxes=[cv2.boundingRect(c) for c in contours]
+    boxes = color_boxes(cyan)
     return max((p for p in boxes if .20*img.width<p[2]<.82*img.width and p[3]>.45*img.height),
                key=lambda p:p[2]*p[3],default=None)
 
@@ -123,12 +111,10 @@ def countdown(row,action,button):
 
 
 class Alt:
-    def __init__(self, addr, player, key, slots, stop, notify):
-        self.url = f"http://{addr}:{PORT}/alt/{player}"
-        self.http = build_opener(ProxyHandler({}))
-        self.player,self.key,self.slots = player,key,slots
+    def __init__(self, connection, slots, stop, notify):
+        self.connection = connection
+        self.player, self.slots = connection.player, slots
         self.stop,self.notify = stop,notify
-        self.instance = secrets.token_hex(12)
         self.run = ""
         self.status = "Подключение"
         self.ocr = OCR()
@@ -137,17 +123,7 @@ class Alt:
         self.deadline = None
 
     def exchange(self, op="poll", **fields):
-        data = dict(instance=self.instance,run=self.run,status=self.status,op=op,**fields)
-        req = Request(self.url,data=json.dumps(data).encode(),headers={"Authorization":"Bearer "+self.key,
-                      "Content-Type":"application/json"})
-        try:
-            with self.http.open(req,timeout=3) as res:
-                return json.load(res)
-        except HTTPError as exc:
-            with exc:
-                if exc.code == 409:
-                    raise Wait(json.load(exc)["error"]) from exc
-                raise Wait(f"Ошибка сети {exc.code}; проверь номер и ключ") from exc
+        return self.connection.exchange(op, run=self.run, status=self.status, **fields)
 
     def guard(self):
         if self.stop.is_set() or not self.run:

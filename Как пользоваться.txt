@@ -1,4 +1,4 @@
-TWD Farm 6.0.2 — Wastelands и Invaded City
+TWD Farm 6.0.3 — Wastelands и Invaded City
 
 1. Для установки запусти «Создать ярлык.bat». Открывай приложение через ярлык TWD Farm или «Запуск.bat».
 2. Для совместного матча открой Wastelands в левом меню. Во вкладке «Основа» находятся LAN-адрес,

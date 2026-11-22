@@ -45,6 +45,34 @@ def segment_distance(p, a, b):
     return math.dist(p, mix(a, b, min(1, max(0, t))))
 
 
+class Wait(Exception):
+    pass
+
+
+class AltConnection:
+    def __init__(self, host, player, key, port=PORT):
+        self.url = f"http://{host}:{port}/alt/{player}"
+        self.player = player
+        self.key = key
+        self.instance = secrets.token_hex(12)
+        self.http = build_opener(ProxyHandler({}))
+
+    def exchange(self, op="poll", *, run="", status="Подключение", **fields):
+        payload = dict(instance=self.instance, run=run, status=status, op=op, **fields)
+        request = Request(self.url, data=json.dumps(payload).encode(), headers={
+            "Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
+        try:
+            with self.http.open(request, timeout=3) as response:
+                return json.load(response)
+        except HTTPError as exc:
+            with exc:
+                if exc.code == 409:
+                    raise Wait(json.load(exc)["error"]) from exc
+                raise Wait(f"Основа ответила HTTP {exc.code}. Проверь номер и код подключения.") from exc
+        except (URLError, OSError) as exc:
+            raise Wait("Нет связи с основой. Проверь IP и кнопку «Включить связь».") from exc
+
+
 class Match:
     def __init__(self):
         self.lock = threading.RLock()
