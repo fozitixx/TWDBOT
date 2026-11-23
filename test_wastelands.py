@@ -136,18 +136,51 @@ class IntegrationTest(unittest.TestCase):
     def test_upgrade_from_single_file(self):
         import twd_bot as farm
         src = Path(farm.HERE)
-        files = {blob:(src/name).read_bytes() for name,blob in farm.TEAM_FILES.items()}
         def fetch(url,timeout):
-            data = files[url.rsplit("/",1)[1]]
-            return json.dumps({"content":base64.b64encode(data).decode()}).encode()
+            name = url.rsplit("/",1)[1]
+            self.assertIn(name,farm.TEAM_FILES)
+            self.assertEqual(url,f"https://raw.githubusercontent.com/{farm.UPDATE_REPO}/{farm.TEAM_REVISION}/{name}")
+            return (src/name).read_bytes()
         with tempfile.TemporaryDirectory() as tmp, patch.object(farm,"HERE",tmp), \
              patch.object(farm,"_http_get",side_effect=fetch) as http:
             self.assertIsNone(farm.team_directory())
             cached = farm.team_directory(download=True)
-            self.assertEqual(http.call_count,len(files))
+            self.assertEqual(http.call_count,len(farm.TEAM_FILES))
             self.assertEqual(farm.team_directory(),cached)
             for name in farm.TEAM_FILES:
                 self.assertEqual((Path(cached)/name).read_bytes(),(src/name).read_bytes())
+
+    def test_offline_open_with_bundled_or_previously_cached_components(self):
+        import twd_bot as farm
+        src = Path(farm.HERE)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(farm,"HERE",tmp), \
+             patch.object(farm,"_http_get",side_effect=AssertionError("unexpected download")):
+            root = Path(tmp)
+            previous = root/".twd-wastelands"/"6.0.14"
+            previous.mkdir(parents=True)
+            for name in farm.TEAM_FILES:
+                (root/name).write_bytes((src/name).read_bytes())
+            self.assertEqual(farm.team_directory(),tmp)
+            for name in ("wastelands.py","wastelands_alt.py"):
+                (root/name).rename(previous/name)
+                (root/name).write_bytes(b"outdated")
+            directory = Path(farm.team_directory(download=True))
+            for name in farm.TEAM_FILES:
+                self.assertEqual((directory/name).read_bytes(),(src/name).read_bytes())
+
+    def test_damaged_download_can_be_retried(self):
+        import twd_bot as farm
+        src = Path(farm.HERE)
+        files = list(farm.TEAM_FILES)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(farm,"HERE",tmp):
+            with patch.object(farm,"_http_get",side_effect=[(src/files[0]).read_bytes(),b"damaged"]):
+                with self.assertRaisesRegex(ValueError,files[1]):
+                    farm.team_directory(download=True)
+            self.assertIsNone(farm.team_directory())
+            with patch.object(farm,"_http_get",side_effect=lambda url,timeout:(src/url.rsplit("/",1)[1]).read_bytes()) as http:
+                cache = Path(farm.team_directory(download=True))
+                self.assertEqual(http.call_count,len(files)-1)
+                self.assertEqual((cache/files[1]).read_bytes(),(src/files[1]).read_bytes())
 
 
 class InviteInputTest(unittest.TestCase):

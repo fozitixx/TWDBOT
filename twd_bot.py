@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "6.0.14 (Wasteland: голосование и расстановка)"
+VERSION = "6.0.15 (Wasteland: голосование и расстановка)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2205,6 +2205,8 @@ _update_checked = 0.0
 
 # 5.x updates only the entry script. These Git blob IDs identify the exact
 # companion files for this version, even after the release branch moves on.
+# Pin the raw download to a commit containing this entire set of files.
+TEAM_REVISION = "205bb7d07bb157693788aa2a524b1da579d56372"
 TEAM_FILES = {
     "wastelands.py": "f044ee877c68e9c7a6925a3f2399942c3815ef88",
     "wastelands_alt.py": "e785700e2d3bb4adb9643595eb3f94c26b802270",
@@ -2231,15 +2233,25 @@ def team_directory(download=False):
     if not download:
         return None
     cache.mkdir(parents=True, exist_ok=True)
+    previous = sorted((p for p in cache.parent.iterdir() if p != cache and p.is_dir()),
+                      key=lambda p: version_tuple(p.name), reverse=True)
     for name, blob in TEAM_FILES.items():
         dest = cache / name
-        src = local / name
         if dest.is_file() and matches(dest.read_bytes(), blob):
             continue
-        data = src.read_bytes() if src.is_file() else b""
-        if not matches(data, blob):
-            response = _http_get(f"https://api.github.com/repos/{UPDATE_REPO}/git/blobs/{blob}", timeout=15)
-            data = base64.b64decode(json.loads(response)["content"])
+        for directory in (local, *previous):
+            source = directory / name
+            if source.is_file():
+                data = source.read_bytes()
+                if matches(data, blob):
+                    break
+        else:
+            url = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{TEAM_REVISION}/{name}"
+            try:
+                data = _http_get(url, timeout=15)
+            except OSError as exc:
+                raise OSError(f"Не удалось скачать {name}. Распакуй полный ZIP этой версии "
+                              f"в папку с twd_bot.py и открой Wastelands снова. ({exc})") from exc
             if not matches(data, blob):
                 raise ValueError(f"Не совпала контрольная сумма {name}")
         with tempfile.NamedTemporaryFile(dir=cache, delete=False) as tmp:
