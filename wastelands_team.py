@@ -276,10 +276,14 @@ class Match:
             if name == "snapshot":
                 self.frames.pop(player, None)
 
-    def reserve(self, player, unit, point):
+    def reserve(self, player, unit, point, count_before=None):
         if not isinstance(point, list) or len(point) != 2 or not all(
                 type(x) in (int,float) and math.isfinite(x) for x in point):
             raise ValueError("Некорректная точка")
+        if count_before is not None:
+            limit = 4 if unit.partition("_")[0] in EARLY else 1
+            if type(count_before) is not int or not 0<=count_before<limit:
+                raise ValueError("Некорректный счётчик перед постановкой")
         x,y = point
         if not (0 < x < 2048 and 0 < y < 1152):
             raise ValueError("Точка вне карты")
@@ -313,6 +317,7 @@ class Match:
             for occupied in (other["point"], other.get("target")):
                 if occupied and math.dist(point, occupied) < clearance:
                     raise ValueError("Рядом занят участок")
+        place["count_before"] = count_before
         place["target"] = point
         place["target_since"] = time.monotonic()
 
@@ -354,7 +359,7 @@ class Match:
                     place = self.places[player,unit]
                     if op == "reserve":
                         try:
-                            self.reserve(player,unit,req["point"])
+                            self.reserve(player,unit,req["point"],req.get("count_before"))
                         except ValueError as exc:
                             if str(exc)=="За пределами назначенной зоны" and not req.get("uses_host_sites"):
                                 raise ValueError("Разметка твинка устарела · обнови и перезапусти твинк") from exc

@@ -480,7 +480,10 @@ class App:
             line = tk.Frame(area,bg=C["card"])
             line.pack(fill="x")
             text(line,placement_label(unit),bold=True).pack(side="left")
-            text(line,"Поставлен" if placed else "Место занято под юнита",size=9,
+            status = "Поставлен" if placed else "Место в плане"
+            if not placed and row.get("target"):
+                status = "Проверка постановки"
+            text(line,status,size=9,
                  color="accent" if placed else "muted").pack(side="left",padx=9)
             x,y = row["point"]
             text(line,f"{x:.0f}, {y:.0f}",size=9,color="muted").pack(side="right")

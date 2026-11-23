@@ -385,7 +385,7 @@ class NetworkTest(unittest.TestCase):
         cx,cy = np.asarray(screen_point(pose,preferred))*frame.size
         ImageDraw.Draw(frame).rectangle((cx-22,cy-22,cx+22,cy+22),fill=(72,72,70))
         with patch.object(a,"game") as game, patch("wastelands_alt.placement_pose",return_value=pose), \
-             patch.object(a,"slot_count",return_value=0),patch("twd_bot.read_hotbar",return_value=[]), \
+             patch.object(a,"hover_count",return_value=0),patch("twd_bot.read_hotbar",return_value=[]), \
              patch.object(a,"placement_outcome",side_effect=["release","commit"]),patch("twd_bot.log"):
             game.money.return_value=16000
             game.grab.return_value=frame
@@ -402,33 +402,62 @@ class NetworkTest(unittest.TestCase):
         frame=Image.new("RGB",(1366,768),(110,86,52))
         pose=(np.array([.4,.4]),np.diag([1/2048,1/1152]))
         with patch.object(a,"game") as game,patch("wastelands_alt.placement_pose",return_value=pose), \
-             patch.object(a,"slot_count",return_value=0),patch("twd_bot.read_hotbar",return_value=[]), \
-             patch.object(a,"placement_outcome",return_value=None),patch.object(a,"recheck_slot",return_value=None),patch("twd_bot.log"):
+             patch.object(a,"hover_count",return_value=0),patch("twd_bot.read_hotbar",return_value=[]), \
+             patch.object(a,"placement_outcome",return_value=None),patch("twd_bot.log"):
             game.money.return_value=16000
             game.grab.return_value=frame
             self.assertIn("не подтверждён",a.place("screen",frame))
             self.assertEqual(game.click_live.call_count,1)
             self.assertTrue(self.match.places[a.player,"screen"]["target"])
 
-    def test_delayed_placement_confirmed_during_wave_income(self):
+    def test_hover_decides_placement_even_when_cash_or_preview_changes(self):
         a=self.alts[0]
-        with patch.object(a,"game") as game,patch.object(a,"slot_count",side_effect=[3,3]):
-            game.path_visible.side_effect=[True,True,False,False,False,False]
-            game.money.return_value=1200
-            self.assertEqual(a.placement_outcome(900,700,4,4,2),"commit")
-        with patch.object(a,"game") as game,patch.object(a,"slot_count",side_effect=[None,None]):
-            game.path_visible.return_value=False
-            game.money.return_value=None
-            self.assertIsNone(a.placement_outcome(900,700,4,4,2))
+        for reads,expected in (([1],"commit"),([0,1],"commit"),([0,0],"release"),
+                               ([0,None],None),([None],None)):
+            with patch.object(a,"game") as game,patch.object(a,"hover_count",side_effect=reads):
+                self.assertEqual(a.placement_outcome(1,1,0),expected)
+                game.money.assert_not_called()
+                game.path_visible.assert_not_called()
 
-    def test_preview_recheck_confirms_only_two_matching_counts(self):
+    def test_hover_samples_only_selected_icon_without_click(self):
         a=self.alts[0]
-        for values, expected in (([3,3],"commit"),([2,2],"release"),([2,None],None)):
-            with patch.object(a,"game") as game,patch.object(a,"slot_count",side_effect=values), \
-                 patch("twd_bot.afk_panel",return_value=False):
-                game.path_visible.return_value=True
-                self.assertEqual(a.recheck_slot(4,4,2),expected)
+        frame=Image.new("RGB",(1356,698))
+        for reads,expected in (([2,2],2),([0,1],None),([2,None],None)):
+            with patch.object(a,"game") as game,patch.object(a,"slot_count",side_effect=reads) as count:
+                game.grab.return_value=frame
+                self.assertEqual(a.hover_count(4,4),expected)
+                x,y=game.hover.call_args.args[0]
+                self.assertTrue(688<x*frame.width<767 and 570<y*frame.height<642)
+                self.assertEqual([c.args[1:] for c in count.call_args_list],[(4,4),(4,4)])
+                game.click.assert_not_called()
+                game.key.assert_not_called()
+
+    def test_pending_titan_reconciles_after_restart_without_second_click(self):
+        a=self.alts[0]
+        for unit,count,expected in (("screen",0,"reserved"),("amplifier",1,"placed")):
+            point=position(a.player,unit)
+            a.exchange("reserve",unit=unit,point=point,count_before=0)
+            state=a.exchange()
+            a.reset(state)
+            with patch.object(a,"game") as game,patch.object(a,"hover_count",return_value=count):
+                self.assertIsNotNone(a.recheck_pending(state))
                 game.click_live.assert_not_called()
+                game.key.assert_not_called()
+            row=self.match.places[a.player,unit]
+            self.assertEqual(row["state"],expected)
+            self.assertNotIn("target",row)
+
+    def test_unreadable_or_full_slot_cannot_place(self):
+        a=self.alts[0]
+        frame=Image.new("RGB",(1366,768))
+        for count in (None,1):
+            with patch.object(a,"game") as game,patch.object(a,"hover_count",return_value=count), \
+                 patch("twd_bot.read_hotbar",return_value=[]):
+                game.money.return_value=22000
+                a.place("amplifier",frame)
+                game.click_live.assert_not_called()
+                game.take.assert_not_called()
+                self.assertNotIn("target",self.match.places[a.player,"amplifier"])
 
     def test_identity_and_lease(self):
         a=self.alts[0]
@@ -505,14 +534,14 @@ class NetworkTest(unittest.TestCase):
         frame=Image.new("RGB",(1366,768))
         game.grab.return_value=frame
         game.take.return_value=True
-        game.money.side_effect=[900]*8+[200,200]
+        game.money.return_value=900
         game.path_visible.side_effect=[True]*6+[False,False]
         pose=(np.array([.41,.41]),np.diag([1/2048,1/1152]))
         def nominal(frame,pose,center,tangent,normal):
             from wastelands_team import BANK_OFFSET
             return [v+BANK_OFFSET*n for v,n in zip(center,normal)]
         with patch.object(alt,"game",game),patch("wastelands_alt.perimeter_point",side_effect=nominal), \
-             patch("wastelands_alt.placement_pose",return_value=pose),patch.object(alt,"slot_count",return_value=0), \
+             patch("wastelands_alt.placement_pose",return_value=pose),patch.object(alt,"hover_count",side_effect=[1,1,1,1,2]), \
              patch("twd_bot.read_hotbar",return_value=[(.532,700)]):
             self.assertIn("занята",alt.place("plunger_2",frame))
             self.assertNotIn("target",self.match.places[1,"plunger_2"])
