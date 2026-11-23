@@ -77,6 +77,37 @@ def invite_buttons(img):
     return None
 
 
+# Cyan text of the map name in the compact Roblox invitation at 1366px.
+_WASTELAND_WORD = np.array([[c == "#" for c in row] for row in (
+    "...........................#................#",
+    "##..##..#..........#.......#................#",
+    ".#..##..#.###...#####..##..#.###..####...####",
+    ".#.###.##...##.#..##..##.#.#...##.##.#..##.##",
+    ".###.###..####.#####..####.#.####.#..#..#...#",
+    "..##..##..####...###..##.#.#.####.#..#..##.##",
+    "..##..##..####.######..###.#.####.#..#...####",
+)])
+
+
+def _wasteland_word(img, x, y, right, height):
+    # The invitation prefix is white. Compare the full cyan word, including
+    # its proportions, so a different destination cannot match by a substring.
+    region = img.crop((x, y-round(.63*height), right, y-round(.08*height)))
+    r, g, b = np.asarray(region.convert("RGB"), dtype=np.int16).transpose(2, 0, 1)
+    ink = (g-r > 25) & (b-r > 45) & (g > 106) & (b > 140)
+    rows, cols = np.nonzero(ink)
+    if not rows.size:
+        return False
+    word = ink[rows.min():rows.max()+1, cols.min():cols.max()+1]
+    h, w = word.shape
+    th, tw = _WASTELAND_WORD.shape
+    if abs((w/h)/(tw/th)-1) > .18:
+        return False
+    scaled = Image.fromarray(word.astype(np.uint8)*255).resize((tw, th), Image.Resampling.BOX)
+    mask = np.asarray(scaled) >= 128
+    return np.count_nonzero(mask & _WASTELAND_WORD) >= .72*np.count_nonzero(mask | _WASTELAND_WORD)
+
+
 def read_invite(img, host, read):
     pair = invite_buttons(img)
     if pair is None:
@@ -88,6 +119,8 @@ def read_invite(img, host, read):
         return read(img,box,zoom=5)
     if not label(line(1.29,.56),host):
         return None, "Вижу приглашение · имя отправителя не совпало или не прочитано"
+    if _wasteland_word(img, x, y, right, height):
+        return button, ""
     words = line(.62,.07)
     if not any(label(words, text) for name in ("Wasteland","Wastelands")
                for text in (name, "to"+name, "invited you to "+name)):
