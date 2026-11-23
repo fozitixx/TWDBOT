@@ -302,6 +302,50 @@ class NetworkTest(unittest.TestCase):
         for a in self.alts:
             a.reset(a.exchange())
 
+    def test_afk_answer_uses_live_panel_and_waits_for_close(self):
+        import twd_bot as farm
+        frame = Image.new("L",(1366,768))
+        x,y = 240,90
+        draw = ImageDraw.Draw(frame)
+        draw.line((x,y,x+238,y),fill=255)
+        title = Image.fromarray(farm.AFK_HEADER.reshape(6,28)).resize((56,11),Image.Resampling.NEAREST)
+        frame.paste(title,(x+8,y+9))
+        for dx in (30,164):
+            draw.rectangle((x+dx,y+56,x+dx+2,y+67),fill=255)
+            draw.rectangle((x+dx,y+65,x+dx+8,y+67),fill=255)
+        for dx in (94,128,196):
+            draw.rectangle((x+dx,y+56,x+dx+8,y+67),outline=255)
+        frame=frame.convert("RGB")
+        panel=farm.afk_panel(frame)
+        self.assertEqual(panel[3],2)
+        for a in self.alts:
+            state=a.exchange()
+            self.assertTrue(state["afk_auto"])
+            with patch.object(a,"game") as game:
+                game.grab.return_value=frame
+                self.assertIn("ответ отправлен",a.tick(state))
+                pt,locate,title=game.click_live.call_args.args
+                self.assertEqual(locate(frame),pt)
+                self.assertIsNone(locate(Image.new("RGB",frame.size)))
+                changed=frame.copy()
+                changed.paste(frame.crop((x+154,y+54,x+178,y+71)),(x+86,y+54))
+                self.assertIsNone(locate(changed))
+                self.assertIn("жду закрытия",a.tick(state))
+                game.click_live.assert_called_once()
+                a.afk_retry_at=0
+                a.tick(state)
+                a.afk_retry_at=0
+                self.assertIn("ручной",a.tick(state))
+                self.assertEqual(game.click_live.call_count,2)
+                self.assertIn("ручного",a.tick(dict(state,afk_auto=False)))
+                a.stop.set()
+                with self.assertRaises(Wait):
+                    a.tick(state)
+                a.stop.clear()
+                self.assertEqual(game.click_live.call_count,2)
+        self.match.start("nightmare","S4R",afk_auto=False)
+        self.assertFalse(self.alts[0].connection.exchange()["afk_auto"])
+
     def test_manual_pairing_for_all_three_players(self):
         codes = [self.match.issue_pin(i) for i in PLAYERS]
         self.assertEqual(len(set(codes)),3)

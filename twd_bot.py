@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "6.0.15 (Wasteland: голосование и расстановка)"
+VERSION = "6.0.16 (Wasteland: голосование и расстановка)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2206,11 +2206,11 @@ _update_checked = 0.0
 # 5.x updates only the entry script. These Git blob IDs identify the exact
 # companion files for this version, even after the release branch moves on.
 # Pin the raw download to a commit containing this entire set of files.
-TEAM_REVISION = "205bb7d07bb157693788aa2a524b1da579d56372"
+TEAM_REVISION = "676ce2d51d524e38339b06e2bb611890383a592c"
 TEAM_FILES = {
-    "wastelands.py": "f044ee877c68e9c7a6925a3f2399942c3815ef88",
-    "wastelands_alt.py": "e785700e2d3bb4adb9643595eb3f94c26b802270",
-    "wastelands_team.py": "bb6888010994225f1fc9bb6d4b7f45aeefc153eb",
+    "wastelands.py": "6dcb7574eeb358c0e49c7f8d85aaee8e1bd12e73",
+    "wastelands_alt.py": "0e98df7710cc4d731a45210091ed09b4593de6d8",
+    "wastelands_team.py": "75222e81172fc7a012ea6652e24429ebfdf59c98",
     "wastelands_view.py": "011967ecd7dd348d3236f260d8e6994b383aa383",
     "wastelands_ocr.ps1": "496e34e723f8a27cd6993fc72f826f398459b5b9",
 }
@@ -2832,10 +2832,19 @@ def afk_panel(img):
         options = [digits((c-12,55,c+12,70)) for c in centers]
         scores = [np.count_nonzero(target & o)/max(1,np.count_nonzero(target | o)) for o in options]
         second, best = np.argsort(scores)[-2:]
-        choice = best if scores[best] > .68 and scores[best]-scores[second] > .10 else None
+        complete = target.any() and all(option.any() for option in options)
+        choice = best if complete and scores[best] > .68 and scores[best]-scores[second] > .10 else None
         points = [((x+c*scale)/img.width,(y+62*scale)/img.height) for c in centers]
         signature = tuple(np.packbits(o).tobytes() for o in [target]+options)
         return crop(0,0,242,112), points, signature, choice
+
+def same_afk_signature(first, second):
+    # The normalized masks can differ slightly after hovering or RDP compression.
+    return first is not None and all(
+        sum((a ^ b).bit_count() for a,b in zip(old,new)) <= 64
+        for old,new in zip(first,second)
+    )
+
 
 class Bot:
     def __init__(self, use_speed=True, hotkeys=True):
@@ -2959,10 +2968,7 @@ class Bot:
                 misses = 0
                 panel, points, signature, automatic = frame
                 # Small changes in antialiasing should not invalidate Discord buttons.
-                if previous is None or any(
-                    sum(bin(a ^ b).count("1") for a, b in zip(old, new)) > 64
-                    for old, new in zip(previous, signature)
-                ):
+                if not same_afk_signature(previous,signature):
                     previous = signature
                     clicked = False
                     handled_answer = None
