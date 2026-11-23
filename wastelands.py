@@ -181,6 +181,7 @@ class App:
         self.summon_all = button(top, "Всех в приватку", lambda: self.summon(PLAYERS))
         self.summon_all.pack(side="right", padx=4)
         self.summon_buttons = {}
+        self.place_buttons = {}
         self.player_status, self.player_actions, self.command_buttons, self.player_results = {}, {}, {}, {}
         self.pin_labels = {}
         for player in PLAYERS:
@@ -205,7 +206,8 @@ class App:
                 b = button(actions,name,lambda i=player,n=name:self.send(i,n))
                 b.pack(side="left",padx=(0,4))
                 self.command_buttons[player].append(b)
-            button(actions,"Места юнитов",lambda i=player:self.reservations(i)).pack(side="right")
+            self.place_buttons[player] = button(actions,"Места юнитов",lambda i=player:self.reservations(i))
+            self.place_buttons[player].pack(side="right")
 
     def _build_client(self, prefs):
         conn = card(self.client)
@@ -567,6 +569,11 @@ class App:
                 self.player_status[i].configure(text="●  На связи" if online else "●  Вне связи",
                                                 fg=C["accent" if online else "muted"])
                 if running:
+                    pending = sum(1 for (owner,_),place in self.match.places.items() if owner==i and
+                                  place.get("target") and now-place.get("target_since",now)>12)
+                    caption = f"Проверить места ({pending})" if pending else "Места юнитов"
+                    if self.place_buttons[i].cget("text")!=caption:
+                        self.place_buttons[i].configure(text=caption)
                     self.player_actions[i].pack(fill="x",pady=(5,0))
                     for b in self.command_buttons[i]:
                         b.configure(state="normal" if online and i not in self.match.recalled and i not in self.match.summons else "disabled")

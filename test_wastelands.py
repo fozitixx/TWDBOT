@@ -349,6 +349,54 @@ class NetworkTest(unittest.TestCase):
         with self.assertRaises(Wait):
             self.alts[0].exchange("commit",unit="screen",point=[1150,540])
 
+    def test_unconfirmed_early_unit_does_not_block_titan(self):
+        a=self.alts[0]
+        a.phase="battle"
+        for unit in PLACEMENT_ORDER:
+            if unit not in ("plunger_4","amplifier","screen"):
+                point=position(a.player,unit)
+                a.exchange("reserve",unit=unit,point=point)
+                a.exchange("commit",unit=unit,point=point)
+        target=position(a.player,"plunger_4")
+        a.exchange("reserve",unit="plunger_4",point=target)
+        frame=Image.new("RGB",(1366,768))
+        with patch.object(a.game,"grab",return_value=frame),patch.object(a,"place",return_value="placing") as place:
+            self.assertEqual(a.tick(a.exchange()),"placing")
+            self.assertEqual(place.call_args.args[0],"amplifier")
+        self.assertEqual(a.pending_places,{"plunger_4"})
+        self.assertEqual(self.match.places[1,"plunger_4"]["target"],target)
+
+    def test_host_assigns_titan_alternatives_for_all_three_alts(self):
+        for a in self.alts:
+            for unit in ("amplifier","screen"):
+                with patch("wastelands_alt.position",side_effect=AssertionError("local layout")):
+                    sites=a.placement_sites(unit)
+                self.assertEqual(len(sites),15)
+                point=sites[8]
+                a.exchange("reserve",unit=unit,point=point)
+                a.exchange("commit",unit=unit,point=point)
+                self.assertEqual(self.match.places[a.player,unit]["point"],point)
+
+    def test_delayed_placement_confirmed_during_wave_income(self):
+        a=self.alts[0]
+        with patch.object(a,"game") as game,patch.object(a,"slot_count",side_effect=[3,3]):
+            game.path_visible.side_effect=[True,True,False,False,False,False]
+            game.money.return_value=1200
+            self.assertEqual(a.placement_outcome(900,700,4,4,2),"commit")
+        with patch.object(a,"game") as game,patch.object(a,"slot_count",side_effect=[None,None]):
+            game.path_visible.return_value=False
+            game.money.return_value=None
+            self.assertIsNone(a.placement_outcome(900,700,4,4,2))
+
+    def test_preview_recheck_confirms_only_two_matching_counts(self):
+        a=self.alts[0]
+        for values, expected in (([3,3],"commit"),([2,2],"release"),([2,None],None)):
+            with patch.object(a,"game") as game,patch.object(a,"slot_count",side_effect=values), \
+                 patch("twd_bot.afk_panel",return_value=False):
+                game.path_visible.return_value=True
+                self.assertEqual(a.recheck_slot(4,4,2),expected)
+                game.click_live.assert_not_called()
+
     def test_identity_and_lease(self):
         a=self.alts[0]
         with patch.object(a.connection,"key",self.alts[1].connection.key),self.assertRaises(Wait):
@@ -424,14 +472,14 @@ class NetworkTest(unittest.TestCase):
         frame=Image.new("RGB",(1366,768))
         game.grab.return_value=frame
         game.take.return_value=True
-        game.money.side_effect=[900,900,900,200]
-        game.path_visible.side_effect=[True,False,False]
+        game.money.side_effect=[900]*8+[200,200]
+        game.path_visible.side_effect=[True]*6+[False,False]
         pose=(np.array([.41,.41]),np.diag([1/2048,1/1152]))
         def nominal(frame,pose,center,tangent,normal):
             from wastelands_team import BANK_OFFSET
             return [v+BANK_OFFSET*n for v,n in zip(center,normal)]
         with patch.object(alt,"game",game),patch("wastelands_alt.perimeter_point",side_effect=nominal), \
-             patch("wastelands_alt.placement_pose",return_value=pose), \
+             patch("wastelands_alt.placement_pose",return_value=pose),patch.object(alt,"slot_count",return_value=0), \
              patch("twd_bot.read_hotbar",return_value=[(.532,700)]):
             self.assertIn("занята",alt.place("plunger_2",frame))
             self.assertNotIn("target",self.match.places[1,"plunger_2"])

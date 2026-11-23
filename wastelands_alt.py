@@ -182,6 +182,10 @@ class Alt:
         self.invite_attempts = 0
         self.placed = set()
         self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
+        self.sites = {}
+        self.rescan_at = {}
+        self.host_sites = state.get("placement_sites",False)
+        self.pending_places = set()
         self.retry = state["progress"].get("retry",0)
         self.levels = {"amplifier":0,"screen":0}
         self.wait_cash = 0
@@ -338,16 +342,86 @@ class Alt:
             self.exchange(op,unit=unit,point=point)
             self.confirm = None
             return True
-        if any(p.get("target") for p in own.values()):
-            raise Wait("Проверь постановку в игре и открой «Резервы» на основе")
+        pending = {unit for unit,row in own.items() if row.get("target")}
+        for unit in self.pending_places-pending-self.placed:
+            self.attempt[unit] += 1
+        self.pending_places = pending
         return False
+
+    def placement_sites(self,unit):
+        if unit not in self.sites:
+            if self.host_sites:
+                self.sites[unit] = self.exchange("placement_sites",unit=unit)["sites"]
+            else:
+                locate = bank_slot if unit.partition("_")[0] in EARLY else position
+                # Older coordinators only know the original five titan candidates.
+                count = placement_attempts(unit) if unit.partition("_")[0] in EARLY else 5
+                self.sites[unit] = [locate(self.player,unit,i) for i in range(count)]
+        return self.sites[unit]
+
+    def slot_count(self,frame,slot,limit):
+        center = .5+(slot-3.5)*.13*frame.height/frame.width
+        half = .05*frame.height/frame.width
+        words = self.ocr.read(frame,(center-half,.84,center+half,.924),zoom=3)
+        for i in range(len(words)):
+            for j in range(i+1,min(i+3,len(words))+1):
+                text = "".join(word[0] for word in words[i:j]).strip()
+                found = re.fullmatch(r"([0-4])\s*/\s*"+str(limit),text)
+                if found and int(found[1])<=limit:
+                    return int(found[1])
+        return None
+
+    def placement_outcome(self,cash,price,slot,limit,before_count):
+        visible_frames = gone_frames = 0
+        spent = False
+        for _ in range(6):
+            self.game.sleep(.23)
+            visible = self.game.path_visible()
+            visible_frames = visible_frames+1 if visible else 0
+            gone_frames = 0 if visible else gone_frames+1
+            after = self.game.money()
+            spent = spent or (after is not None and cash-after>=.8*price)
+            if gone_frames>=2 and spent:
+                return "commit"
+        if before_count is not None:
+            observed = [self.slot_count(self.game.grab(),slot,limit) for _ in range(2)]
+            if observed==[before_count+1]*2:
+                return "commit"
+            if visible_frames>=3 and observed==[before_count]*2 and not spent:
+                return "release"
+        if visible_frames>=3 and not spent and after is not None and after>=cash:
+            return "release"
+        return None
+
+    def recheck_slot(self,slot,limit,before_count):
+        # Re-open the slot preview once after a delayed or obscured purchase.
+        # No placement click is sent here. The count belongs to this account.
+        if before_count is None or before_count>=limit:
+            return None
+        frame = self.game.grab()
+        if farm.afk_panel(frame):
+            return None
+        if not self.game.path_visible():
+            self.game.key(str(slot))
+            self.game.sleep(.35)
+            if self.game.path_visible():
+                self.game.holding = slot
+        reads = []
+        for _ in range(2):
+            self.game.sleep(.18)
+            reads.append(self.slot_count(self.game.grab(),slot,limit))
+        if reads==[before_count+1]*2:
+            return "commit"
+        if reads==[before_count]*2:
+            return "release"
+        return None
 
     def place(self, unit, img):
         prices = farm.read_hotbar(img)
         slot = self.slots[unit.partition("_")[0]]
         name = placement_label(unit)
         # Associate the physical card with its slot even when another price is unreadable.
-        center = (.313 + (slot-1)*.072)
+        center = .5+(slot-3.5)*.13*img.height/img.width
         price = next((v for x,v in prices if abs(x-center)<.032 and v),None)
         cash = self.game.money()
         # A selected early unit can cover its own price at RDP scale.
@@ -356,9 +430,12 @@ class Alt:
         kind = unit.partition("_")[0]
         if price is None and kind in ("plunger","tv"):
             price = farm.UNITS[kind]["price"]
+        if price is None and kind in ("amplifier","screen"):
+            price = {"amplifier":7000,"screen":7750}[kind]
         if price is None or cash is None or cash < price:
             return f"Жду {name} · баланс {cash}, цена слота {slot}: {price}"
-        if self.attempt[unit]>=placement_attempts(unit):
+        sites = self.placement_sites(unit)
+        if self.attempt[unit]>=len(sites):
             return f"{name} · свободное место не найдено, проверь разметку"
         if not self.game.take(slot):
             return "Не появилась подсветка дороги"
@@ -366,16 +443,20 @@ class Alt:
             self.game.hover(farm.IDLE_POINT)
             snap = self.game.grab()
             pose = placement_pose(snap)
+            if pose is None and self.reference is not None:
+                pose = tracked_pose(self.reference,self.pose,snap) if self.game.rect()==self.reference_rect else None
             if pose is None:
                 return "Проверяю направление Wastelands по дороге и обломкам"
-            for attempt in range(self.attempt[unit],placement_attempts(unit)):
+            limit = 4 if kind in EARLY else 1
+            before_count = self.slot_count(snap,slot,limit)
+            for attempt in range(self.attempt[unit],len(sites)):
                 self.attempt[unit] = attempt
                 if kind in EARLY:
-                    point = perimeter_point(snap,pose,*bank_slot(self.player,unit,attempt))
+                    point = perimeter_point(snap,pose,*sites[attempt])
                     if point is None:
                         continue
                 else:
-                    point = position(self.player,unit,attempt)
+                    point = sites[attempt]
                 pt = screen_point(pose,point)
                 if not (.015<pt[0]<.985 and .10<pt[1]<.92) or (.27<pt[0]<.74 and pt[1]>.81):
                     continue
@@ -385,10 +466,14 @@ class Alt:
                     if any(reason in str(exc) for reason in
                            ("Рядом занят участок","Зона ранней защиты основы","Зона титанов основы")):
                         continue
+                    if "За пределами назначенной зоны" in str(exc):
+                        if not self.host_sites:
+                            raise Wait("Разметка основы и твинка различается · обнови и перезапусти оба приложения") from exc
+                        continue
                     raise
                 break
             else:
-                self.attempt[unit] = placement_attempts(unit)
+                self.attempt[unit] = len(sites)
                 return f"{name} · места заняты или кромка не видна, проверь расстановку"
             def live_point(frame):
                 if frame.size==snap.size and np.median(abs(scene(frame)-scene(snap)))<4:
@@ -400,21 +485,19 @@ class Alt:
                 # click_live raises Wait only before the button press.
                 self.confirm = ("release",unit,point)
                 raise
-            self.game.sleep(.40)
-            after = self.game.money()
-            gone = not self.game.path_visible()
-            self.game.sleep(.12)
-            gone = gone and not self.game.path_visible()
-            spent = after is not None and cash-after >= .8*price
-            if gone and spent:
-                self.game.holding = None
+            outcome = self.placement_outcome(cash,price,slot,limit,before_count)
+            if outcome is None:
+                outcome = self.recheck_slot(slot,limit,before_count)
+            if outcome=="commit":
                 self.confirm = ("commit",unit,point)
                 self.exchange("commit",unit=unit,point=point)
                 self.confirm = None
                 self.placed.add(unit)
+                self.game.drop()
                 self.pose,self.reference = pose,self.game.grab()
+                self.reference_rect = self.game.rect()
                 return f"Поставил {name}"
-            if not gone and after is not None and after>=cash:
+            if outcome=="release":
                 self.confirm = ("release",unit,point)
                 self.exchange("release",unit=unit,point=point)
                 self.confirm = None
@@ -523,6 +606,8 @@ class Alt:
     def command(self, cmd):
         name = cmd["name"]
         unit = "amplifier" if name=="Aerial Attack" else "screen"
+        if unit in self.pending_places:
+            return {"result":"Место титана ещё не подтверждено"}
         if self.phase!="battle" or unit not in self.placed:
             return {"result":"Титан ещё не поставлен"}
         live=self.game.grab()
@@ -580,6 +665,8 @@ class Alt:
             return "Состояние постановки синхронизировано"
         if state["progress"]["retry"]!=self.retry:
             self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
+            self.sites.clear()
+            self.rescan_at.clear()
             self.retry = state["progress"]["retry"]
         if self.phase=="lobby":
             return self.lobby(state,img)
@@ -599,9 +686,27 @@ class Alt:
             return response["result"]
         if "plunger" in self.placed and not self.ready and ready_button(img):
             return self.vote("ready")
+        pending_kinds = {unit.partition("_")[0] for unit in self.pending_places}
         for unit in PLACEMENT_ORDER:
-            if unit not in self.placed:
-                return self.place(unit,img)
+            if unit in self.placed or unit.partition("_")[0] in pending_kinds:
+                continue
+            if unit in self.sites and self.attempt[unit]>=len(self.sites[unit]):
+                if unit not in ("amplifier","screen"):
+                    continue
+                due = self.rescan_at.setdefault(unit,time.monotonic()+8)
+                if time.monotonic()<due:
+                    continue
+                del self.rescan_at[unit]
+                self.attempt[unit] = 0
+            return self.place(unit,img)
+        outstanding = [u for u in PLACEMENT_ORDER if u not in self.placed]
+        if outstanding and not {"amplifier","screen"}.issubset(self.placed):
+            if self.rescan_at:
+                return "Полоса титана занята · повторю поиск свободного места"
+            pending = ", ".join(placement_label(u) for u in PLACEMENT_ORDER if u in self.pending_places)
+            if pending:
+                return "Места юнитов · ждут подтверждения: "+pending
+            return "Свободные точки исчерпаны · Места юнитов → Повторить поиск места"
         if min(self.levels.values())<8 and time.monotonic()>self.next_upgrade:
             self.next_upgrade = time.monotonic()+4
             cash = self.game.money()
@@ -624,6 +729,7 @@ class Alt:
         return "Ссылка на приватку открыта" if opened else "Не удалось открыть ссылку на приватку"
 
     def loop(self):
+        last_notice = None
         try:
             while not self.stop.is_set():
                 try:
@@ -638,7 +744,9 @@ class Alt:
                         self.status = "На связи · жду матч"
                 except (Wait,OSError,ValueError,RuntimeError) as exc:
                     self.status = str(exc)
-                self.notify(self.status)
+                if self.status != last_notice:
+                    self.notify(self.status)
+                    last_notice = self.status
                 self.stop.wait(.38)
         finally:
             self.ocr.close()

@@ -47,6 +47,11 @@ PLACEMENT_ORDER = ("plunger", "plunger_2", "plunger_3", "plunger_4",
 LANES = [((1159, 631), (1336, 751)), ((1022, 690), (1285, 868)),
          ((1539, 871), (1770, 1029))]
 
+# (distance along the lane, extra distance away from the road in map pixels).
+TITAN_OFFSETS = ((0,0),(.09,0),(-.09,0),(.16,0),(-.16,0),
+                 (0,24),(.16,24),(-.16,24),(0,45),(.20,45),(-.20,45),
+                 (.32,20),(-.32,20),(.40,40),(-.40,40))
+
 
 def mix(a, b, fraction):
     return [x + (y - x) * fraction for x, y in zip(a, b)]
@@ -77,7 +82,7 @@ def bank_slot(player, unit, attempt=0):
 
 
 def placement_attempts(unit):
-    return 5+len(SPARE_BANKS) if unit.partition("_")[0] in EARLY else 5
+    return 5+len(SPARE_BANKS) if unit.partition("_")[0] in EARLY else len(TITAN_OFFSETS)
 
 
 def position(player, unit, attempt=0):
@@ -86,7 +91,10 @@ def position(player, unit, attempt=0):
         return [v+BANK_OFFSET*n for v,n in zip(center,normal)]
     a, b = LANES[player - 1]
     progress = .22 if unit == "amplifier" else .76
-    return mix(a, b, progress + (0, .09, -.09, .16, -.16)[attempt % 5])
+    along, outward = TITAN_OFFSETS[attempt]
+    base = mix(a,b,max(0,min(1,progress+along)))
+    side = -1 if player==2 else 1
+    return [v+side*outward*n for v,n in zip(base,BRANCH)]
 
 
 def segment_distance(p, a, b):
@@ -131,7 +139,7 @@ class AltConnection:
         self.http = build_opener(ProxyHandler({}))
 
     def exchange(self, op="poll", *, run="", status="Подключение", **fields):
-        payload = dict(instance=self.instance, run=run, status=status, op=op, can_summon=True, **fields)
+        payload = dict(instance=self.instance, run=run, status=status, op=op, can_summon=True, uses_host_sites=True, **fields)
         request = Request(self.url, data=json.dumps(payload).encode(), headers={
             "Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
         try:
@@ -311,6 +319,7 @@ class Match:
             self.expire_summon(player, now)
             summon = self.summons.get(player)
             op = req.get("op","poll")
+            sites = None
             claimed = None
             if op == "summon_result":
                 if summon and summon["id"] == req.get("id") and summon["instance"] == owner:
@@ -325,11 +334,22 @@ class Match:
             elif op != "poll":
                 if not self.run or self.run != req.get("run") or player in self.recalled:
                     raise ValueError("Матч сменился")
-                if op in ("reserve","release","commit"):
+                if op=="placement_sites":
+                    unit = req["unit"]
+                    if unit not in PLACEMENT_ORDER:
+                        raise ValueError("Неизвестный юнит")
+                    locate = bank_slot if unit.partition("_")[0] in EARLY else position
+                    sites = [locate(player,unit,i) for i in range(placement_attempts(unit))]
+                elif op in ("reserve","release","commit"):
                     unit = req["unit"]
                     place = self.places[player,unit]
                     if op == "reserve":
-                        self.reserve(player,unit,req["point"])
+                        try:
+                            self.reserve(player,unit,req["point"])
+                        except ValueError as exc:
+                            if str(exc)=="За пределами назначенной зоны" and not req.get("uses_host_sites"):
+                                raise ValueError("Разметка твинка устарела · обнови и перезапусти твинк") from exc
+                            raise
                     elif op == "release":
                         if place.get("target") and place["target"]!=req.get("point"):
                             raise ValueError("Резерв изменился")
@@ -369,7 +389,7 @@ class Match:
                 cmd = None
             return dict(run="" if player in self.recalled else self.run,
                         summon={"id":summon["id"],"link":summon["link"]} if summon and summon["instance"]==owner else None,
-                        mode=self.mode,host=self.host,places=list(self.places.values()),claimed=claimed,
+                        placement_sites=True, sites=sites, mode=self.mode,host=self.host,places=list(self.places.values()),claimed=claimed,
                         vote_seconds=max(0,self.vote_until-now) if self.vote_owner==player else 0,
                         progress=self.progress.get(player,{}),
                         command=dict(cmd,remaining=cmd["until"]-now) if cmd and not cmd.get("claimed")
