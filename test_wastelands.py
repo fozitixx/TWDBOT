@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from wastelands_alt import Alt, Wait, level, manager_card, countdown
+from wastelands_alt import Alt, Game, Wait, level, manager_card, countdown
 from wastelands_team import AltConnection, Match, PAIR_LIFETIME, PLACEMENT_ORDER, PLAYERS, UNITS, connect_by_pin, position, serve
 from wastelands_view import OCR, label, road_pose, screen_point
 
@@ -148,6 +148,56 @@ class IntegrationTest(unittest.TestCase):
             self.assertEqual(farm.team_directory(),cached)
             for name in farm.TEAM_FILES:
                 self.assertEqual((Path(cached)/name).read_bytes(),(src/name).read_bytes())
+
+
+class InviteInputTest(unittest.TestCase):
+    def test_button_and_cursor_must_still_match(self):
+        frame = Image.new("RGB", (1366, 768))
+        with Image.open(Path(__file__).parent / "tests/fixtures/wasteland_invite_buttons.png") as card:
+            frame.paste(card, (1163, 229))
+        game = Mock(spec=Game)
+        game.rect.return_value = (100, 50, 1466, 818)
+        game.to_screen.side_effect = lambda pt: Game.to_screen(game, pt)
+        game.grab.return_value = frame
+        point = (1288/1366, 261/768)
+        game.m = Mock()
+        game.m.position = (500, 500)
+        with self.assertRaisesRegex(Wait, "Курсор"):
+            Game.accept_invite(game, point)
+        game.m.press.assert_not_called()
+        game.m.position = (1388, 311)
+        Game.accept_invite(game, point)
+        game.m.press.assert_called_once()
+        game.m.release.assert_called_once()
+        game.grab.return_value = Image.new("RGB", frame.size)
+        with self.assertRaisesRegex(Wait, "Приглашение"):
+            Game.accept_invite(game, point)
+        game.m.press.assert_called_once()
+
+    def test_click_retries_until_confirmed(self):
+        alt = Alt.__new__(Alt)
+        alt.game, alt.ocr, alt.exchange = Mock(), Mock(), Mock()
+        alt.reset({"run":"match", "progress":{}})
+        alt.game.vote_point.return_value = None
+        state = {"mode":"nightmare", "host":"Host"}
+        point = (.95, .33)
+        with patch("wastelands_alt.read_invite", return_value=(point, "")) as invite, \
+             patch("wastelands_alt.time.monotonic", return_value=100) as clock:
+            for t in (100, 101, 103):
+                clock.return_value = t
+                alt.lobby(state, None)
+            self.assertEqual(alt.game.accept_invite.call_count, 2)
+            self.assertFalse(alt.invited)
+            alt.exchange.assert_not_called()
+            invite.return_value = None, ""
+            alt.ocr.read.return_value = []
+            self.assertIn("жду подтверждения", alt.lobby(state, None))
+            alt.exchange.assert_not_called()
+            alt.ocr.read.side_effect = [[("Wasteland", .1, .4, .05, .02)],
+                                        [("Cancel", .5, .9, .05, .02)]]
+            self.assertIn("В группе", alt.lobby(state, None))
+            alt.exchange.assert_called_once_with("invited")
+            self.assertTrue(alt.invited)
 
 
 class NetworkTest(unittest.TestCase):

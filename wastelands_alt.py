@@ -8,7 +8,7 @@ from pynput import mouse
 
 import twd_bot as farm
 from wastelands_team import ABILITIES, PLACEMENT_ORDER, Wait, placement_label, position, private_server_links
-from wastelands_view import OCR, color_boxes, label, read_invite, map_point, preview, road_pose, scene, screen_point, tracked_pose
+from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, road_pose, scene, screen_point, tracked_pose
 
 
 class Game(farm.Bot):
@@ -50,6 +50,27 @@ class Game(farm.Bot):
         self.m.press(mouse.Button.left)
         try:
             time.sleep(.085)
+        finally:
+            self.m.release(mouse.Button.left)
+
+    def accept_invite(self, point):
+        rect = self.rect()
+        target = self.to_screen(point)
+        # Roblox updates its hover target on a movement event in some RDP sessions.
+        self.hover(point)
+        self.sleep(.20)
+        frame = self.grab()
+        live = invite_buttons(frame)
+        if not live or any(abs(a-b)*size > 3 for a,b,size in zip(point,live[1],frame.size)):
+            raise Wait("Приглашение изменилось · проверяю снова")
+        self.check()
+        if self.rect() != rect:
+            raise Wait("Окно Roblox переместилось · проверяю приглашение снова")
+        if any(abs(a-b)>3 for a,b in zip(self.m.position,target)):
+            raise Wait("Курсор не попал на «Принять» · повторяю наведение")
+        self.m.press(mouse.Button.left)
+        try:
+            self.sleep(.15)
         finally:
             self.m.release(mouse.Button.left)
 
@@ -143,7 +164,8 @@ class Alt:
         self.voted = state["progress"].get("voted",False)
         self.ready = state["progress"].get("ready",False)
         self.invited = state["progress"].get("invited",False)
-        self.last_invite = 0
+        self.last_invite = None
+        self.invite_attempts = 0
         self.placed = set()
         self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
         self.retry = state["progress"].get("retry",0)
@@ -159,14 +181,27 @@ class Alt:
     def text(self, img, box=(0,0,1,1)):
         return self.ocr.read(img,box)
 
+    def confirm_group(self):
+        if not self.invited:
+            self.exchange("invited")
+            self.invited = True
+        self.last_invite = None
+        self.invite_attempts = 0
+
     def lobby(self, state, img):
+        now = time.monotonic()
+        if self.last_invite is not None and now-self.last_invite > 45:
+            self.last_invite = None
+            self.invite_attempts = 0
         if (self.invited and self.game.ready_visible()) or (self.placed and self.game.money() is not None):
             self.phase = "battle"
             self.game.camera_top_down()
             return "Подготовка расстановки"
         vote = self.game.vote_point(state["mode"])
         if vote and not self.invited:
-            return "Ожидаю группу Wastelands от основы"
+            if self.last_invite is None:
+                return "Ожидаю группу Wastelands от основы"
+            self.confirm_group()
         if vote and not self.voted:
             self.game.click(vote)
             self.voted = True
@@ -176,22 +211,21 @@ class Alt:
             return "Жду READY"
         accept, reason = read_invite(img,state["host"],self.ocr.read)
         if accept:
-            if time.monotonic()-self.last_invite>3:
-                self.game.click(accept)
+            if self.last_invite is None or now-self.last_invite >= 2:
+                self.game.accept_invite(accept)
                 self.last_invite = time.monotonic()
-                self.exchange("invited")
-                self.invited = True
-            return "Нажал принять · жду входа в группу"
+                self.invite_attempts += 1
+            return f"Приглашение на экране · попытка {self.invite_attempts}, проверяю вход"
         if reason:
             return reason
         group = self.text(img,(0,.26,.19,.74))
         group_map = label(group,"Wasteland") or label(group,"Wastelands")
         controls = self.text(img,(.35,.74,.65,.98)) if group_map else []
         if label(controls,"Cancel") or label(controls,"Отмена"):
-            if not self.invited:
-                self.exchange("invited")
-                self.invited = True
+            self.confirm_group()
             return "В группе · жду запуска основой"
+        if self.last_invite is not None:
+            return "Приглашение исчезло · жду подтверждения входа"
         return "Жду приглашение или голосование"
 
     def update_places(self,state):
