@@ -221,6 +221,22 @@ class VoteTest(unittest.TestCase):
         self.assertEqual(alt.game.click_live.call_count,2)
         self.assertAlmostEqual(alt.game.click_live.call_args.args[0][0],.562)
 
+    def test_ready_after_first_plunger_requires_confirmation(self):
+        alt = Alt.__new__(Alt)
+        alt.game, alt.ocr, alt.exchange = Mock(), Mock(), Mock()
+        alt.exchange.return_value = {"vote_seconds":6}
+        alt.reset({"run":"match", "progress":{"invited":True,"voted":True}})
+        alt.game.vote_button.return_value = {"cx":.5,"cy":.19,"w":.1,"h":.06}
+        alt.vote_reading = Mock(side_effect=[((n,4),None) for n in (0,0,0,0,0,1)])
+        with patch("wastelands_alt.time.monotonic",return_value=100) as clock:
+            self.assertIn("повторю",alt.vote("ready"))
+            self.assertFalse(alt.ready)
+            clock.return_value=103
+            self.assertIn("подтверждён",alt.vote("ready"))
+            self.assertTrue(alt.ready)
+        alt.exchange.assert_any_call("ready")
+        self.assertEqual(alt.game.click_live.call_args.args[0],(.5,.19))
+
     def test_voting_turn_released_or_expires(self):
         match = Match()
         match.start("nightmare","Host")
@@ -383,6 +399,7 @@ class NetworkTest(unittest.TestCase):
         a.phase="battle"
         frame=Image.new("RGB",(1366,768))
         calls=[]
+        ImageDraw.Draw(frame).rectangle((610,119,755,167),fill=(0,155,0))
         def place(unit,img):
             pt=position(1,unit)
             a.exchange("reserve",unit=unit,point=pt)
@@ -393,8 +410,8 @@ class NetworkTest(unittest.TestCase):
             a.levels[unit]+=1
             calls.append(unit)
         with patch.object(a,"place",side_effect=place),patch.object(a,"manager",side_effect=improve), \
-             patch.object(a.game,"grab",return_value=frame),patch.object(a.game,"ready_visible",return_value=True), \
-             patch.object(a.game,"click",side_effect=lambda _:calls.append("ready")),patch.object(a.game,"money",return_value=100000):
+             patch.object(a.game,"grab",return_value=frame),patch.object(a,"vote_reading",side_effect=[((0,4),None),((1,4),None)]), \
+             patch.object(a.game,"click_live",side_effect=lambda *args:calls.append("ready")),patch.object(a.game,"money",return_value=100000):
             for _ in range(27):
                 a.next_upgrade=0
                 a.tick(a.exchange())
@@ -410,7 +427,7 @@ class NetworkTest(unittest.TestCase):
         game.money.side_effect=[900,900,900,200]
         game.path_visible.side_effect=[True,False,False]
         pose=(np.array([.41,.41]),np.diag([1/2048,1/1152]))
-        with patch.object(alt,"game",game),patch("wastelands_alt.road_pose",return_value=pose), \
+        with patch.object(alt,"game",game),patch("wastelands_alt.placement_pose",return_value=pose), \
              patch("twd_bot.read_hotbar",return_value=[(.532,700)]):
             self.assertIn("занята",alt.place("plunger_2",frame))
             self.assertNotIn("target",self.match.places[1,"plunger_2"])
@@ -418,7 +435,7 @@ class NetworkTest(unittest.TestCase):
         self.assertEqual(self.match.places[1,"plunger_2"]["point"],position(1,"plunger_2",1))
         self.assertEqual(self.match.places[1,"plunger"]["state"],"reserved")
         self.assertEqual([call.args for call in game.take.call_args_list], [(4,), (4,)])
-        self.assertEqual(game.click.call_count,2)
+        self.assertEqual(game.click_live.call_count,2)
 
     def test_teleport_frame_and_ack(self):
         a=self.alts[1]
@@ -455,6 +472,24 @@ class VisionTest(unittest.TestCase):
                 pixel=np.array(screen_point(pose,p))*frame.size
                 self.assertLess(np.linalg.norm(pixel-point(p)),19,(angle,p,pixel,point(p)))
         self.assertIsNone(road_pose(Image.new("RGB",(1366,768))))
+
+    def test_placement_uses_wrecks_at_opposite_headings(self):
+        from wastelands_view import placement_pose
+        for sign in (1,-1):
+            frame = Image.new("RGB",(1366,768),(117,94,62))
+            def point(p):
+                return tuple((np.asarray(p)-[1024,576])*sign*1366/2048+[683,384])
+            draw = ImageDraw.Draw(frame)
+            for a,b in [((0,-95),(2048,1305)),((835,475),(990,246)),((990,246),(730,73)),((1550,965),(1420,1160))]:
+                draw.line((point(a),point(b)),fill=(218,64,47),width=32)
+            self.assertIsNone(placement_pose(frame))
+            for pos in ((804,700),(505,515)):
+                x,y=point(pos)
+                draw.rectangle((x-25,y-17,x+25,y+17),fill=(69,69,48))
+            pose=placement_pose(frame)
+            self.assertIsNotNone(pose)
+            placed=np.asarray(screen_point(pose,(951,424)))*frame.size
+            self.assertLess(np.linalg.norm(placed-point((951,424))),16)
 
     def test_stationary_terrain_without_opencv(self):
         from wastelands_view import tracked_pose

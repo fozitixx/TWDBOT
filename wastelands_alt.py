@@ -8,7 +8,7 @@ from pynput import mouse
 
 import twd_bot as farm
 from wastelands_team import ABILITIES, PLACEMENT_ORDER, Wait, placement_label, position, private_server_links
-from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, road_pose, scene, screen_point, tracked_pose
+from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, placement_pose, mission_button, ready_button, scene, screen_point, tracked_pose
 
 
 class Game(farm.Bot):
@@ -33,6 +33,12 @@ class Game(farm.Bot):
         if self.rect() != rect:
             raise Wait("Окно переместилось")
         return img
+
+    @staticmethod
+    def vote_button(img, mode):
+        if mode=="ready":
+            return ready_button(img)
+        return mission_button(img,mode) or farm.Bot.vote_button(img,mode)
 
     def check(self):
         self.guard()
@@ -169,7 +175,7 @@ class Alt:
         self.phase = "lobby"
         self.voted = state["progress"].get("voted",False)
         self.vote_retry = 0
-        self.vote_uncertain = False
+        self.uncertain_votes = set()
         self.ready = state["progress"].get("ready",False)
         self.invited = state["progress"].get("invited",False)
         self.last_invite = None
@@ -196,9 +202,11 @@ class Alt:
         self.last_invite = None
         self.invite_attempts = 0
 
-    def vote_reading(self, img, button):
+    def vote_reading(self, img, button, mode=None):
         x,y,w,h = (button[k] for k in ("cx","cy","w","h"))
-        area = farm.crop_frac(img,(x+.09*w,y-.48*h,x+.49*w,y+.48*h)).convert("L")
+        box = ((x-.26*w,y+.52*h,x+.26*w,y+1.14*h) if mode=="ready"
+               else (x+.09*w,y-.48*h,x+.49*w,y+.48*h))
+        area = farm.crop_frac(img,box).convert("L")
         ink = area.point(lambda v: 255 if v>180 else 0)
         bounds = ink.getbbox()
         if not bounds or bounds[2]-bounds[0]<.30*area.width or bounds[3]-bounds[1]<.30*area.height:
@@ -212,9 +220,10 @@ class Alt:
 
     def vote(self, mode):
         title = mode.upper()
-        if self.voted:
+        is_ready = mode=="ready"
+        if not is_ready and self.voted:
             return f"Голосование за {title} продолжается"
-        if self.vote_uncertain:
+        if mode in self.uncertain_votes:
             return f"Проверь голос за {title} · не прочитан счётчик после попытки"
         now = time.monotonic()
         if now < self.vote_retry:
@@ -224,20 +233,21 @@ class Alt:
             return f"Жду очереди голосовать за {title}"
         until = now + turn["vote_seconds"]
         def target(button):
-            return (button["cx"]-.20*button["w"],button["cy"]) if button else None
+            if button:
+                return (button["cx"] if is_ready else button["cx"]-.20*button["w"],button["cy"])
         try:
             frame = self.game.grab()
             button = self.game.vote_button(frame,mode)
             if not button:
                 return "Экран голосования закрылся"
-            before, original = self.vote_reading(frame,button)
+            before, original = self.vote_reading(frame,button,mode)
             if not (before and before[0]==before[1]):
                 if time.monotonic()+3 > until:
                     return "Обновляю кадр голосования"
-                self.game.click_live(target(button), lambda img: target(self.game.vote_button(img,mode)), "VOTE")
+                self.game.click_live(target(button), lambda img: target(self.game.vote_button(img,mode)), "READY" if is_ready else "VOTE")
                 # A second click can remove a vote. Only retry on a readable,
                 # unchanged counter while this alt still holds the voting turn.
-                self.vote_uncertain = True
+                self.uncertain_votes.add(mode)
                 after = None
                 changed_frames = 0
                 unchanged_frames = 0
@@ -247,7 +257,7 @@ class Alt:
                     button = self.game.vote_button(frame,mode)
                     if not button:
                         return "Голосование закрылось · проверяю экран матча"
-                    after, current = self.vote_reading(frame,button)
+                    after, current = self.vote_reading(frame,button,mode)
                     if time.monotonic()>=until:
                         return f"Проверь голос за {title} · время проверки истекло"
                     if after and (after[0]==after[1] or
@@ -265,11 +275,16 @@ class Alt:
                         changed_frames = unchanged_frames = 0
                 else:
                     if before and before==after or unchanged_frames>=2:
-                        self.vote_uncertain = False
+                        self.uncertain_votes.discard(mode)
                         return f"{title} · счётчик не изменился, повторю"
                     return f"Проверь голос за {title} · нет подтверждения"
-            self.exchange("voted")
-            self.voted = True
+            self.uncertain_votes.discard(mode)
+            if is_ready:
+                self.exchange("ready")
+                self.ready = True
+            else:
+                self.exchange("voted")
+                self.voted = True
             return f"Голосование за {title} · счётчик подтверждён"
         finally:
             self.vote_retry = time.monotonic()+1.2
@@ -286,7 +301,7 @@ class Alt:
             return "Подготовка расстановки"
         vote = self.game.vote_button(img,state["mode"])
         if vote and not self.invited:
-            if self.last_invite is None:
+            if self.last_invite is None and not mission_button(img,state["mode"]):
                 return "Ожидаю группу Wastelands от основы"
             self.confirm_group()
         if vote:
@@ -308,7 +323,7 @@ class Alt:
             return "В группе · жду запуска основой"
         if self.last_invite is not None:
             return "Приглашение исчезло · жду подтверждения входа"
-        if self.voted or self.vote_uncertain:
+        if self.voted or state["mode"] in self.uncertain_votes:
             return "Голосование закрылось · проверяю появление READY"
         return "Жду приглашение или голосование"
 
@@ -350,9 +365,9 @@ class Alt:
         try:
             self.game.hover(farm.IDLE_POINT)
             snap = self.game.grab()
-            pose = road_pose(snap)
+            pose = placement_pose(snap)
             if pose is None:
-                return "Не узнал поворот Wastelands"
+                return "Проверяю направление Wastelands по дороге и обломкам"
             point = position(self.player,unit,self.attempt[unit])
             pt = screen_point(pose,point)
             if not (.015<pt[0]<.985 and .10<pt[1]<.92) or (.27<pt[0]<.74 and pt[1]>.81):
@@ -363,7 +378,16 @@ class Alt:
                 if "занят" in str(e) or "Зона ранней защиты основы" in str(e):
                     self.attempt[unit]+=1
                 raise
-            self.game.click(pt)
+            def live_point(frame):
+                if frame.size==snap.size and np.median(abs(scene(frame)-scene(snap)))<4:
+                    return pt
+                return None
+            try:
+                self.game.click_live(pt,live_point,name)
+            except Wait:
+                # click_live raises Wait only before the button press.
+                self.confirm = ("release",unit,point)
+                raise
             self.game.sleep(.40)
             after = self.game.money()
             gone = not self.game.path_visible()
@@ -501,7 +525,7 @@ class Alt:
                     return {"result":"Не удалось сверить положение камеры"}
                 try:
                     self.game.hover(farm.IDLE_POINT)
-                    current = road_pose(self.game.grab())
+                    current = placement_pose(self.game.grab())
                 finally:
                     self.game.drop()
                 if current is None:
@@ -561,12 +585,8 @@ class Alt:
                 self.deadline = None
             self.exchange("result",id=cmd["id"],**response)
             return response["result"]
-        if "plunger" in self.placed and not self.ready:
-            if self.game.ready_visible():
-                self.game.click(farm.READY_POINT)
-            self.ready = True
-            self.exchange("ready")
-            return "Plunger поставлен · READY"
+        if "plunger" in self.placed and not self.ready and ready_button(img):
+            return self.vote("ready")
         for unit in PLACEMENT_ORDER:
             if unit not in self.placed:
                 return self.place(unit,img)

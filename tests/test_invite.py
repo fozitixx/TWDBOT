@@ -4,10 +4,21 @@ from unittest.mock import Mock
 
 from PIL import Image, ImageDraw
 
-from wastelands_view import read_invite
+from wastelands_view import mission_button, read_invite
 
 
 class InviteTest(unittest.TestCase):
+    def test_adjacent_buttons_in_windowed_vote(self):
+        frame = Image.new("RGB", (1092,558))
+        with Image.open(Path(__file__).parent / "fixtures/mission_buttons_rdp.png") as buttons:
+            frame.paste(buttons,(375,372))
+        for size in (frame.size,(1366,698)):
+            for mode,x in (("hard",.42),("nightmare",.58)):
+                button = mission_button(frame.resize(size),mode)
+                self.assertIsNotNone(button)
+                self.assertAlmostEqual(button["cx"],x,delta=.01)
+                self.assertAlmostEqual(button["cy"],.72,delta=.01)
+
     def test_compact_invite_when_map_ocr_is_empty(self):
         frame = Image.new("RGB", (1366, 768))
         with Image.open(Path(__file__).parent / "fixtures/wasteland_invite_buttons.png") as card:

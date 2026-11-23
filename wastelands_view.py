@@ -3,11 +3,12 @@ import base64
 import io
 import json
 import math
+from itertools import permutations
 from pathlib import Path
 import subprocess
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 try:
     import cv2
@@ -141,6 +142,128 @@ def _binary_match(template, spectrum, integral, shape):
     scores = np.divide(covariance, norm, out=np.zeros_like(covariance), where=norm>0)
     y,x = np.unravel_index(scores.argmax(), scores.shape)
     return scores[y,x], (x,y)
+
+
+def mission_button(img, mode):
+    """Match the aligned red and purple button outlines even when a card is black."""
+    w = 640
+    h = round(w*img.height/img.width)
+    top = int(.63*h)
+    band = img.convert("RGB").resize((w,h),Image.Resampling.BILINEAR).crop((0,top,w,int(.80*h)))
+    r,g,b = np.asarray(band,dtype=np.int16).transpose(2,0,1)
+    def buttons(mask):
+        return [(x,y+top,bw,bh) for x,y,bw,bh in color_boxes(mask.astype(np.uint8))
+                if .09*w<bw<.20*w and .035*h<bh<.085*h and 0<y<band.height-bh]
+    red = buttons((r>92)&(r>2*g+8)&(r>1.45*b))
+    purple = buttons((b>92)&(b>2*g+10)&(b>1.25*r))
+    for left in red:
+        for right in purple:
+            x,y,bw,bh = left
+            rx,ry,rw,rh = right
+            if (.32*w<x<.43*w and .50*w<rx<.57*w and 0<rx-x-bw<.055*w and
+                    abs(y+bh/2-ry-rh/2)<.01*h and .8<bw/rw<1.25):
+                x,y,bw,bh = right if mode=="nightmare" else left
+                return dict(cx=(x+bw/2)/w,cy=(y+bh/2)/h,w=bw/w,h=bh/h)
+    return None
+
+
+def ready_button(img):
+    w,h = img.size
+    left,top = round(.37*w),round(.12*h)
+    roi = img.crop((left,top,round(.63*w),round(.27*h))).convert("RGB")
+    r,g,b = np.asarray(roi,dtype=np.int16).transpose(2,0,1)
+    green = (g>65)&(g-r>45)&(g-b>45)
+    for x,y,bw,bh in sorted(color_boxes(green.astype(np.uint8)),key=lambda box:-box[2]*box[3]):
+        if not (.07*w<bw<.15*w and .035*h<bh<.09*h and abs(left+x+bw/2-w/2)<.035*w):
+            continue
+        if green[y:y+bh,x:x+bw].mean()>.60:
+            return dict(cx=(left+x+bw/2)/w,cy=(top+y+bh/2)/h,w=bw/w,h=bh/h)
+    return None
+
+
+# Centers of three separate olive vehicles around the annotated early-defense bend.
+_VEHICLES = np.array([[804.,700.],[505.,515.],[1248.,275.]])
+_LANDMARK_BASIS = np.linalg.inv((_VEHICLES[:2]-ANCHOR).T)
+
+
+def landmark_pose(img):
+    """Determine which bend is visible using two wrecks and the branching road."""
+    w = 512
+    h = round(w*img.height/img.width)
+    rgb = np.asarray(img.convert("RGB").resize((w,h),Image.Resampling.BILINEAR),dtype=np.int16)
+    r,g,b = rgb.transpose(2,0,1)
+    olive = (abs(r-g)<=6)&(g-b>10)&(g<112)&(g>30)
+    olive = np.asarray(Image.fromarray(olive).filter(ImageFilter.MedianFilter(3)),dtype=np.uint8)
+    centers = [(x+bw/2,y+bh/2) for x,y,bw,bh in color_boxes(olive)
+               if 9<=bw<=52 and 6<=bh<=46 and bw*bh>=108 and y+bh/2<.83*h
+               and olive[y:y+bh,x:x+bw].mean()>.35]
+    if not 2<=len(centers)<=50:
+        return None
+    road = (r>110)&(r-g>58)&(r-b>52)
+    road = np.asarray(Image.fromarray(road).filter(ImageFilter.MaxFilter(3)))
+    # Sample both sides of the junction and the first side road separately.
+    edges = [((450,212),(815,461)),((855,489),(1370,838)),((835,475),(990,246)),
+             ((990,246),(805,125)),((1550,965),(1430,1149))]
+    samples = np.array([np.linspace(a,b,21) for a,b in edges])-ANCHOR
+    shifts = np.stack(np.meshgrid(np.arange(-20,21,2),np.arange(-20,21,2)),axis=-1).reshape(-1,2)
+    ref_delta = complex(*(_VEHICLES[1]-_VEHICLES[0]))
+    matches = []
+    for pair in permutations(centers,2):
+        a,second = np.asarray(pair)
+        ratio = complex(*(second-a))/ref_delta
+        if not .16<abs(ratio)<.38:
+            continue
+        anchor = complex(*a)+ratio*complex(*(ANCHOR-_VEHICLES[0]))
+        origins = np.array([anchor.real,anchor.imag])+shifts
+        mats = (np.asarray(pair)[None,:,:]-origins[:,None,:]).transpose(0,2,1)@_LANDMARK_BASIS
+        spawn = origins+mats@(np.array([1024,576])-ANCHOR)
+        good = (abs(spawn[:,0]-w/2)<.16*w)&(abs(spawn[:,1]-h/2)<.19*h)
+        if not good.any():
+            continue
+        origins,mats = origins[good],mats[good]
+        points = origins[:,None,None,:]+np.einsum("nij,ekj->neki",mats,samples)
+        x,y = np.rint(points).astype(int).transpose(3,0,1,2)
+        visible = (x>=0)&(x<w)&(y>=0)&(y<h)&~((y>.81*h)&(x>.26*w)&(x<.74*w))
+        visible &= ~((y<.23*h)&(x>.33*w)&(x<.67*w))
+        yy,xx = y.clip(0,h-1),x.clip(0,w-1)
+        # Ignore brightly painted overlays (including map annotations) that hide the road.
+        visible &= ~((g[yy,xx]>210)&(b[yy,xx]<65))
+        hit = visible & road[yy,xx]
+        n = visible.sum(2)
+        support = hit.sum(2)/np.maximum(1,n)
+        good = ((n[:,:3]>=7)&(support[:,:3]>=.58)).all(1)
+        scores = hit[:,:3].sum((1,2))/np.maximum(1,n[:,:3].sum(1))
+        scores += .06*(hit[:,3:].sum((1,2))/np.maximum(1,n[:,3:].sum(1))-.5)
+        # Smaller corrections to the initial similarity fit break ties within a road stripe.
+        scores -= .025*np.linalg.norm(origins-[anchor.real,anchor.imag],axis=1)/20
+        scores[~good] = 0
+        idx = scores.argmax()
+        if scores[idx]>=.76:
+            matches.append((scores[idx],origins[idx],mats[idx]))
+    if not matches:
+        return None
+    matches.sort(key=lambda entry:-entry[0])
+    score,origin,mat = matches[0]
+    for other,loc,transform in matches[1:]:
+        if score-other>.07:
+            break
+        if np.linalg.norm(origin-loc)>7 or np.linalg.norm(mat-transform)>.045:
+            return None
+    return origin/[w,h], mat/np.array([[w],[h]])
+
+
+def placement_pose(img):
+    landmarks = landmark_pose(img)
+    if landmarks is None:
+        return None
+    road = road_pose(img)
+    if road is not None:
+        # Use the more precise road fit only when the wrecks verify its orientation.
+        offsets = np.asarray([screen_point(road,p) for p in _VEHICLES])-np.asarray(
+            [screen_point(landmarks,p) for p in _VEHICLES])
+        if np.max(np.linalg.norm(offsets*img.size,axis=1))<.024*img.width:
+            return road
+    return landmarks
 
 
 def road_pose(img):
