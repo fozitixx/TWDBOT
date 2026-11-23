@@ -136,6 +136,8 @@ class Match:
         self.frames = {}
         self.results = {}
         self.progress = {}
+        self.vote_owner = None
+        self.vote_until = 0
 
     def issue_pin(self, player):
         with self.lock:
@@ -174,6 +176,7 @@ class Match:
             self.run = secrets.token_hex(8)
             self.recalled.clear()
             self.mode, self.host = mode, host.strip()
+            self.vote_owner = None
             self.places = {(i, u): {"unit": u, "player": i, "point": position(i, u),
                                     "state": "reserved"} for i in PLAYERS for u in PLACEMENT_ORDER}
             self.pending.clear()
@@ -300,6 +303,13 @@ class Match:
                         place.update(point=place.pop("target"),state="placed")
                     elif place["state"] != "placed" or place["point"] != req["point"]:
                         raise ValueError("Резерв не подтверждён")
+                elif op == "vote_turn":
+                    if self.vote_owner is None or now >= self.vote_until:
+                        self.vote_owner = player
+                        self.vote_until = now+6
+                elif op == "vote_end":
+                    if self.vote_owner == player:
+                        self.vote_owner = None
                 elif op in ("invited","voted","ready"):
                     self.progress[player][op] = True
                 elif op == "claim":
@@ -325,6 +335,7 @@ class Match:
             return dict(run="" if player in self.recalled else self.run,
                         summon={"id":summon["id"],"link":summon["link"]} if summon and summon["instance"]==owner else None,
                         mode=self.mode,host=self.host,places=list(self.places.values()),claimed=claimed,
+                        vote_seconds=max(0,self.vote_until-now) if self.vote_owner==player else 0,
                         progress=self.progress.get(player,{}),
                         command=dict(cmd,remaining=cmd["until"]-now) if cmd and not cmd.get("claimed")
                         and req.get("run")==self.run else None)

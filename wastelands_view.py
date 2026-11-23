@@ -215,13 +215,21 @@ def road_pose(img):
         if len(rows)<16:
             return None
         design,vals=np.asarray(rows),np.asarray(centers)
-        fit,_,rank,_=np.linalg.lstsq(design,vals,rcond=None)
+        # When the HUD covers the second bend, transverse sections through
+        # one junction constrain heading and translation, but barely constrain scale.
+        # Keep the template scale in that direction during refinement.
+        prior = np.array([[0,0,60,0],[0,0,0,60]])
+        prior_values = 60*mat[:,0]
+        def fit_sections(rows, values):
+            return np.linalg.lstsq(np.vstack((rows, prior)),
+                                   np.r_[values, prior_values], rcond=None)[0]
+        fit = fit_sections(design, vals)
         keep=abs(design@fit-vals)<2.5
-        if rank<4 or keep.sum()<16:
+        if keep.sum()<16 or np.linalg.svd(design[keep,:2],compute_uv=False)[-1]<1.5:
             return None
-        fit,_,rank,_=np.linalg.lstsq(design[keep],vals[keep],rcond=None)
+        fit = fit_sections(design[keep], vals[keep])
         new_mat=np.array([[fit[2],-fit[3]],[fit[3],fit[2]]])
-        if rank<4 or np.linalg.norm(fit[:2]-origin)>7 or np.linalg.norm(new_mat-mat)>.035:
+        if np.linalg.norm(fit[:2]-origin)>7 or np.linalg.norm(new_mat-mat)>.035:
             return None
         origin,mat=fit[:2],new_mat
     return origin / [w,h], mat / np.array([[w],[h]])

@@ -3,7 +3,7 @@ import re
 import time
 
 import numpy as np
-from PIL import ImageGrab
+from PIL import Image, ImageGrab, ImageOps
 from pynput import mouse
 
 import twd_bot as farm
@@ -54,20 +54,26 @@ class Game(farm.Bot):
             self.m.release(mouse.Button.left)
 
     def accept_invite(self, point):
+        def current(frame):
+            buttons = invite_buttons(frame)
+            return buttons[1] if buttons else None
+        self.click_live(point, current, "Принять")
+
+    def click_live(self, point, locate, title):
         rect = self.rect()
         target = self.to_screen(point)
         # Roblox updates its hover target on a movement event in some RDP sessions.
         self.hover(point)
         self.sleep(.20)
         frame = self.grab()
-        live = invite_buttons(frame)
-        if not live or any(abs(a-b)*size > 3 for a,b,size in zip(point,live[1],frame.size)):
-            raise Wait("Приглашение изменилось · проверяю снова")
+        live = locate(frame)
+        if not live or any(abs(a-b)*size > 3 for a,b,size in zip(point,live,frame.size)):
+            raise Wait(f"Кнопка «{title}» изменилась · проверяю снова")
         self.check()
         if self.rect() != rect:
-            raise Wait("Окно Roblox переместилось · проверяю приглашение снова")
+            raise Wait("Окно Roblox переместилось · проверяю кнопку снова")
         if any(abs(a-b)>3 for a,b in zip(self.m.position,target)):
-            raise Wait("Курсор не попал на «Принять» · повторяю наведение")
+            raise Wait(f"Курсор не попал на «{title}» · повторяю наведение")
         self.m.press(mouse.Button.left)
         try:
             self.sleep(.15)
@@ -162,6 +168,8 @@ class Alt:
         self.run = state["run"]
         self.phase = "lobby"
         self.voted = state["progress"].get("voted",False)
+        self.vote_retry = 0
+        self.vote_uncertain = False
         self.ready = state["progress"].get("ready",False)
         self.invited = state["progress"].get("invited",False)
         self.last_invite = None
@@ -188,6 +196,85 @@ class Alt:
         self.last_invite = None
         self.invite_attempts = 0
 
+    def vote_reading(self, img, button):
+        x,y,w,h = (button[k] for k in ("cx","cy","w","h"))
+        area = farm.crop_frac(img,(x+.09*w,y-.48*h,x+.49*w,y+.48*h)).convert("L")
+        ink = area.point(lambda v: 255 if v>180 else 0)
+        bounds = ink.getbbox()
+        if not bounds or bounds[2]-bounds[0]<.30*area.width or bounds[3]-bounds[1]<.30*area.height:
+            return None, None
+        glyphs = ink.crop(bounds).resize((80,36),Image.Resampling.BILINEAR)
+        clean = ImageOps.expand(ImageOps.invert(ink),border=8,fill=255)
+        words = self.ocr.read(clean,zoom=3)
+        count = re.fullmatch(r"([0-4])/([1-4])", "".join(word[0] for word in words).replace(" ",""))
+        value = (int(count[1]),int(count[2])) if count and count[1]<=count[2] else None
+        return value, np.asarray(glyphs)>127
+
+    def vote(self, mode):
+        title = mode.upper()
+        if self.voted:
+            return f"Голосование за {title} продолжается"
+        if self.vote_uncertain:
+            return f"Проверь голос за {title} · не прочитан счётчик после попытки"
+        now = time.monotonic()
+        if now < self.vote_retry:
+            return f"Проверяю голосование за {title}"
+        turn = self.exchange("vote_turn")
+        if turn.get("vote_seconds",0) < 4:
+            return f"Жду очереди голосовать за {title}"
+        until = now + turn["vote_seconds"]
+        def target(button):
+            return (button["cx"]-.20*button["w"],button["cy"]) if button else None
+        try:
+            frame = self.game.grab()
+            button = self.game.vote_button(frame,mode)
+            if not button:
+                return "Экран голосования закрылся"
+            before, original = self.vote_reading(frame,button)
+            if not (before and before[0]==before[1]):
+                if time.monotonic()+3 > until:
+                    return "Обновляю кадр голосования"
+                self.game.click_live(target(button), lambda img: target(self.game.vote_button(img,mode)), "VOTE")
+                # A second click can remove a vote. Only retry on a readable,
+                # unchanged counter while this alt still holds the voting turn.
+                self.vote_uncertain = True
+                after = None
+                changed_frames = 0
+                unchanged_frames = 0
+                for _ in range(3):
+                    self.game.sleep(.35)
+                    frame = self.game.grab()
+                    button = self.game.vote_button(frame,mode)
+                    if not button:
+                        return "Голосование закрылось · проверяю экран матча"
+                    after, current = self.vote_reading(frame,button)
+                    if time.monotonic()>=until:
+                        return f"Проверь голос за {title} · время проверки истекло"
+                    if after and (after[0]==after[1] or
+                                  before and before[1]==after[1] and after[0]>before[0]):
+                        break
+                    # In a small RDP window OCR can merge "1/" into one glyph.
+                    # Compare only the white counter lettering, away from the cursor.
+                    if original is not None and current is not None:
+                        diff = np.count_nonzero(current ^ original) / max(1,np.count_nonzero(current | original))
+                        changed_frames = changed_frames+1 if diff>.18 and (not before or not after) else 0
+                        unchanged_frames = unchanged_frames+1 if diff<.04 else 0
+                        if changed_frames>=2:
+                            break
+                    else:
+                        changed_frames = unchanged_frames = 0
+                else:
+                    if before and before==after or unchanged_frames>=2:
+                        self.vote_uncertain = False
+                        return f"{title} · счётчик не изменился, повторю"
+                    return f"Проверь голос за {title} · нет подтверждения"
+            self.exchange("voted")
+            self.voted = True
+            return f"Голосование за {title} · счётчик подтверждён"
+        finally:
+            self.vote_retry = time.monotonic()+1.2
+            self.exchange("vote_end")
+
     def lobby(self, state, img):
         now = time.monotonic()
         if self.last_invite is not None and now-self.last_invite > 45:
@@ -197,18 +284,13 @@ class Alt:
             self.phase = "battle"
             self.game.camera_top_down()
             return "Подготовка расстановки"
-        vote = self.game.vote_point(state["mode"])
+        vote = self.game.vote_button(img,state["mode"])
         if vote and not self.invited:
             if self.last_invite is None:
                 return "Ожидаю группу Wastelands от основы"
             self.confirm_group()
-        if vote and not self.voted:
-            self.game.click(vote)
-            self.voted = True
-            self.exchange("voted")
-            return "Нажат VOTE · "+state["mode"].upper()
-        if vote or self.voted:
-            return "Жду READY"
+        if vote:
+            return self.vote(state["mode"])
         accept, reason = read_invite(img,state["host"],self.ocr.read)
         if accept:
             if self.last_invite is None or now-self.last_invite >= 2:
@@ -226,6 +308,8 @@ class Alt:
             return "В группе · жду запуска основой"
         if self.last_invite is not None:
             return "Приглашение исчезло · жду подтверждения входа"
+        if self.voted or self.vote_uncertain:
+            return "Голосование закрылось · проверяю появление READY"
         return "Жду приглашение или голосование"
 
     def update_places(self,state):
@@ -251,6 +335,12 @@ class Alt:
         center = (.313 + (slot-1)*.072)
         price = next((v for x,v in prices if abs(x-center)<.032 and v),None)
         cash = self.game.money()
+        # A selected early unit can cover its own price at RDP scale.
+        # The configured slot identifies the unit; placement still requires
+        # a highlighted road and a matching decrease in the actual balance.
+        kind = unit.partition("_")[0]
+        if price is None and kind in ("plunger","tv"):
+            price = farm.UNITS[kind]["price"]
         if price is None or cash is None or cash < price:
             return f"Жду {name} · баланс {cash}, цена слота {slot}: {price}"
         if self.attempt[unit]>=5:

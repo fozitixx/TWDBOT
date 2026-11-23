@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "6.0.8 (Wasteland: принятие приглашений)"
+VERSION = "6.0.9 (Wasteland: голосование и расстановка)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2207,9 +2207,9 @@ _update_checked = 0.0
 # companion files for this version, even after the release branch moves on.
 TEAM_FILES = {
     "wastelands.py": "9cad2e8755b2126fa8c750e3392eef164682a03e",
-    "wastelands_alt.py": "5d50d760623c6089ddb3a4cd31e36d57933b1a20",
-    "wastelands_team.py": "d702b85342b5f2045a757593b6a617f54b2c47ae",
-    "wastelands_view.py": "b18d9582ab425e8b472b1d0179b437c8e1e01b5b",
+    "wastelands_alt.py": "4c71254c8568368f3712bf2bbdd6322cc7ab5efd",
+    "wastelands_team.py": "d2626bd2cd32a489479804af05177968c84f3c95",
+    "wastelands_view.py": "87ada58f9a8aa26f1fa4d955b26f0e2c767c35ac",
     "wastelands_ocr.ps1": "496e34e723f8a27cd6993fc72f826f398459b5b9",
 }
 
@@ -3141,6 +3141,11 @@ class Bot:
             img = self.grab()
         except Exception:
             return None
+        button = self.vote_button(img, mode)
+        return (button["cx"], button["cy"]) if button else None
+
+    @staticmethod
+    def vote_button(img, mode):
         w, h = img.size
         a = np.asarray(img.convert("RGB").resize((LOBBY_W, max(1, round(LOBBY_W * h / w))), Image.BOX)).astype(np.int16)
         r, g, b = a[..., 0], a[..., 1], a[..., 2]
@@ -3155,7 +3160,7 @@ class Bot:
             for v in blobs:
                 if (abs(v["cx"] - c["cx"]) < 0.02 and 0.03 <= v["h"] <= 0.1 and abs(v["w"] - c["w"]) < 0.04
                         and v["cy"] > c["cy"] + c["h"] / 2):
-                    return (v["cx"], v["cy"])
+                    return v
         return None
 
     def vote_screen(self):

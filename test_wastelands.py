@@ -156,6 +156,7 @@ class InviteInputTest(unittest.TestCase):
         with Image.open(Path(__file__).parent / "tests/fixtures/wasteland_invite_buttons.png") as card:
             frame.paste(card, (1163, 229))
         game = Mock(spec=Game)
+        game.click_live.side_effect = partial(Game.click_live,game)
         game.rect.return_value = (100, 50, 1466, 818)
         game.to_screen.side_effect = lambda pt: Game.to_screen(game, pt)
         game.grab.return_value = frame
@@ -170,7 +171,7 @@ class InviteInputTest(unittest.TestCase):
         game.m.press.assert_called_once()
         game.m.release.assert_called_once()
         game.grab.return_value = Image.new("RGB", frame.size)
-        with self.assertRaisesRegex(Wait, "Приглашение"):
+        with self.assertRaisesRegex(Wait, "Кнопка"):
             Game.accept_invite(game, point)
         game.m.press.assert_called_once()
 
@@ -178,7 +179,7 @@ class InviteInputTest(unittest.TestCase):
         alt = Alt.__new__(Alt)
         alt.game, alt.ocr, alt.exchange = Mock(), Mock(), Mock()
         alt.reset({"run":"match", "progress":{}})
-        alt.game.vote_point.return_value = None
+        alt.game.vote_button.return_value = None
         state = {"mode":"nightmare", "host":"Host"}
         point = (.95, .33)
         with patch("wastelands_alt.read_invite", return_value=(point, "")) as invite, \
@@ -198,6 +199,42 @@ class InviteInputTest(unittest.TestCase):
             self.assertIn("В группе", alt.lobby(state, None))
             alt.exchange.assert_called_once_with("invited")
             self.assertTrue(alt.invited)
+
+
+class VoteTest(unittest.TestCase):
+    def test_missed_vote_retries_and_confirmed_vote_stays_selected(self):
+        alt = Alt.__new__(Alt)
+        alt.game, alt.ocr, alt.exchange = Mock(), Mock(), Mock()
+        alt.exchange.return_value = {"vote_seconds":6}
+        alt.reset({"run":"match", "progress":{"invited":True}})
+        alt.game.ready_visible.return_value = False
+        alt.game.vote_button.return_value = {"cx":.59,"cy":.72,"w":.14,"h":.06}
+        alt.vote_reading = Mock(side_effect=[((n,4),None) for n in (1,1,1,1,1,2)])
+        state = {"mode":"nightmare", "host":"Host"}
+        with patch("wastelands_alt.time.monotonic",return_value=100) as clock:
+            self.assertIn("повторю",alt.lobby(state,None))
+            self.assertFalse(alt.voted)
+            clock.return_value = 103
+            self.assertIn("подтверждён",alt.lobby(state,None))
+            self.assertTrue(alt.voted)
+            self.assertNotIn("READY",alt.lobby(state,None))
+        self.assertEqual(alt.game.click_live.call_count,2)
+        self.assertAlmostEqual(alt.game.click_live.call_args.args[0][0],.562)
+
+    def test_voting_turn_released_or_expires(self):
+        match = Match()
+        match.start("nightmare","Host")
+        def turn(p,op="vote_turn"):
+            return match.exchange(p,{"op":op,"instance":str(p),"run":match.run})["vote_seconds"]
+        with patch("wastelands_team.time.monotonic",return_value=100) as clock:
+            self.assertGreater(turn(1),0)
+            self.assertEqual(turn(2),0)
+            turn(1,"vote_end")
+            self.assertGreater(turn(2),0)
+            clock.return_value=107
+            self.assertGreater(turn(3),0)
+            turn(2,"vote_end")
+            self.assertEqual(turn(1),0)
 
 
 class NetworkTest(unittest.TestCase):
