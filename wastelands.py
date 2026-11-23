@@ -108,6 +108,7 @@ class App:
         self.peer_addr = tk.StringVar(value=prefs.get("peer_address",""))
         self.host = tk.StringVar(value=prefs.get("host",""))
         self.mode = tk.StringVar(value="hard" if prefs.get("mode")=="hard" else "nightmare")
+        self.afk_auto = tk.BooleanVar(value=prefs.get("afk_auto",True))
         self._build_main()
         self._build_client(prefs)
         self._run_view = False
@@ -173,6 +174,11 @@ class App:
                            selectcolor="#81323b" if name=="hard" else "#614285",
                            activebackground=C["card2"], activeforeground=C["accent"], relief="flat",
                            offrelief="flat", bd=0, highlightthickness=0, padx=9, pady=4).pack(side="left")
+
+        tk.Checkbutton(self.match_fields, text="Автоответ твинков на AFK CHECK",
+                       variable=self.afk_auto, bg=C["card"], fg=C["text"], selectcolor=C["entry"],
+                       activebackground=C["card"], activeforeground=C["accent"], font=(FONT,9),
+                       highlightthickness=0).grid(row=2,column=0,columnspan=2,sticky="w",pady=(4,0))
 
         top = tk.Frame(body, bg=C["bg"])
         top.pack(fill="x", pady=(2, 4))
@@ -255,7 +261,7 @@ class App:
     def remember(self):
         if self.save_prefs:
             self.save_prefs(dict(address=self.addr.get().strip(),peer_address=self.peer_addr.get().strip(),host=self.host.get().strip(),
-                                 mode=self.mode.get(),slots={u:v.get() for u,v in self.slot_vars.items()},
+                                 mode=self.mode.get(),afk_auto=self.afk_auto.get(),slots={u:v.get() for u,v in self.slot_vars.items()},
                                  role="alt" if self.tabs.select()==str(self.client) else "main"))
 
     def active(self):
@@ -317,7 +323,7 @@ class App:
             messagebox.showinfo("Матч","Сначала останови текущий матч помощника.")
             return
         try:
-            self.match.start(self.mode.get(),self.host.get())
+            self.match.start(self.mode.get(),self.host.get(),afk_auto=self.afk_auto.get())
             self.remember()
             self.note.configure(text="Пригласи твинков на Wastelands и запусти матч в Roblox с основы.")
             self.render_players()

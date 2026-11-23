@@ -173,6 +173,7 @@ class Match:
         self.summons = {}
         self.recalled = set()
         self.run = ""
+        self.afk_auto = True
         self.mode = "nightmare"
         self.host = ""
         self.places = {}
@@ -213,13 +214,14 @@ class Match:
             self.pair_failures.append(now)
             raise ValueError("PIN неверен, уже использован или истёк. Проверь PIN на основе.")
 
-    def start(self, mode, host):
+    def start(self, mode, host, *, afk_auto=True):
         if mode not in ("hard", "nightmare") or not host.strip():
             raise ValueError("Укажи сложность и имя основы из PARTY INVITE")
         with self.lock:
             self.run = secrets.token_hex(8)
             self.recalled.clear()
             self.mode, self.host = mode, host.strip()
+            self.afk_auto = afk_auto
             self.vote_owner = None
             self.places = {(i, u): {"unit": u, "player": i, "point": position(i, u),
                                     "state": "reserved"} for i in PLAYERS for u in PLACEMENT_ORDER}
@@ -403,7 +405,7 @@ class Match:
                 cmd = None
             return dict(run="" if player in self.recalled else self.run,
                         summon={"id":summon["id"],"link":summon["link"]} if summon and summon["instance"]==owner else None,
-                        placement_sites=True, sites=sites, mode=self.mode,host=self.host,places=list(self.places.values()),claimed=claimed,
+                        afk_auto=self.afk_auto, placement_sites=True, sites=sites, mode=self.mode,host=self.host,places=list(self.places.values()),claimed=claimed,
                         vote_seconds=max(0,self.vote_until-now) if self.vote_owner==player else 0,
                         progress=self.progress.get(player,{}),
                         command=dict(cmd,remaining=cmd["until"]-now) if cmd and not cmd.get("claimed")

@@ -173,6 +173,9 @@ class Alt:
     def reset(self, state):
         self.run = state["run"]
         self.phase = "lobby"
+        self.afk_signature = None
+        self.afk_clicks = 0
+        self.afk_retry_at = 0
         self.voted = state["progress"].get("voted",False)
         self.vote_retry = 0
         self.uncertain_votes = set()
@@ -694,13 +697,39 @@ class Alt:
             return {"result":result}
         return {"result":self.manager(unit,name)}
 
+    def answer_afk(self,panel,automatic):
+        _, points, signature, choice = panel
+        if not farm.same_afk_signature(self.afk_signature,signature):
+            self.afk_signature = signature
+            self.afk_clicks = 0
+            self.afk_retry_at = 0
+        if not automatic or choice is None:
+            return "AFK CHECK · жду ручного ответа"
+        if time.monotonic()<self.afk_retry_at:
+            return "AFK CHECK · жду закрытия панели"
+        if self.afk_clicks>=2:
+            return "AFK CHECK · панель осталась, нужен ручной ответ"
+
+        def current(frame):
+            live = farm.afk_panel(frame)
+            if live and live[3]==choice and farm.same_afk_signature(signature,live[2]):
+                return live[1][choice]
+            return None
+
+        self.game.click_live(points[choice],current,"AFK CHECK")
+        self.afk_clicks += 1
+        self.afk_retry_at = time.monotonic()+2
+        return "AFK CHECK · ответ отправлен, проверяю закрытие"
+
     def tick(self,state):
         self.guard()
-        img = self.game.grab()
         if self.needs_close:
             self.close_manager()
-        if farm.afk_panel(img):
-            return "Проверка в игре · жду ручного ответа"
+        img = self.game.grab()
+        panel = farm.afk_panel(img)
+        if panel:
+            return self.answer_afk(panel,state.get("afk_auto",False))
+        self.afk_signature = None
         if farm.is_end_image(farm.crop_frac(img,farm.END_BOX)):
             self.phase = "end"
         if self.phase=="end":
