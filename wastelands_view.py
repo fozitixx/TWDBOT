@@ -58,6 +58,43 @@ def color_boxes(mask):
     return boxes
 
 
+def invite_buttons(img):
+    """Find adjacent decline/accept rectangles in the top-right invitation."""
+    w, h = img.size
+    left, top = int(.68*w), int(.08*h)
+    rgb = np.asarray(img.crop((left,top,w,int(.43*h))).convert("RGB"), dtype=np.int16)
+    r,g,b = rgb.transpose(2,0,1)
+    def buttons(mask):
+        return [(x+left,y+top,bw,bh) for x,y,bw,bh in color_boxes(mask.astype(np.uint8))
+                if .035*w < bw < .115*w and .018*h < bh < .075*h and 1.8 < bw/bh < 5]
+    red = buttons((r>110)&(r>1.6*g)&(r>1.4*b))
+    green = buttons((g>95)&(g>1.6*r)&(g>1.4*b))
+    for x,y,rw,rh in sorted(red,key=lambda box:-box[2]*box[3]):
+        for gx,gy,gw,gh in sorted(green,key=lambda box:-box[2]*box[3]):
+            if (0 <= gx-x-rw < .35*rh and abs(gy-y)<.18*rh and
+                    .83*rh<gh<1.2*rh and .9*rw<gw<1.6*rw):
+                return (x,y,gx+gw,rh), ((gx+gw/2)/w,(gy+gh/2)/h)
+    return None
+
+
+def read_invite(img, host, read):
+    pair = invite_buttons(img)
+    if pair is None:
+        return None, ""
+    (x,y,right,height), button = pair
+    def line(high,low):
+        box = ((x-.10*height)/img.width,(y-high*height)/img.height,
+               right/img.width,(y-low*height)/img.height)
+        return read(img,box,zoom=5)
+    if not label(line(1.29,.56),host):
+        return None, "Вижу приглашение · имя отправителя не совпало или не прочитано"
+    words = line(.62,.07)
+    if not any(label(words, text) for name in ("Wasteland","Wastelands")
+               for text in (name, "to"+name, "invited you to "+name)):
+        return None, "Вижу приглашение от основы · не распознана карта Wasteland"
+    return button, ""
+
+
 def _binary_match(template, spectrum, integral, shape):
     """Normalized correlation of binary images over fully visible placements."""
     h, w = template.shape
@@ -231,7 +268,7 @@ class OCR:
     def __init__(self):
         self.proc = None
 
-    def read(self, img, box=(0,0,1,1)):
+    def read(self, img, box=(0,0,1,1), *, zoom=2):
         if self.proc is None or self.proc.poll() is not None:
             script = Path(__file__).with_name("wastelands_ocr.ps1")
             self.proc = subprocess.Popen(["powershell.exe","-NoProfile","-NonInteractive",
@@ -239,7 +276,7 @@ class OCR:
                         stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
         l,t,r,b = [round(v*s) for v,s in zip(box,(img.width,img.height)*2)]
         part = img.crop((l,t,r,b)).convert("RGB")
-        scale = min(2,2000/max(part.size))
+        scale = min(zoom,2000/max(part.size))
         part = part.resize((round(part.width*scale),round(part.height*scale)),Image.Resampling.BICUBIC)
         buf = io.BytesIO()
         part.save(buf,"PNG")

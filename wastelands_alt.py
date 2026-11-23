@@ -8,7 +8,7 @@ from pynput import mouse
 
 import twd_bot as farm
 from wastelands_team import ABILITIES, PLACEMENT_ORDER, Wait, placement_label, position, private_server_links
-from wastelands_view import OCR, color_boxes, label, map_point, preview, road_pose, scene, screen_point, tracked_pose
+from wastelands_view import OCR, color_boxes, label, read_invite, map_point, preview, road_pose, scene, screen_point, tracked_pose
 
 
 class Game(farm.Bot):
@@ -174,18 +174,20 @@ class Alt:
             return "Нажат VOTE · "+state["mode"].upper()
         if vote or self.voted:
             return "Жду READY"
-        card = self.text(img,(.69,.09,1,.40))
-        header = label(card,"PARTY INVITE")
-        host_box = (.69,header[1]+.007,1,header[1]+.039) if header else (0,0,0,0)
-        if (header and label(card,state["host"],host_box) and
-                label(card,"Wastelands") and label(card,"ACCEPT")):
+        accept, reason = read_invite(img,state["host"],self.ocr.read)
+        if accept:
             if time.monotonic()-self.last_invite>3:
-                self.game.click(label(card,"ACCEPT"))
+                self.game.click(accept)
                 self.last_invite = time.monotonic()
                 self.exchange("invited")
                 self.invited = True
-            return "Принято приглашение на Wastelands"
-        if label(self.text(img,(0,.26,.19,.74)),"Wastelands") and label(self.text(img,(.35,.74,.65,.98)),"Cancel"):
+            return "Нажал принять · жду входа в группу"
+        if reason:
+            return reason
+        group = self.text(img,(0,.26,.19,.74))
+        group_map = label(group,"Wasteland") or label(group,"Wastelands")
+        controls = self.text(img,(.35,.74,.65,.98)) if group_map else []
+        if label(controls,"Cancel") or label(controls,"Отмена"):
             if not self.invited:
                 self.exchange("invited")
                 self.invited = True

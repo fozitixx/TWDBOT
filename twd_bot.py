@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "6.0.5 (Wastelands: вызов твинков в приватку)"
+VERSION = "6.0.6 (Wasteland: распознавание приглашений)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2207,9 +2207,9 @@ _update_checked = 0.0
 # companion files for this version, even after the release branch moves on.
 TEAM_FILES = {
     "wastelands.py": "9cad2e8755b2126fa8c750e3392eef164682a03e",
-    "wastelands_alt.py": "8919e50e109b3ff49ab5451d045e9d0cf3f338c4",
+    "wastelands_alt.py": "3479cd392330c6bbdd2076d207a5cce234791e11",
     "wastelands_team.py": "d702b85342b5f2045a757593b6a617f54b2c47ae",
-    "wastelands_view.py": "13dae7f020202f9643e9ea06c72d65ae1cf55508",
+    "wastelands_view.py": "292116ec924e98cc31b43e8897e328bb89e4fe7e",
     "wastelands_ocr.ps1": "496e34e723f8a27cd6993fc72f826f398459b5b9",
 }
 
