@@ -7,8 +7,8 @@ from PIL import Image, ImageGrab, ImageOps
 from pynput import mouse
 
 import twd_bot as farm
-from wastelands_team import ABILITIES, PLACEMENT_ORDER, Wait, placement_label, position, private_server_links
-from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, placement_pose, mission_button, ready_button, scene, screen_point, tracked_pose
+from wastelands_team import ABILITIES, EARLY, PLACEMENT_ORDER, bank_slot, placement_attempts, Wait, placement_label, position, private_server_links
+from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, perimeter_point, placement_pose, mission_button, ready_button, scene, screen_point, tracked_pose
 
 
 class Game(farm.Bot):
@@ -358,8 +358,8 @@ class Alt:
             price = farm.UNITS[kind]["price"]
         if price is None or cash is None or cash < price:
             return f"Жду {name} · баланс {cash}, цена слота {slot}: {price}"
-        if self.attempt[unit]>=5:
-            return f"{name}: пять точек заняты; проверь разметку"
+        if self.attempt[unit]>=placement_attempts(unit):
+            return f"{name} · свободное место не найдено, проверь разметку"
         if not self.game.take(slot):
             return "Не появилась подсветка дороги"
         try:
@@ -368,16 +368,28 @@ class Alt:
             pose = placement_pose(snap)
             if pose is None:
                 return "Проверяю направление Wastelands по дороге и обломкам"
-            point = position(self.player,unit,self.attempt[unit])
-            pt = screen_point(pose,point)
-            if not (.015<pt[0]<.985 and .10<pt[1]<.92) or (.27<pt[0]<.74 and pt[1]>.81):
-                return "Место закрыто интерфейсом или вне кадра"
-            try:
-                self.exchange("reserve",unit=unit,point=point)
-            except Wait as e:
-                if "занят" in str(e) or "Зона ранней защиты основы" in str(e):
-                    self.attempt[unit]+=1
-                raise
+            for attempt in range(self.attempt[unit],placement_attempts(unit)):
+                self.attempt[unit] = attempt
+                if kind in EARLY:
+                    point = perimeter_point(snap,pose,*bank_slot(self.player,unit,attempt))
+                    if point is None:
+                        continue
+                else:
+                    point = position(self.player,unit,attempt)
+                pt = screen_point(pose,point)
+                if not (.015<pt[0]<.985 and .10<pt[1]<.92) or (.27<pt[0]<.74 and pt[1]>.81):
+                    continue
+                try:
+                    self.exchange("reserve",unit=unit,point=point)
+                except Wait as exc:
+                    if any(reason in str(exc) for reason in
+                           ("Рядом занят участок","Зона ранней защиты основы","Зона титанов основы")):
+                        continue
+                    raise
+                break
+            else:
+                self.attempt[unit] = placement_attempts(unit)
+                return f"{name} · места заняты или кромка не видна, проверь расстановку"
             def live_point(frame):
                 if frame.size==snap.size and np.median(abs(scene(frame)-scene(snap)))<4:
                     return pt

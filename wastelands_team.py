@@ -20,19 +20,28 @@ UNITS = ("plunger", "tv", "amplifier", "screen")
 ABILITIES = ("Aerial Attack", "Hook and Punch", "Teleport")
 # First copy keeps its original ID for existing commands and READY.
 MAIN_EARLY = ((930, 452), (950, 482))
-# Each row belongs to one alt. Columns are successive copies in the yellow bend.
-EARLY = {
-    "plunger": (
-        ((951,424), (900,468), (916,420), (938,392)),
-        ((972,396), (958,364), (986,428), (986,334)),
-        ((993,368), (1020,338), (1048,318), (1060,350)),
-    ),
-    "tv": (
-        ((977,501), (980,466), (1008,486), (1038,504)),
-        ((1004,520), (1064,528), (1070,492), (1096,516)),
-        ((1031,539), (1066,562), (1098,550), (1092,584)),
-    ),
-}
+EARLY = ("plunger", "tv")
+# Map-space axes along the main road and its branch, from their junction.
+JUNCTION = (835.,475.)
+_road_length = math.hypot(715,490)
+TRUNK = (715/_road_length,490/_road_length)
+BRANCH = (TRUNK[1],-TRUNK[0])
+# Each run follows one bank. The gap in the first run leaves room for the main pair.
+PERIMETER = (
+    (TRUNK, BRANCH, (48,146,185,224,263,302)),
+    (BRANCH, TRUNK, (112,145,178,211,244,273)),
+    (BRANCH, (-TRUNK[0],-TRUNK[1]), (68,101,134,167,200,233)),
+    (TRUNK, BRANCH, (-72,-110,-148,-186,-224,-262)),
+)
+# Extra sites continue along the trunk and around the next corner of the branch.
+SPARE_BANKS = (
+    *((0,s,1) for s in (-300,-340,-380,-420,340)),
+    *((0,s,-1) for s in (164,202,240,278,-260,-298,-336,-374,-412)),
+    *((276,s,side) for s in (-82,-122,-162,-202) for side in (-1,1)),
+)
+EDGE_GAP = 14
+BANK_OFFSET = 24 + EDGE_GAP  # nominal half road width plus clearance for the base
+EDGE_ADJUST = 21  # maximum correction from the nominal boundary, in map pixels
 PLACEMENT_ORDER = ("plunger", "plunger_2", "plunger_3", "plunger_4",
                    "tv", "tv_2", "tv_3", "tv_4", "amplifier", "screen")
 LANES = [((1159, 631), (1336, 751)), ((1022, 690), (1285, 868)),
@@ -51,12 +60,30 @@ def placement_label(unit):
     return unit.title()
 
 
-def position(player, unit, attempt=0):
+def bank_slot(player, unit, attempt=0):
     kind, _, number = unit.partition("_")
-    if kind in EARLY:
-        x, y = EARLY[kind][player-1][int(number or 1)-1]
-        dx, dy = [(0, 0), (8, 5), (-7, -5), (6, -8), (-5, 8)][attempt % 5]
-        return [x + dx, y + dy]
+    copy = int(number or 1)-1 + (4 if kind=="tv" else 0)
+    rank, bank = divmod(copy*len(PLAYERS)+player-1, len(PERIMETER))
+    tangent, normal, along = PERIMETER[bank]
+    start = JUNCTION
+    if attempt<5:
+        distance = along[rank] + (0, 7, -7, 14, -14)[attempt]
+    else:
+        branch_distance,distance,side = SPARE_BANKS[(attempt-5+rank+bank)%len(SPARE_BANKS)]
+        start = [v+branch_distance*n for v,n in zip(JUNCTION,BRANCH)]
+        tangent, normal = TRUNK, tuple(side*n for n in BRANCH)
+    center = [v+distance*t for v,t in zip(start,tangent)]
+    return center, tangent, normal
+
+
+def placement_attempts(unit):
+    return 5+len(SPARE_BANKS) if unit.partition("_")[0] in EARLY else 5
+
+
+def position(player, unit, attempt=0):
+    if unit.partition("_")[0] in EARLY:
+        center, _, normal = bank_slot(player,unit,attempt)
+        return [v+BANK_OFFSET*n for v,n in zip(center,normal)]
     a, b = LANES[player - 1]
     progress = .22 if unit == "amplifier" else .76
     return mix(a, b, progress + (0, .09, -.09, .16, -.16)[attempt % 5])
@@ -245,7 +272,15 @@ class Match:
                 return
             raise ValueError("Предыдущий резерв ещё не подтверждён")
         if place["state"] != "placed":
-            if not any(math.dist(point, position(player,unit,j)) < 1 for j in range(5)):
+            def allowed(attempt):
+                planned = position(player,unit,attempt)
+                if unit.partition("_")[0] not in EARLY:
+                    return math.dist(point,planned)<1
+                _, tangent, normal = bank_slot(player,unit,attempt)
+                dx,dy = x-planned[0],y-planned[1]
+                return (abs(dx*tangent[0]+dy*tangent[1])<1 and
+                        abs(dx*normal[0]+dy*normal[1])<=EDGE_ADJUST+.01)
+            if not any(allowed(j) for j in range(placement_attempts(unit))):
                 raise ValueError("За пределами назначенной зоны")
         elif unit != "screen":
             raise ValueError("Перенос доступен только для Screen")

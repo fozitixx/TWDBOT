@@ -427,7 +427,11 @@ class NetworkTest(unittest.TestCase):
         game.money.side_effect=[900,900,900,200]
         game.path_visible.side_effect=[True,False,False]
         pose=(np.array([.41,.41]),np.diag([1/2048,1/1152]))
-        with patch.object(alt,"game",game),patch("wastelands_alt.placement_pose",return_value=pose), \
+        def nominal(frame,pose,center,tangent,normal):
+            from wastelands_team import BANK_OFFSET
+            return [v+BANK_OFFSET*n for v,n in zip(center,normal)]
+        with patch.object(alt,"game",game),patch("wastelands_alt.perimeter_point",side_effect=nominal), \
+             patch("wastelands_alt.placement_pose",return_value=pose), \
              patch("twd_bot.read_hotbar",return_value=[(.532,700)]):
             self.assertIn("занята",alt.place("plunger_2",frame))
             self.assertNotIn("target",self.match.places[1,"plunger_2"])

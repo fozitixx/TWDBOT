@@ -363,6 +363,39 @@ def screen_point(pose, point):
     return tuple(origin+mat@(np.array(point)-ANCHOR))
 
 
+def perimeter_point(img, pose, center, tangent, normal):
+    """Measure the outside edge in several cross-sections of the highlighted road."""
+    from wastelands_team import BANK_OFFSET, EDGE_ADJUST, EDGE_GAP
+    # Work in map units so clearance is independent of projection and resolution.
+    offsets = np.arange(-40, 80)
+    coords = (np.asarray(center) + np.arange(-8,9,4)[:,None,None]*np.asarray(tangent)
+              + offsets[:,None]*np.asarray(normal))
+    origin, mat = pose
+    pixels = np.rint((origin+(coords-ANCHOR)@mat.T)*img.size).astype(int)
+    x,y = pixels.transpose(2,0,1)
+    if x.min()<0 or y.min()<0 or x.max()>=img.width or y.max()>=img.height:
+        return None
+    left,top = int(x.min()),int(y.min())
+    crop = img.crop((left,top,int(x.max())+1,int(y.max())+1)).convert("RGB")
+    r,g,b = np.asarray(crop)[y-top,x-left].astype(np.int16).transpose(2,0,1)
+    red = (r>110)&(r-g>58)&(r-b>52)
+    edges = []
+    for row in red:
+        # The boundary has a sustained red band followed by clear ground.
+        for i in range(10,len(row)-EDGE_GAP-3):
+            if (abs(offsets[i]+EDGE_GAP-BANK_OFFSET)<=EDGE_ADJUST and
+                    row[i-10:i].sum()>=8 and row[i-1] and not row[i:i+EDGE_GAP+3].any()):
+                edges.append(offsets[i])
+                break
+    if len(edges)<3 or np.ptp(edges)>8:
+        return None
+    distance = float(np.median(edges))+EDGE_GAP
+    index = round(distance)-offsets[0]
+    if red[:,index-2:index+3].any():
+        return None
+    return (np.asarray(center)+distance*np.asarray(normal)).tolist()
+
+
 def map_point(pose, point):
     origin,mat = pose
     return (ANCHOR+np.linalg.solve(mat,np.array(point)-origin)).tolist()
