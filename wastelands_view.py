@@ -363,6 +363,34 @@ def screen_point(pose, point):
     return tuple(origin+mat@(np.array(point)-ANCHOR))
 
 
+def rank_titan_sites(img, pose, sites, tried=()):
+    """Prefer a clear patch under the base, in the local camera projection."""
+    if not sites:
+        return []
+    grid = np.arange(-24, 25, 4)
+    dx, dy = np.meshgrid(grid, grid)
+    footprint = np.column_stack((dx.ravel(), dy.ravel()))
+    footprint = footprint[(footprint**2).sum(axis=1) <= 24**2]
+    origin, mat = pose
+    points = np.asarray(sites)
+    pixels = np.rint((origin + (points[:, None] + footprint - ANCHOR) @ mat.T) * img.size).astype(int)
+    x, y = pixels.transpose(2, 0, 1)
+    visible = (x >= 0) & (x < img.width) & (y >= 0) & (y < img.height)
+    rgb = np.asarray(img.convert("RGB"))
+    samples = rgb[y.clip(0,img.height-1), x.clip(0,img.width-1)].astype(int)
+    r, g, b = samples.transpose(2, 0, 1)
+    sand = (r >= 75) & (r-g >= 9) & (g-b >= 18) & (r-g < 45) & (r-b < 105)
+    spread = np.percentile(g, 90, axis=1) - np.percentile(g, 10, axis=1)
+    cost = 1 - (visible & sand).mean(axis=1) + np.minimum(spread/100, 1)*.35
+    if len(tried):
+        # Adjacent offsets often cover the very same wreck.
+        distance = np.linalg.norm(points[:,None] - np.asarray(tried), axis=2).min(axis=1)
+        cost += np.maximum(0, 1 - distance/52)
+    # A near tie favors the earlier site in the coordinator's plan.
+    order = np.argsort(np.rint(cost*12), kind="stable")
+    return [sites[index] for index in order]
+
+
 def perimeter_point(img, pose, center, tangent, normal):
     """Measure the outside edge in several cross-sections of the highlighted road."""
     from wastelands_team import BANK_OFFSET, EDGE_ADJUST, EDGE_GAP

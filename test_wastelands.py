@@ -371,11 +371,44 @@ class NetworkTest(unittest.TestCase):
             for unit in ("amplifier","screen"):
                 with patch("wastelands_alt.position",side_effect=AssertionError("local layout")):
                     sites=a.placement_sites(unit)
-                self.assertEqual(len(sites),15)
+                self.assertEqual(len(sites),30)
                 point=sites[8]
                 a.exchange("reserve",unit=unit,point=point)
                 a.exchange("commit",unit=unit,point=point)
                 self.assertEqual(self.match.places[a.player,unit]["point"],point)
+
+    def test_screen_skips_debris_and_reuses_preview_after_rejection(self):
+        a = self.alts[0]
+        frame = Image.new("RGB",(1366,768),(112,90,53))
+        pose = (np.array([.41,.41]),np.diag([1/2048,1/1152]))
+        preferred = position(1,"screen")
+        cx,cy = np.asarray(screen_point(pose,preferred))*frame.size
+        ImageDraw.Draw(frame).rectangle((cx-22,cy-22,cx+22,cy+22),fill=(72,72,70))
+        with patch.object(a,"game") as game, patch("wastelands_alt.placement_pose",return_value=pose), \
+             patch.object(a,"slot_count",return_value=0),patch("twd_bot.read_hotbar",return_value=[]), \
+             patch.object(a,"placement_outcome",side_effect=["release","commit"]),patch("twd_bot.log"):
+            game.money.return_value=16000
+            game.grab.return_value=frame
+            self.assertIn("Поставил",a.place("screen",frame))
+            self.assertEqual(game.take.call_count,1)
+            first,second = [call.args[0] for call in game.click_live.call_args_list]
+            self.assertGreater(np.linalg.norm((np.array(first)-screen_point(pose,preferred))*frame.size),22)
+            self.assertGreater(np.linalg.norm((np.array(first)-second)*frame.size),26)
+            point = self.match.places[1,"screen"]["point"]
+            np.testing.assert_allclose(screen_point(pose,point),second)
+
+    def test_ambiguous_screen_keeps_single_reservation(self):
+        a=self.alts[1]
+        frame=Image.new("RGB",(1366,768),(110,86,52))
+        pose=(np.array([.4,.4]),np.diag([1/2048,1/1152]))
+        with patch.object(a,"game") as game,patch("wastelands_alt.placement_pose",return_value=pose), \
+             patch.object(a,"slot_count",return_value=0),patch("twd_bot.read_hotbar",return_value=[]), \
+             patch.object(a,"placement_outcome",return_value=None),patch.object(a,"recheck_slot",return_value=None),patch("twd_bot.log"):
+            game.money.return_value=16000
+            game.grab.return_value=frame
+            self.assertIn("не подтверждён",a.place("screen",frame))
+            self.assertEqual(game.click_live.call_count,1)
+            self.assertTrue(self.match.places[a.player,"screen"]["target"])
 
     def test_delayed_placement_confirmed_during_wave_income(self):
         a=self.alts[0]

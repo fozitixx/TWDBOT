@@ -53,6 +53,11 @@ TITAN_OFFSETS = ((0,0),(.09,0),(-.09,0),(.16,0),(-.16,0),
                  (.32,20),(-.32,20),(.40,40),(-.40,40))
 
 
+# Both titans can use the whole assigned strip if their preferred end is blocked.
+TITAN_SPARES = tuple((progress, outward) for outward in (0, 28, 54)
+                     for progress in (0, .25, .5, .75, 1))
+
+
 def mix(a, b, fraction):
     return [x + (y - x) * fraction for x, y in zip(a, b)]
 
@@ -82,7 +87,7 @@ def bank_slot(player, unit, attempt=0):
 
 
 def placement_attempts(unit):
-    return 5+len(SPARE_BANKS) if unit.partition("_")[0] in EARLY else len(TITAN_OFFSETS)
+    return 5+len(SPARE_BANKS) if unit.partition("_")[0] in EARLY else len(TITAN_OFFSETS) + len(TITAN_SPARES)
 
 
 def position(player, unit, attempt=0):
@@ -91,8 +96,12 @@ def position(player, unit, attempt=0):
         return [v+BANK_OFFSET*n for v,n in zip(center,normal)]
     a, b = LANES[player - 1]
     progress = .22 if unit == "amplifier" else .76
-    along, outward = TITAN_OFFSETS[attempt]
-    base = mix(a,b,max(0,min(1,progress+along)))
+    if attempt < len(TITAN_OFFSETS):
+        along, outward = TITAN_OFFSETS[attempt]
+        progress = max(0, min(1, progress + along))
+    else:
+        progress, outward = TITAN_SPARES[attempt - len(TITAN_OFFSETS)]
+    base = mix(a,b,progress)
     side = -1 if player==2 else 1
     return [v+side*outward*n for v,n in zip(base,BRANCH)]
 

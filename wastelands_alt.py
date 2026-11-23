@@ -8,7 +8,7 @@ from pynput import mouse
 
 import twd_bot as farm
 from wastelands_team import ABILITIES, EARLY, PLACEMENT_ORDER, bank_slot, placement_attempts, Wait, placement_label, position, private_server_links
-from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, perimeter_point, placement_pose, mission_button, ready_button, scene, screen_point, tracked_pose
+from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, perimeter_point, rank_titan_sites, placement_pose, mission_button, ready_button, scene, screen_point, tracked_pose
 
 
 class Game(farm.Bot):
@@ -449,14 +449,19 @@ class Alt:
                 return "Проверяю направление Wastelands по дороге и обломкам"
             limit = 4 if kind in EARLY else 1
             before_count = self.slot_count(snap,slot,limit)
-            for attempt in range(self.attempt[unit],len(sites)):
+            titan = kind not in EARLY
+            start = self.attempt[unit]
+            if titan:
+                sites[start:] = rank_titan_sites(snap,pose,sites[start:],sites[:start])
+            clicks = 0
+            for attempt in range(start,len(sites)):
                 self.attempt[unit] = attempt
-                if kind in EARLY:
+                if titan:
+                    point = sites[attempt]
+                else:
                     point = perimeter_point(snap,pose,*sites[attempt])
                     if point is None:
                         continue
-                else:
-                    point = sites[attempt]
                 pt = screen_point(pose,point)
                 if not (.015<pt[0]<.985 and .10<pt[1]<.92) or (.27<pt[0]<.74 and pt[1]>.81):
                     continue
@@ -471,41 +476,52 @@ class Alt:
                             raise Wait("Разметка основы и твинка различается · обнови и перезапусти оба приложения") from exc
                         continue
                     raise
-                break
-            else:
-                self.attempt[unit] = len(sites)
-                return f"{name} · места заняты или кромка не видна, проверь расстановку"
-            def live_point(frame):
-                if frame.size==snap.size and np.median(abs(scene(frame)-scene(snap)))<4:
-                    return pt
-                return None
-            try:
-                self.game.click_live(pt,live_point,name)
-            except Wait:
-                # click_live raises Wait only before the button press.
-                self.confirm = ("release",unit,point)
-                raise
-            outcome = self.placement_outcome(cash,price,slot,limit,before_count)
-            if outcome is None:
-                outcome = self.recheck_slot(slot,limit,before_count)
-            if outcome=="commit":
-                self.confirm = ("commit",unit,point)
-                self.exchange("commit",unit=unit,point=point)
-                self.confirm = None
-                self.placed.add(unit)
-                self.game.drop()
-                self.pose,self.reference = pose,self.game.grab()
-                self.reference_rect = self.game.rect()
-                return f"Поставил {name}"
-            if outcome=="release":
-                self.confirm = ("release",unit,point)
-                self.exchange("release",unit=unit,point=point)
-                self.confirm = None
-                self.attempt[unit]+=1
-                return "Точка занята · пробую рядом"
-            return f"Проверь {name}: результат клика не подтверждён"
+                outcome = self.try_place(point,pt,snap,unit,cash,price,slot,limit,before_count)
+                if titan:
+                    farm.log(f"Wastelands · твинк {self.player} · {name} · место {attempt+1}/{len(sites)} "
+                             f"({point[0]:.0f}, {point[1]:.0f}) · {outcome or 'требует проверки'}")
+                if outcome=="commit":
+                    self.placed.add(unit)
+                    self.game.drop()
+                    self.pose,self.reference = pose,self.game.grab()
+                    self.reference_rect = self.game.rect()
+                    return f"Поставил {name}"
+                if outcome is None:
+                    return f"Проверь {name}: результат клика не подтверждён"
+                self.attempt[unit] = attempt+1
+                clicks += 1
+                if not titan or clicks>=3 or not self.game.path_visible():
+                    return "Точка занята · пробую рядом"
+                # The preview stayed open. Keep its pose and slot, and try a
+                # different footprint after verifying the scene at click time.
+                cash = self.game.money()
+                if cash is None or cash<price:
+                    return f"Перепроверяю баланс для {name}"
+                sites[attempt+1:] = rank_titan_sites(snap,pose,sites[attempt+1:],sites[:attempt+1])
+            self.attempt[unit] = len(sites)
+            return f"{name} · места заняты или кромка не видна, проверь расстановку"
         finally:
             self.game.drop()
+
+    def try_place(self,point,pt,snap,unit,cash,price,slot,limit,before_count):
+        reference_scene = scene(snap)
+        def live_point(frame):
+            if frame.size==snap.size and np.median(abs(scene(frame)-reference_scene))<4:
+                return pt
+            return None
+        try:
+            self.game.click_live(pt,live_point,placement_label(unit))
+        except Wait:
+            self.confirm = ("release",unit,point)
+            raise
+        outcome = self.placement_outcome(cash,price,slot,limit,before_count)
+        if outcome is None:
+            outcome = self.recheck_slot(slot,limit,before_count)
+        if outcome:
+            self.confirm = (outcome,unit,point)
+            self.exchange(outcome,unit=unit,point=point)
+            self.confirm = None
+        return outcome
 
     def header(self, img):
         return label(self.text(img,(0,0,1,.32)),"UNIT MANAGER")

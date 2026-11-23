@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "6.0.12 (Wasteland: голосование и расстановка)"
+VERSION = "6.0.13 (Wasteland: голосование и расстановка)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2207,9 +2207,9 @@ _update_checked = 0.0
 # companion files for this version, even after the release branch moves on.
 TEAM_FILES = {
     "wastelands.py": "8ade31b7081dc5fa9092b466caec3e6826673aff",
-    "wastelands_alt.py": "0f052cb70a4a8634e9298c422ed9e90d94f667ee",
-    "wastelands_team.py": "56a241c937c8f5e8c5e27f5796b44a96733f2428",
-    "wastelands_view.py": "4dd7e00ff67914fb7ee36b966585db93eee8346d",
+    "wastelands_alt.py": "836a9a8688b70f292eaa178baa8789ce9d124e25",
+    "wastelands_team.py": "e7fa99fc72dc25946953c99ce295a1857558e222",
+    "wastelands_view.py": "011967ecd7dd348d3236f260d8e6994b383aa383",
     "wastelands_ocr.ps1": "496e34e723f8a27cd6993fc72f826f398459b5b9",
 }
 
