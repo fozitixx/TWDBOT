@@ -16,9 +16,9 @@ from unittest.mock import Mock, patch
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from wastelands_alt import Alt, Game, Wait, UnitCounts, level, manager_card, manager_total, manager_unit_count, placement_cash, visual_manager_total, countdown
-from wastelands_team import AltConnection, Match, PAIR_LIFETIME, PLACEMENT_ORDER, PLAYERS, UNITS, connect_by_pin, position, serve
-from wastelands_view import OCR, label, road_pose, screen_point
+from wastelands_alt import Alt, Game, Wait, UnitCounts, level, manager_card, manager_total, manager_unit_count, placement_cash, preserve_bank_capacity, visual_manager_total, countdown
+from wastelands_team import AltConnection, BRANCH, JUNCTION, Match, PAIR_LIFETIME, PLACEMENT_ORDER, PLAYERS, TRUNK, UNITS, bank_slot, connect_by_pin, position, serve
+from wastelands_view import ANCHOR, OCR, label, placement_in_view, road_pose, screen_point
 
 PRIVATE_LINK = "https://www.roblox.com/share?code=Test123&type=Server"
 
@@ -454,8 +454,7 @@ class NetworkTest(unittest.TestCase):
             place.assert_not_called()
             a.next_check=0
             for u in PLACEMENT_ORDER[:4]:
-                a.sites[u]=[position(a.player,u)]
-                a.attempt[u]=1
+                a.rescan_at[u]=time.monotonic()+4
             self.assertIn("поиск",a.tick(a.exchange()))
             place.assert_not_called()
             a.rescan_at["plunger"]=0
@@ -507,6 +506,78 @@ class NetworkTest(unittest.TestCase):
             self.assertGreater(np.linalg.norm((np.array(first)-screen_point(pose,preferred))*frame.size),22)
             self.assertGreater(np.linalg.norm((np.array(first)-second)*frame.size),26)
             np.testing.assert_allclose(screen_point(pose,self.match.places[1,"screen"]["point"]),second)
+
+    def test_paid_rejection_skips_the_same_patch_across_copies_and_players(self):
+        a=self.alts[2]
+        center,_,normal=map(np.asarray,bank_slot(3,"tv"))
+        p=(center+46*normal).tolist()
+        adjacent=position(3,"tv",1)
+        self.assertLess(math.dist(p,adjacent),26)
+        for funded in (False,True):
+            with self.subTest(funded=funded):
+                self.match.start("nightmare","Host")
+                a.reset(a.exchange())
+                state=a.exchange("reserve",unit="tv",point=p,slot=4,count_before=0,total_before=4)
+                a.update_places(state)
+                since=self.match.places[3,"tv"]["target_since"]
+                a.funded_lease=("tv",tuple(p),since) if funded else None
+                with patch.object(a,"placement_readback",return_value=UnitCounts(0,4)):
+                    a.recheck_pending(state)
+                    self.assertFalse(a.exchange()["rejected_sites"])
+                    a.recheck_pending(state)
+                self.assertIn(("early",tuple(p)),a.local_rejections)
+                self.assertEqual(bool(a.exchange()["rejected_sites"]),funded)
+                if funded:
+                    # The other helper's shared bank includes the same center.
+                    with self.assertRaisesRegex(ValueError,"недавно отклонила"):
+                        self.match.reserve(1,"tv_3",position(3,"tv"))
+                    with patch("wastelands_team.time.monotonic",return_value=time.monotonic()+40):
+                        self.match.reserve(1,"tv_3",position(3,"tv"))
+                else:
+                    self.match.reserve(1,"tv_3",position(3,"tv"))
+
+    def test_offscreen_titan_remeasures_after_turn_and_restores_an_unverified_view(self):
+        a=self.alts[2]
+        frame=Image.new("RGB",(1366,768),(110,88,53))
+        size=np.asarray(frame.size)
+        origin=np.array([.596,.670])
+        mat=np.array([[-.0004268,.0002371],[-.0004639,-.0008350]])
+        view=[(origin,mat)]
+        def turn(px):
+            angle=math.radians(px/5)
+            co,si=math.cos(angle),math.sin(angle)
+            rotate=np.array([[co,-si],[si,co]])
+            o,m=view[0]
+            view[0]=(.5+(rotate@((o-.5)*size))/size,(rotate@(m*size[:,None]))/size[:,None])
+        with patch.object(a,"game") as game,patch.object(a,"hover_count",return_value=0), \
+             patch.object(a,"manager_counts",return_value=UnitCounts(0,8)), \
+             patch("wastelands_alt.placement_cash",return_value=10000), \
+             patch("wastelands_alt.placement_pose",side_effect=lambda f:view[0]) as fit, \
+             patch("wastelands_alt.tracked_pose",return_value=None):
+            game.grab.return_value=frame
+            game.px_per_deg=5
+            game.turn_camera.side_effect=turn
+            self.assertIn("повернул",a.place("amplifier",frame))
+            self.assertFalse(self.match.places[3,"amplifier"].get("target"))
+            first=game.turn_camera.call_args.args[0]
+            fit.side_effect=lambda f:None
+            self.assertIn("вернул",a.place("amplifier",frame))
+            self.assertEqual(game.turn_camera.call_args.args[0],-first)
+            game.click_live.assert_not_called()
+            fit.side_effect=lambda f:view[0]
+            for _ in range(4):
+                a.next_turn_at=0
+                a.place("amplifier",frame)
+                if game.click_live.called:
+                    break
+            game.click_live.assert_called_once()
+            target=self.match.places[3,"amplifier"]["target"]
+            click=game.click_live.call_args.args[0]
+            np.testing.assert_allclose(screen_point(view[0],target),click)
+            self.assertTrue(placement_in_view(*click))
+            self.assertFalse(placement_in_view(*screen_point((origin,mat),target)))
+            with patch.object(a,"placement_readback",return_value=UnitCounts(1,9)):
+                self.assertIn("Поставил",a.recheck_pending(a.exchange()))
 
     def test_ambiguous_screen_keeps_single_reservation(self):
         a=self.alts[1]
@@ -740,30 +811,47 @@ class NetworkTest(unittest.TestCase):
                                 "tv","tv_2","tv_3","tv_4","amplifier","screen"]+["amplifier","screen"]*8)
 
     def test_all_three_complete_the_build_with_partial_and_delayed_readings(self):
-        frame=Image.new("RGB",(1366,768),(110,90,53))
-        pose=(np.array([835/2048,475/1152]),np.diag([1/2048,1/1152]))
-        def bank(frame,pose,center,tangent,normal):
-            from wastelands_team import BANK_OFFSET
-            return [v+BANK_OFFSET*n for v,n in zip(center,normal)]
+        # Each RDP client sees the same road from its own spawn. The two small
+        # blocked patches match the repeated TV attempts in the reported match.
+        size=(1366,768)
+        frames,poses=[],{}
+        for angle,spawn in ((2.65,(990,550)),(.86,(1040,590)),(-.62,(1030,570))):
+            frame=Image.new("RGB",size,(125,101,62))
+            co,si=math.cos(angle),math.sin(angle)
+            mat=.58*np.array([[co,-si],[si,co]])/np.array(size)[:,None]
+            pose=(np.array([.5,.5])-mat@(np.array(spawn)-ANCHOR),mat)
+            trunk,branch,junction=map(np.asarray,(TRUNK,BRANCH,JUNCTION))
+            for start,end,normal in ((junction-650*trunk,junction+1100*trunk,branch),
+                                     (junction,junction+276*branch,trunk),
+                                     (junction+276*branch,junction+276*branch-420*trunk,branch)):
+                corners=[tuple(np.asarray(screen_point(pose,p))*size) for p in
+                         (start-24*normal,end-24*normal,end+24*normal,start+24*normal)]
+                ImageDraw.Draw(frame).polygon(corners,fill=(169,46,38))
+            frames.append(frame)
+            poses[id(frame)]=pose
         rosters=[[] for _ in self.alts]
         clicks=[[] for _ in self.alts]
+        failures=[[],[]]
         with ExitStack() as stack:
             stack.enter_context(patch("twd_bot.log"))
-            stack.enter_context(patch("wastelands_alt.placement_pose",return_value=pose))
-            stack.enter_context(patch("wastelands_alt.perimeter_point",side_effect=bank))
-            stack.enter_context(patch("wastelands_alt.placement_cash",return_value=None))
+            stack.enter_context(patch("wastelands_alt.placement_pose",side_effect=lambda f:poses[id(f)]))
+            stack.enter_context(patch("wastelands_alt.placement_cash",return_value=30000))
             for i,a in enumerate(self.alts):
                 a.phase="battle"
                 a.ready=True
                 a.next_slot_check=float("inf")
                 def click(pt,locate,name,i=i,a=a):
-                    self.assertEqual(locate(frame),pt)
+                    self.assertEqual(locate(frames[i]),pt)
+                    self.assertTrue(placement_in_view(*pt))
                     pending=[r for r in self.match.places.values() if r["player"]==a.player and r.get("target")]
                     self.assertEqual(len(pending),1)
                     unit=pending[0]["unit"]
                     clicks[i].append(unit)
-                    if i!=1 or len(clicks[i])!=1:  # the first physical site was rejected
-                        rosters[i].append(unit)
+                    for failed,center in zip(failures,((1041,571),(891,311))):
+                        if math.dist(pending[0]["target"],center)<17:
+                            failed.append(pending[0]["target"])
+                            return
+                    rosters[i].append(unit)
                 def hover(slot,limit,i=i,a=a):
                     kind=next(k for k,v in a.slots.items() if v==slot)
                     if i==0 or (i==2 and len(rosters[i])%3==2):
@@ -773,7 +861,7 @@ class NetworkTest(unittest.TestCase):
                     # After the first unit all card titles may be clipped.
                     return UnitCounts(None,len(rosters[i]))
                 game=stack.enter_context(patch.object(a,"game"))
-                game.grab.return_value=frame
+                game.grab.return_value=frames[i]
                 game.click_live.side_effect=click
                 stack.enter_context(patch.object(a,"hover_count",side_effect=hover))
                 stack.enter_context(patch.object(a,"manager_counts",side_effect=manager))
@@ -785,7 +873,8 @@ class NetworkTest(unittest.TestCase):
                 if all(len(roster)==10 and len(a.placed)==10 for a,roster in zip(self.alts,rosters)):
                     break
         self.assertEqual(rosters,[list(PLACEMENT_ORDER) for _ in PLAYERS])
-        self.assertEqual([len(c) for c in clicks],[10,11,10])
+        self.assertEqual([len(p) for p in failures],[1,1])
+        self.assertEqual(sum(map(len,clicks)),32)
         self.assertTrue(all(r["state"]=="placed" and not r.get("target") for r in self.match.places.values()))
 
     def test_teleport_frame_and_ack(self):
@@ -920,9 +1009,19 @@ class VisionTest(unittest.TestCase):
         pose = (np.array([.41,.41]),np.diag([1/2048,1/1152]))
         with patch("wastelands_view.cv2", None):
             self.assertIs(tracked_pose(frame,pose,frame),pose)
+            crowded=frame.copy()
+            draw=ImageDraw.Draw(crowded)
+            draw.rectangle((100,42,220,139),fill=38)
+            draw.rectangle((25,75,280,98),fill=180)
+            self.assertIs(tracked_pose(frame,pose,crowded),pose)
             self.assertIsNone(tracked_pose(frame,pose,Image.fromarray(np.roll(terrain,4,axis=1))))
             blank = Image.new("L",frame.size)
             self.assertIsNone(tracked_pose(blank,pose,blank))
+
+    def test_two_remaining_bases_do_not_lose_the_last_free_stretch(self):
+        middle,left,right=[900,320],[881,320],[919,320]
+        self.assertEqual(preserve_bank_capacity([middle,left,right],2),[left,right,middle])
+        self.assertEqual(preserve_bank_capacity([middle,left,right],1)[0],middle)
 
     @unittest.skipUnless(sys.platform=="win32","Windows OCR")
     def test_windows_manager_ocr(self):
