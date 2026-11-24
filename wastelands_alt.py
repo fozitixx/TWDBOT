@@ -8,7 +8,7 @@ from pynput import mouse
 
 import twd_bot as farm
 from wastelands_team import ABILITIES, EARLY, PLACEMENT_ORDER, bank_slot, placement_attempts, Wait, placement_label, position, private_server_links
-from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, perimeter_point, rank_titan_sites, placement_pose, mission_button, ready_button, scene, screen_point, tracked_pose
+from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, perimeter_point, rank_titan_sites, placement_pose, mission_button, ready_button, wastelands_slots, scene, screen_point, tracked_pose
 
 
 class Game(farm.Bot):
@@ -146,7 +146,7 @@ def countdown(row,action,button):
 class Alt:
     def __init__(self, connection, slots, stop, notify):
         self.connection = connection
-        self.player, self.slots = connection.player, slots
+        self.player, self.configured_slots = connection.player, dict(slots)
         self.stop,self.notify = stop,notify
         self.run = ""
         self.status = "Подключение"
@@ -173,6 +173,9 @@ class Alt:
     def reset(self, state):
         self.run = state["run"]
         self.phase = "lobby"
+        self.slots = dict(getattr(self,"configured_slots",{}))
+        self.next_slot_check = 0
+        self.full_early = set()
         self.afk_signature = None
         self.afk_clicks = 0
         self.afk_retry_at = 0
@@ -239,6 +242,7 @@ class Alt:
             return f"Проверяю голосование за {title}"
         turn = self.exchange("vote_turn")
         if turn.get("vote_seconds",0) < 4:
+            self.vote_retry = now+.8
             return f"Жду очереди голосовать за {title}"
         until = now + turn["vote_seconds"]
         def target(button):
@@ -304,7 +308,8 @@ class Alt:
         if self.last_invite is not None and now-self.last_invite > 45:
             self.last_invite = None
             self.invite_attempts = 0
-        if (self.invited and self.game.ready_visible()) or (self.placed and self.game.money() is not None):
+        if ((self.invited or self.voted) and (img is not None and ready_button(img) or self.game.ready_visible())
+                or self.placed and self.game.money() is not None):
             self.phase = "battle"
             self.game.camera_top_down()
             return "Подготовка расстановки"
@@ -375,13 +380,17 @@ class Alt:
         icon = frame.crop((round(x-.046*h),round(.854*h),round(x+.046*h),round(.897*h)))
         # White glyphs have a dark outline, even on the white TV portrait.
         # Remove bright background regions touching the edges before OCR.
-        mask = ImageOps.expand(icon.convert("L").point(lambda v: 255 if v>=155 else 0),1,fill=255)
-        ImageDraw.floodfill(mask,(0,0),0)
-        bounds = mask.getbbox()
-        samples = [icon]
-        if bounds:
-            samples.insert(0,ImageOps.expand(ImageOps.invert(mask.crop(bounds)),4,fill=255))
-        for sample in samples:
+        gray = icon.convert("L")
+        for threshold in (155,120,None):
+            if threshold is None:
+                sample = icon
+            else:
+                mask = ImageOps.expand(gray.point(lambda v: 255 if v>=threshold else 0),1,fill=255)
+                ImageDraw.floodfill(mask,(0,0),0)
+                bounds = mask.getbbox()
+                if not bounds:
+                    continue
+                sample = ImageOps.expand(ImageOps.invert(mask.crop(bounds)),4,fill=255)
             words = self.ocr.read(sample,zoom=5)
             text = "".join(word[0] for word in words).replace(" ","")
             text = text.translate(str.maketrans({"O":"0", "o":"0", "I":"1", "l":"1"}))
@@ -453,6 +462,8 @@ class Alt:
         cash = self.game.money()
         # A selected early unit can cover its own price at RDP scale.
         kind = unit.partition("_")[0]
+        if kind in EARLY and any(other!=kind and price==farm.UNITS[other]["price"] for other in EARLY):
+            return f"{name} · в слоте {slot} видна цена другого юнита, проверь номера слотов"
         if price is None and kind in ("plunger","tv"):
             price = farm.UNITS[kind]["price"]
         if price is None and kind in ("amplifier","screen"):
@@ -469,6 +480,8 @@ class Alt:
         if before_count is None:
             return f"Не прочитал счётчик {name} в слоте {slot} · повторяю наведение"
         if before_count==limit:
+            if kind in EARLY:
+                self.full_early.add(kind)
             return f"{name} · в игре уже {limit}/{limit}, проверь места юнитов"
         if not self.game.take(slot):
             return "Не появилась подсветка дороги"
@@ -738,11 +751,22 @@ class Alt:
             return "Состояние постановки синхронизировано"
         if state["progress"]["retry"]!=self.retry:
             self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
+            self.full_early.clear()
+            self.slot_wait_until.clear()
             self.sites.clear()
             self.rescan_at.clear()
             self.retry = state["progress"]["retry"]
         if self.phase=="lobby":
             return self.lobby(state,img)
+        if (not self.ready and "ready" not in self.uncertain_votes
+                and time.monotonic()>=self.vote_retry and ready_button(img)):
+            return self.vote("ready")
+        if time.monotonic()>=self.next_slot_check and not self.placed and not self.pending_places:
+            detected = wastelands_slots(img)
+            if detected and detected!=self.slots:
+                farm.log(f"Wastelands · твинк {self.player} · слоты по карточкам: {detected}")
+                self.slots = detected
+            self.next_slot_check = float("inf") if detected else time.monotonic()+2
         cmd = state["command"]
         if cmd:
             cmd = self.exchange("claim",id=cmd["id"])["claimed"]
@@ -757,36 +781,39 @@ class Alt:
                 self.deadline = None
             self.exchange("result",id=cmd["id"],**response)
             return response["result"]
-        if "plunger" in self.placed and not self.ready and ready_button(img):
-            return self.vote("ready")
         if self.pending_places:
             checked = self.recheck_pending(state)
             if checked:
                 return checked
-        pending_kinds = {unit.partition("_")[0] for unit in self.pending_places}
-        for unit in PLACEMENT_ORDER:
+        outstanding = [u for u in PLACEMENT_ORDER if u not in self.placed
+                       and u.partition("_")[0] not in self.full_early]
+        pending_kinds = {u.partition("_")[0] for u in self.pending_places}
+        # Finish one early unit type before moving on to the next stage.
+        stage = outstanding
+        for kind in EARLY:
+            copies = [u for u in outstanding if u.partition("_")[0]==kind]
+            if copies:
+                stage = copies
+                break
+        now = time.monotonic()
+        for unit in stage:
             kind = unit.partition("_")[0]
-            if unit in self.placed or kind in pending_kinds or time.monotonic()<self.slot_wait_until.get(kind,0):
+            if kind in pending_kinds or now<self.slot_wait_until.get(kind,0):
                 continue
             if unit in self.sites and self.attempt[unit]>=len(self.sites[unit]):
-                if unit not in ("amplifier","screen"):
-                    continue
-                due = self.rescan_at.setdefault(unit,time.monotonic()+8)
-                if time.monotonic()<due:
+                due = self.rescan_at.setdefault(unit,now+4)
+                if now<due:
                     continue
                 del self.rescan_at[unit]
                 self.attempt[unit] = 0
             return self.place(unit,img)
-        outstanding = [u for u in PLACEMENT_ORDER if u not in self.placed]
-        if outstanding and not {"amplifier","screen"}.issubset(self.placed):
-            if self.rescan_at:
-                return "Полоса титана занята · повторю поиск свободного места"
-            pending = ", ".join(placement_label(u) for u in PLACEMENT_ORDER if u in self.pending_places)
-            if pending:
-                return "Места юнитов · ждут подтверждения: "+pending
-            if any(time.monotonic()<until for until in self.slot_wait_until.values()):
-                return "Перепроверяю счётчики на карточках юнитов"
-            return "Свободные точки исчерпаны · Места юнитов → Повторить поиск места"
+        if stage:
+            kind = stage[0].partition("_")[0]
+            if kind in pending_kinds:
+                return f"{placement_label(stage[0])} · жду подтверждения постановки"
+            if now<self.slot_wait_until.get(kind,0):
+                return f"{placement_label(stage[0])} · перепроверяю счётчик слота {self.slots[kind]}"
+            return f"{placement_label(stage[0])} · повторю поиск свободного места"
         if min(self.levels.values())<8 and time.monotonic()>self.next_upgrade:
             self.next_upgrade = time.monotonic()+4
             cash = self.game.money()

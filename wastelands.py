@@ -238,7 +238,7 @@ class App:
         slots = tk.Frame(group,bg=C["card"])
         slots.pack(fill="x")
         saved = prefs.get("slots",{})
-        for col,(unit,default) in enumerate(zip(UNITS,(4,5,1,3))):
+        for col,(unit,default) in enumerate(zip(UNITS,(3,4,1,2))):
             slots.columnconfigure(col,weight=1,uniform="slot")
             text(slots,"TV" if unit=="tv" else unit.title(),size=9,color="muted").grid(row=0,column=col,sticky="w")
             value = str(saved.get(unit,default)) if isinstance(saved,dict) else str(default)

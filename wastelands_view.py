@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import math
+from functools import lru_cache
 from itertools import permutations
 from pathlib import Path
 import subprocess
@@ -164,6 +165,46 @@ def mission_button(img, mode):
                     abs(y+bh/2-ry-rh/2)<.01*h and .8<bw/rw<1.25):
                 x,y,bw,bh = right if mode=="nightmare" else left
                 return dict(cx=(x+bw/2)/w,cy=(y+bh/2)/h,w=bw/w,h=bh/h)
+    return None
+
+
+@lru_cache(maxsize=1)
+def _hotbar_portraits():
+    with Image.open(Path(__file__).with_name("wastelands_hotbar.png")) as strip:
+        return np.stack([np.asarray(strip.crop((x,0,x+32,32)),dtype=np.int16)
+                         for x in range(0,128,32)])
+
+
+def wastelands_slots(img):
+    """Recognize a complete loadout. Keep manual slots for unknown skins or partial matches."""
+    refs = _hotbar_portraits()
+    names = ("amplifier","screen","plunger","tv")
+    scores = np.full((4,6),255.)
+    w,h = img.size
+    # Ignore the hover counter and the slot number in the top-left corner.
+    mask = np.ones((32,32),dtype=bool)
+    mask[10:23] = False
+    mask[:8,:8] = False
+    templates = refs[:,mask].reshape(4,-1).astype(float)
+    templates -= templates.mean(axis=1,keepdims=True)
+    norm = np.linalg.norm(templates,axis=1)
+    for slot in range(6):
+        nominal = w*.5 + (slot-2.5)*.13*h
+        for shift in (-.01,0,.005,.01,.015):
+            x = nominal + shift*h
+            for y in (.874*h,.880*h):
+                box = tuple(round(v) for v in (x-.033*h,y-.034*h,x+.033*h,y+.034*h))
+                crop = img.crop(box).convert("RGB").resize((32,32),Image.Resampling.BILINEAR)
+                diff = np.abs(refs - np.asarray(crop,dtype=np.int16))
+                pixels = np.asarray(crop)[mask].ravel().astype(float)
+                pixels -= pixels.mean()
+                corr = templates @ pixels / np.maximum(1,norm*np.linalg.norm(pixels))
+                cost = diff[:,mask].mean(axis=(1,2)) + 28*(1-corr)
+                scores[:,slot] = np.minimum(scores[:,slot],cost)
+    slots = scores.argmin(axis=1)
+    ranked = np.sort(scores,axis=1)
+    if len(set(slots))==4 and np.all(ranked[:,0]<34) and np.all(ranked[:,1]-ranked[:,0]>6):
+        return {name:int(slot)+1 for name,slot in zip(names,slots)}
     return None
 
 
