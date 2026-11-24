@@ -19,8 +19,36 @@ from PIL import Image, ImageDraw, ImageFont
 from wastelands_alt import Alt, Game, Wait, UnitCounts, level, manager_card, manager_total, manager_unit_count, placement_cash, preserve_bank_capacity, visual_manager_total, countdown
 from wastelands_team import AltConnection, BRANCH, JUNCTION, Match, PAIR_LIFETIME, PLACEMENT_ORDER, PLAYERS, TRUNK, UNITS, bank_slot, connect_by_pin, position, serve
 from wastelands_view import ANCHOR, OCR, label, placement_in_view, road_pose, screen_point
+from wastelands_manager import titan_cards, upgrade_price
 
 PRIVATE_LINK = "https://www.roblox.com/share?code=Test123&type=Server"
+
+
+def titan_manager_frame(levels=(0,0), *, reverse=False, left=974):
+    import twd_bot as farm
+    with Image.open(Path(__file__).parent/"tests/fixtures/titans_rdp.png") as fixture:
+        row = fixture.convert("RGB")
+    for level_value,x in zip(levels,(125,293)):
+        if level_value==0:
+            continue
+        ImageDraw.Draw(row).rectangle((x-1,31,x+8,42),fill=(46,22,24))
+        if level_value is not None:
+            glyph,aspect = farm._get_templates()[str(level_value)]
+            ink = Image.fromarray((glyph*255).astype(np.uint8)).resize((round(aspect*9),9),Image.Resampling.LANCZOS)
+            row.paste("white",(x,32,x+ink.width,41),ink)
+    if reverse:
+        first,second = row.crop((0,0,167,134)),row.crop((169,0,336,134))
+        row.paste(second,(0,0))
+        row.paste(first,(169,0))
+    frame = Image.new("RGB",(1356,698),(89,73,52))
+    draw = ImageDraw.Draw(frame)
+    draw.rectangle((left,44,left+369,682),fill=(21,32,36),outline=(25,209,227),width=3)
+    draw.rectangle((50,400,220,434),fill=(27,141,45))  # selected unit's separate upgrade
+    draw.rectangle((left+9,638,left+181,670),fill=(27,141,45))  # Upgrade All
+    draw.rectangle((left+185,638,left+360,670),fill=(148,15,17))  # Sell All
+    frame.paste(row,(left+15,118))
+    return frame
+
 
 class IntegrationTest(unittest.TestCase):
     def test_peer_address(self):
@@ -481,7 +509,8 @@ class NetworkTest(unittest.TestCase):
             for unit in ("amplifier","screen"):
                 with patch("wastelands_alt.position",side_effect=AssertionError("local layout")):
                     sites=a.placement_sites(unit)
-                self.assertEqual(len(sites),30)
+                self.assertEqual(sites[:30],[position(a.player,unit,n) for n in range(30)])
+                self.assertGreater(len({tuple(site) for site in sites[30:]}),50)
                 point=sites[8]
                 a.exchange("reserve",unit=unit,point=point)
                 a.exchange("commit",unit=unit,point=point)
@@ -506,6 +535,58 @@ class NetworkTest(unittest.TestCase):
             self.assertGreater(np.linalg.norm((np.array(first)-screen_point(pose,preferred))*frame.size),22)
             self.assertGreater(np.linalg.norm((np.array(first)-second)*frame.size),26)
             np.testing.assert_allclose(screen_point(pose,self.match.places[1,"screen"]["point"]),second)
+
+    def test_first_screen_explores_past_five_rejected_patches_and_remembers_success(self):
+        a = self.alts[0]
+        amp = min(a.placement_sites("amplifier"),key=lambda p:math.dist(p,(1278,646)))
+        a.exchange("reserve",unit="amplifier",point=amp,slot=1,count_before=0,total_before=8)
+        a.exchange("commit",unit="amplifier",point=amp)
+        sites = a.placement_sites("screen")
+        missed = [(1294,722),(1336,751),(1367,706),(1175,608),(1219,638)]
+        for target in missed:
+            point = min(sites,key=lambda p:math.dist(p,target))
+            self.assertLess(math.dist(point,target),1)
+            state = a.exchange("reserve",unit="screen",point=point,slot=3,count_before=0,total_before=9)
+            a.update_places(state)
+            a.funded_lease = ("screen",tuple(point),self.match.places[1,"screen"]["target_since"])
+            with patch.object(a,"placement_readback",return_value=UnitCounts(0,9)):
+                a.recheck_pending(state)
+                a.recheck_pending(state)
+        self.assertNotIn("1/screen",self.match.titan_sites)
+        # The old 35-second shared cooldown has expired; obstacles still exist.
+        self.match.rejections.clear()
+        a.local_rejections.clear()
+        a.update_places(a.exchange())
+        frame=Image.new("RGB",(1356,698),(115,93,54))
+        pose=(np.array([.40,.4]),np.diag([1/2048,1/1152]))
+        with patch.object(a,"game") as game,patch.object(a,"map_pose",return_value=pose), \
+             patch("wastelands_alt.placement_cash",return_value=20000), \
+             patch.object(a,"placement_baseline",return_value=UnitCounts(0,9)):
+            game.grab.return_value = frame
+            a.place("screen",frame)
+            game.click_live.assert_called_once()
+            chosen = self.match.places[1,"screen"]["target"]
+            self.assertTrue(all(math.dist(chosen,p)>=24 for p in missed))
+            self.assertGreaterEqual(math.dist(chosen,amp),54)
+            with patch.object(a,"placement_readback",return_value=UnitCounts(1,10)):
+                self.assertIn("Поставил",a.recheck_pending(a.exchange()))
+        saved = self.match.titan_sites
+        self.assertEqual(saved,{"1/amplifier":amp,"1/screen":chosen})
+        restarted = Match(dict(saved,**{"2/screen":[999,999]}))
+        restarted.start("nightmare","Host")
+        for u,p in (("screen",chosen),("amplifier",amp)):
+            plan = restarted.exchange(1,{"instance":"test","run":restarted.run,"op":"placement_sites","unit":u})
+            self.assertEqual(plan["preferred_site"],p)
+        self.assertNotIn("2/screen",restarted.titan_sites)
+
+    def test_personal_titan_card_and_total_can_resolve_a_stale_hover(self):
+        a = self.alts[1]
+        with patch.object(a,"hover_count",return_value=0), \
+             patch.object(a,"manager_counts",return_value=UnitCounts(1,10)) as manager:
+            self.assertEqual(a.placement_readback("screen",2,UnitCounts(0,9),True),UnitCounts(1,10))
+            self.assertEqual(a.placement_baseline("screen",2,1).slot,1)
+            manager.return_value = UnitCounts(1,9)
+            self.assertEqual(a.placement_readback("screen",2,UnitCounts(0,9),True),UnitCounts())
 
     def test_paid_rejection_skips_the_same_patch_across_copies_and_players(self):
         a=self.alts[2]
@@ -797,8 +878,11 @@ class NetworkTest(unittest.TestCase):
             a.exchange("reserve",unit=unit,point=pt)
             a.exchange("commit",unit=unit,point=pt)
             calls.append(unit)
-        def improve(unit,action):
+        def improve(unit,action,*,cash):
             self.assertEqual(action,"Upgrade")
+            self.assertIsNone(unit)
+            unit=min(a.levels,key=lambda name:a.levels[name] or 0)
+            a.levels[unit]=a.levels[unit] or 0
             a.levels[unit]+=1
             calls.append(unit)
         with patch.object(a,"place",side_effect=place),patch.object(a,"manager",side_effect=improve), \
@@ -809,6 +893,72 @@ class NetworkTest(unittest.TestCase):
                 a.tick(a.exchange())
         self.assertEqual(calls,["ready","plunger","plunger_2","plunger_3","plunger_4",
                                 "tv","tv_2","tv_3","tv_4","amplifier","screen"]+["amplifier","screen"]*8)
+
+    def test_individual_upgrades_read_both_levels_and_verify_purchase_through_battle_tick(self):
+        a = self.alts[2]
+        a.phase,a.ready,a.next_slot_check = "battle",True,float("inf")
+        for unit in PLACEMENT_ORDER:
+            self.match.places[a.player,unit]["state"] = "placed"
+        levels = [0,0]
+        panel_open = False
+        hidden = Image.new("RGB",(1356,698))
+        clicks = []
+        def frame():
+            return titan_manager_frame(levels,reverse=bool(sum(levels)%2)) if panel_open else hidden
+        def toggle(key):
+            nonlocal panel_open
+            self.assertEqual(key,"v")
+            panel_open = not panel_open
+        def click(point,locate,title):
+            self.assertTrue(panel_open)
+            self.assertEqual(point,locate(frame()))
+            index = min(range(2),key=levels.__getitem__)
+            name = ("Amplifier","Screen")[index]
+            self.assertEqual(title,"Upgrade "+name)
+            x,y = np.asarray(point)*hidden.size
+            column = index ^ (sum(levels)%2)
+            self.assertLess(abs(x-(1048+169*column)),3)
+            self.assertLess(abs(y-228),3)
+            levels[index]+=1
+            clicks.append(name)
+        with patch.object(a,"game") as game,patch.object(a,"placement_text",return_value=[]), \
+             patch("wastelands_alt.placement_cash",return_value=100000),patch("wastelands_alt.time.sleep"), \
+             patch("twd_bot.log"):
+            game.grab.side_effect=frame
+            game.key.side_effect=game.k.release.side_effect=toggle
+            game._vk.side_effect=lambda key:key
+            game.click_live.side_effect=click
+            for i in range(16):
+                if i==5:  # A restarted worker must use the live levels.
+                    a.reset(a.exchange())
+                    a.phase,a.ready,a.next_slot_check = "battle",True,float("inf")
+                a.next_upgrade=0
+                status=a.tick(a.exchange())
+                self.assertIn("Титаны 2/2",status)
+                self.assertIn(f"Amplifier ур. {levels[0]}/8",status)
+                self.assertIn(f"Screen ур. {levels[1]}/8",status)
+                self.assertFalse(panel_open)
+            self.assertIn("завершены",a.tick(a.exchange()))
+            self.assertEqual(clicks,["Amplifier","Screen"]*8)
+            self.assertEqual(game.key.call_count,16)
+            game.click.assert_not_called()
+
+    def test_upgrade_waits_for_money_and_requires_an_observed_level_change(self):
+        a=self.alts[0]
+        frame=titan_manager_frame()
+        cards=titan_cards(frame)
+        with patch.object(a,"game") as game,patch.object(a,"placement_text",return_value=[]):
+            game.grab.return_value=frame
+            self.assertIn("2,875",a.improve_titans(frame,cards,1000))
+            game.click_live.assert_not_called()
+            self.assertIn("Проверю результат",a.improve_titans(frame,cards,35675))
+            self.assertEqual(a.levels,{"amplifier":0,"screen":0})
+            locate=game.click_live.call_args.args[1]
+            self.assertIsNone(locate(titan_manager_frame((1,0))))
+            self.assertIsNone(locate(Image.new("RGB",frame.size)))
+            bad=titan_manager_frame((None,0))
+            self.assertIn("Сверяю",a.improve_titans(bad,titan_cards(bad),35675))
+            game.click_live.assert_called_once()
 
     def test_all_three_complete_the_build_with_partial_and_delayed_readings(self):
         # Each RDP client sees the same road from its own spawn. The two small
@@ -892,6 +1042,33 @@ class NetworkTest(unittest.TestCase):
 
 
 class VisionTest(unittest.TestCase):
+    def test_individual_titan_cards_at_rdp_sizes_and_in_swapped_columns(self):
+        for scale,reverse,left in ((.9,False,974),(1,False,974),(1.2,True,530),(1.5,False,550),(1.8,True,800)):
+            frame=titan_manager_frame(reverse=reverse,left=left)
+            frame=frame.resize(tuple(round(v*scale) for v in frame.size),Image.Resampling.LANCZOS)
+            cards=titan_cards(frame)
+            self.assertEqual(set(cards),{"amplifier","screen"})
+            for index,(name,price) in enumerate((("amplifier",2875),("screen",3525))):
+                card=cards[name]
+                self.assertEqual(card.level,0)
+                x,y=np.asarray(card.button)*frame.size/scale
+                self.assertLess(abs(x-(left+74+169*(index^reverse))),3)
+                self.assertLess(abs(y-228),3)
+                if scale==1:
+                    self.assertEqual(upgrade_price(frame,card),price)
+
+    def test_partial_card_and_unrelated_green_bar_cannot_be_upgraded(self):
+        frame=titan_manager_frame()
+        # Keep both green frames but remove the label from only one.
+        ImageDraw.Draw(frame).rectangle((1020,213,1087,240),fill=(20,90,24))
+        cards=titan_cards(frame)
+        self.assertIsNone(cards["amplifier"].button)
+        self.assertIsNotNone(cards["screen"].button)
+        # Scroll until the visible part of Screen no longer includes its button.
+        ImageDraw.Draw(frame).rectangle((1158,185,1325,256),fill=(21,32,36))
+        card=titan_cards(frame).get("screen")
+        self.assertTrue(card is None or card.button is None)
+
     def test_hotbar_portraits_find_reordered_units_and_reject_ambiguous_layout(self):
         from wastelands_view import wastelands_slots
         with Image.open(Path(__file__).with_name("wastelands_hotbar.png")) as refs:
