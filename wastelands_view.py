@@ -270,9 +270,9 @@ _VEHICLES = np.array([[804.,700.],[505.,515.],[1248.,275.]])
 _LANDMARK_BASIS = np.linalg.inv((_VEHICLES[:2]-ANCHOR).T)
 
 
-def landmark_pose(img):
+def landmark_pose(img, *, width=512):
     """Determine which bend is visible using two wrecks and the branching road."""
-    w = 512
+    w = width
     h = round(w*img.height/img.width)
     rgb = np.asarray(img.convert("RGB").resize((w,h),Image.Resampling.BILINEAR),dtype=np.int16)
     r,g,b = rgb.transpose(2,0,1)
@@ -334,6 +334,23 @@ def landmark_pose(img):
         if np.linalg.norm(origin-loc)>7 or np.linalg.norm(mat-transform)>.045:
             return None
     return origin/[w,h], mat/np.array([[w],[h]])
+
+
+def recover_third_bank_pose(img):
+    """Recheck marginal wreck edges at two samplings before using the near bank."""
+    from wastelands_team import LANES
+    first = landmark_pose(img,width=508)
+    if first is None:
+        return None
+    second = landmark_pose(img,width=520)
+    if second is None:
+        return None
+    # Require the same junction, both wrecks and both ends of the placement strip.
+    marks = np.vstack((ANCHOR,_VEHICLES[:2],LANES[2]))-ANCHOR
+    difference = first[0]-second[0]+marks@(first[1]-second[1]).T
+    if np.linalg.norm(difference*img.size,axis=1).max()>.012*img.width:
+        return None
+    return (first[0]+second[0])/2,(first[1]+second[1])/2
 
 
 def placement_pose(img):
@@ -453,35 +470,47 @@ def placement_in_view(x,y):
             ((x<=.79)|(y>=.15)) & ((x<=.32)|(x>=.68)|(y>=.12)))
 
 
-def framing_turn(pose, sites, size, avoid_sign=0):
+@lru_cache(maxsize=4)
+def _base_offsets(radius):
+    grid = np.arange(-radius,radius+1,3)
+    dx,dy = np.meshgrid(grid,grid)
+    points = np.column_stack((dx.ravel(),dy.ravel()))
+    return points[(points**2).sum(1)<=radius**2]
+
+
+def framing_turn(pose, sites, size, avoid_sign=0, *, radius=0):
     """Find a nearby heading with more of the permitted ground inside the viewport."""
     if not sites:
         return 0
     origin,mat = pose
     # The camera orbits the avatar, so compare headings in physical pixels.
-    offsets = (origin+(np.asarray(sites)-ANCHOR)@mat.T-.5)*size
-    def coverage(angle):
+    sites = np.asarray(sites)[:,None,:]+_base_offsets(radius)
+    offsets = (origin+(sites-ANCHOR)@mat.T-.5)*size
+    def in_frame(angle):
         radians = math.radians(angle)
         co,si = math.cos(radians),math.sin(radians)
-        x,y = (.5+(offsets@np.array([[co,si],[-si,co]]))/size).T
-        return np.count_nonzero(placement_in_view(x,y))
-    best,score = 0,coverage(0)
+        x,y = np.moveaxis(.5+(offsets@np.array([[co,si],[-si,co]]))/size,-1,0)
+        return placement_in_view(x,y).all(axis=1)
+    seen = in_frame(0)
+    if radius:
+        # Only newly exposed ground can help after the visible bases were checked.
+        offsets = offsets[~seen]
+        if not len(offsets):
+            return 0
+    best,score = 0,0 if radius else int(seen.sum())
     for angle in (20,-20,40,-40,60,-60,80,-80,90,-90):
         if angle*avoid_sign<=0:
-            available = coverage(angle)
+            available = np.count_nonzero(in_frame(angle))
             if available>score:
                 best,score = angle,available
     return best
 
 
-def rank_build_sites(img, pose, sites, radius, preference):
+def rank_build_sites(img, pose, sites, radius, preference, *, clear_titan_base=False):
     """Score sand and texture under each projected base, using the current frame."""
     if not sites:
         return []
-    grid = np.arange(-radius, radius+1, 3)
-    dx, dy = np.meshgrid(grid, grid)
-    footprint = np.column_stack((dx.ravel(), dy.ravel()))
-    footprint = footprint[(footprint**2).sum(axis=1) <= radius**2]
+    footprint = _base_offsets(radius)
     origin, mat = pose
     points = np.asarray(sites)
     pixels = np.rint((origin + (points[:, None] + footprint - ANCHOR) @ mat.T) * img.size).astype(int)
@@ -494,6 +523,19 @@ def rank_build_sites(img, pose, sites, radius, preference):
     spread = np.percentile(g, 90, axis=1) - np.percentile(g, 10, axis=1)
     cost = 1 - (visible & sand).mean(axis=1) + np.minimum(spread/100, 1)*.35
     order = np.argsort(np.rint((cost+preference)*12),kind="stable")
+    if clear_titan_base:
+        # Gray rubble can share the brightness of brown sand. Check its color
+        # across the projected base before a learned site can win on preference.
+        ground = ((r>=54)&(r-g>=.09*r)&(r-g<=.32*r)&(g-b>=.19*r)
+                  &(r-b>=.42*r)&(r-b<=.63*r))
+        center = (footprint**2).sum(1)<=(radius/2)**2
+        clear = ((visible & placement_in_view(x/img.width,y/img.height)).all(1)
+                 & (ground.mean(1)>=.86) & (ground[:,center].mean(1)>=.94)
+                 & (spread<=np.maximum(22,.32*np.median(g,axis=1))))
+        for sx,sy in ((1,1),(-1,1),(-1,-1),(1,-1)):
+            quarter = (sx*footprint[:,0]>=0)&(sy*footprint[:,1]>=0)
+            clear &= ground[:,quarter].mean(1)>=.72
+        order = order[clear[order]]
     return [sites[index] for index in order]
 
 

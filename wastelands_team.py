@@ -45,11 +45,25 @@ EDGE_GAP = 14
 BANK_OFFSET = 24 + EDGE_GAP  # nominal half road width plus clearance for the base
 EDGE_ADJUST = 21  # maximum correction from the nominal boundary, in map pixels
 EARLY_CLEARANCE = 26
+TITAN_CLEARANCE = 54
 REJECTION_SECONDS = 35
 PLACEMENT_ORDER = ("plunger", "plunger_2", "plunger_3", "plunger_4",
                    "tv", "tv_2", "tv_3", "tv_4", "amplifier", "screen")
-LANES = [((1159, 631), (1336, 751)), ((1022, 690), (1285, 868)),
-         ((1539, 871), (1770, 1029))]
+
+
+def trunk_point(along, across):
+    return tuple(j+along*t+across*n for j,t,n in zip(JUNCTION,TRUNK,BRANCH))
+
+
+# The open sand marked for helper 3 is on the negative side of the trunk,
+# between the early junction and the next bend. All distances are map pixels.
+THIRD_BANK_RUN = (548,664)
+THIRD_BANK_EDGE = -64
+LANES = (((1159,631),(1336,751)), ((1022,690),(1285,868)),
+         tuple(trunk_point(along,THIRD_BANK_EDGE) for along in THIRD_BANK_RUN))
+# Signed depth from the lane and clearance past either end of its centerline.
+TITAN_DEPTH = (80, -80, -36)
+TITAN_EXTENSION = (80, 80, 12)
 
 # (distance along the lane, extra distance away from the road in map pixels).
 TITAN_OFFSETS = ((0,0),(.09,0),(-.09,0),(.16,0),(-.16,0),
@@ -61,8 +75,7 @@ TITAN_OFFSETS = ((0,0),(.09,0),(-.09,0),(.16,0),(-.16,0),
 TITAN_SPARES = tuple((progress, outward) for outward in (0, 28, 54)
                      for progress in (0, .25, .5, .75, 1))
 
-# Distances in map pixels. Continue along the same bank when wrecks or towers
-# obstruct the original patch. The two strips on the same side stay separate.
+# Distances on a full-size strip, scaled to each helper's depth and extension.
 TITAN_BANK_GRID = tuple((along,outward) for along in range(-80,81,20)
                         for outward in (0,20,40,60,80))
 TITAN_LANE_GRID = tuple((fraction,outward) for fraction in (.10,.22,.34,.46,.58,.70,.82,.94)
@@ -72,7 +85,7 @@ TITAN_LANE_GRID = tuple((fraction,outward) for fraction in (.10,.22,.34,.46,.58,
 CONFIRMED_TITAN_SITES = {
     1: {"amplifier":(1278,646)},
     2: {"amplifier":(1024,720),"screen":(1180,797)},
-    3: {"amplifier":(1590,906),"screen":(1570,826)},
+    3: {},
 }
 
 
@@ -136,6 +149,15 @@ def placement_attempts(unit):
     return len(TITAN_OFFSETS)+len(TITAN_SPARES)+len(TITAN_LANE_GRID)+len(TITAN_BANK_GRID)
 
 
+def on_third_titan_bank(point):
+    dx,dy = point[0]-JUNCTION[0],point[1]-JUNCTION[1]
+    along = dx*TRUNK[0]+dy*TRUNK[1]
+    across = dx*BRANCH[0]+dy*BRANCH[1]
+    margin = TITAN_EXTENSION[2]
+    return (THIRD_BANK_RUN[0]-margin-1 <= along <= THIRD_BANK_RUN[1]+margin+1
+            and THIRD_BANK_EDGE+TITAN_DEPTH[2]-1 <= across <= THIRD_BANK_EDGE+1)
+
+
 def position(player, unit, attempt=0):
     if unit.partition("_")[0] in EARLY:
         center, _, normal = bank_slot(player,unit,attempt)
@@ -153,10 +175,11 @@ def position(player, unit, attempt=0):
             progress,outward = TITAN_LANE_GRID[index]
         else:
             extension,outward = TITAN_BANK_GRID[index-len(TITAN_LANE_GRID)]
+            extension *= TITAN_EXTENSION[player-1]/80
             progress = (0 if extension<0 else 1)+extension/math.dist(a,b)
     base = mix(a,b,progress)
-    side = -1 if player==2 else 1
-    return [v+side*outward*n for v,n in zip(base,BRANCH)]
+    depth = outward*TITAN_DEPTH[player-1]/80
+    return [v+depth*n for v,n in zip(base,BRANCH)]
 
 
 def segment_distance(p, a, b):
@@ -174,10 +197,13 @@ def placement_conflict(player,unit,point,places):
         if other["player"]==player and other["unit"]==unit:
             continue
         both_early = unit.partition("_")[0] in EARLY and other["unit"].partition("_")[0] in EARLY
-        clearance = EARLY_CLEARANCE if both_early else 54
+        clearance = EARLY_CLEARANCE if both_early else TITAN_CLEARANCE
         target = other.get("target")
-        # Early copies can share fallback candidates until someone claims one.
-        protect_plan = other["state"]=="placed" or (not both_early and not target)
+        # The third helper's two titans can exchange unclaimed positions on
+        # their small patch. Every pending or built base still owns its radius.
+        same_titan_bank = (player==other["player"]==3 and unit in ("amplifier","screen")
+                           and other["unit"] in ("amplifier","screen"))
+        protect_plan = other["state"]=="placed" or (not (both_early or same_titan_bank) and not target)
         for occupied in (other["point"] if protect_plan else None, target):
             if occupied and math.dist(point, occupied) < clearance:
                 return "Рядом занят участок"

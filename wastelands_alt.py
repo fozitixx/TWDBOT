@@ -10,12 +10,12 @@ from pynput import mouse
 
 import twd_bot as farm
 from wastelands_manager import manager_bounds, titan_cards, upgrade_price
-from wastelands_team import (ABILITIES, BANK_OFFSET, EARLY, EARLY_CLEARANCE, REJECTION_SECONDS,
+from wastelands_team import (ABILITIES, BANK_OFFSET, EARLY, EARLY_CLEARANCE, TITAN_CLEARANCE, REJECTION_SECONDS,
                             PLACEMENT_ORDER, SPARE_BANKS, Wait, bank_slot, footprint_class, near_rejection, placement_conflict,
-                            placement_label, position, private_server_links, recent_sites)
+                            on_third_titan_bank, placement_label, position, private_server_links, recent_sites)
 from wastelands_view import (OCR, color_boxes, framing_turn, invite_buttons, label, read_invite, map_point, preview,
                             perimeter_points, rank_build_sites, placement_in_view, placement_pose, mission_button, ready_button,
-                            visual_slot_count, wastelands_slots, scene, screen_point, tracked_pose)
+                            recover_third_bank_pose, visual_slot_count, wastelands_slots, scene, screen_point, tracked_pose)
 
 
 class Game(farm.Bot):
@@ -262,12 +262,12 @@ def placement_cash(frame, read):
     return None
 
 
-def preserve_bank_capacity(ranked,needed):
+def preserve_bank_capacity(ranked,needed,clearance=EARLY_CLEARANCE):
     """Prefer a base that leaves space for the other helpers' remaining towers."""
     if needed<=1:
         return ranked
     coords = np.asarray(ranked)
-    nearby = ((coords[:,None]-coords)**2).sum(axis=2)<EARLY_CLEARANCE**2
+    nearby = ((coords[:,None]-coords)**2).sum(axis=2)<clearance**2
     free = np.ones(len(coords),dtype=bool)
     degree = nearby.sum(axis=1)
     packing = []
@@ -578,7 +578,12 @@ class Alt:
         if unit not in self.sites:
             if self.host_sites:
                 plan = self.exchange("placement_sites",unit=unit)
-                self.sites[unit] = plan["sites"]
+                sites = plan["sites"]
+                if self.player==3 and unit in ("amplifier","screen"):
+                    sites = [p for p in sites if on_third_titan_bank(p)]
+                    if not sites:
+                        raise Wait("Основа передала старую зону титанов твинка 3. Обнови основу до 6.0.23 или новее.")
+                self.sites[unit] = sites
                 if unit in ("amplifier","screen") and plan.get("preferred_site"):
                     self.preferred_titans[unit] = plan["preferred_site"]
             else:
@@ -819,6 +824,8 @@ class Alt:
             if current is not None:
                 return current
         current = placement_pose(snap)
+        if current is None and self.player==3:
+            current = recover_third_bank_pose(snap)
         if current is not None:
             # Only a fresh landmark fit becomes the reference. Tracking always
             # starts at that frame, so motion between attempts cannot accumulate.
@@ -855,7 +862,9 @@ class Alt:
             failed,sign,until = self.failed_heading
             if now<until and abs((heading-failed+180)%360-180)<12:
                 avoid_sign = sign
-        angle = max(-self.max_turn,min(self.max_turn,framing_turn(pose,free,frame.size,avoid_sign)))
+        radius = TITAN_CLEARANCE//2 if self.player==3 and unit in ("amplifier","screen") else 0
+        angle = framing_turn(pose,free,frame.size,avoid_sign,radius=radius)
+        angle = max(-self.max_turn,min(self.max_turn,angle))
         if not angle or farm.afk_panel(self.game.grab()):
             return False
         scale = self.turn_scale if self.turn_scale is not None else self.game.px_per_deg
@@ -906,7 +915,10 @@ class Alt:
             if any(math.dist(point,p)<EARLY_CLEARANCE for p in other_plans):
                 cost += .24
             preference.append(cost)
-        ranked = rank_build_sites(frame,pose,available,12 if early else 24,preference)
+        check_ground = self.player==3 and not early
+        radius = TITAN_CLEARANCE//2 if check_ground else (12 if early else 24)
+        ranked = rank_build_sites(frame,pose,available,radius,preference,clear_titan_base=check_ground)
+        obstructed = len(available)-len(ranked)
         if not early and self.failed_titan_sites:
             # The team cooldown expires, but this helper still explores unused
             # ground before retrying the exact same wreck later in this match.
@@ -915,7 +927,12 @@ class Alt:
             needed = sum(p["unit"].partition("_")[0] in EARLY and p["state"]!="placed" and not p.get("target")
                          for p in self.team_places)
             ranked = preserve_bank_capacity(ranked,needed)
-        return ranked,visible,busy,rejected
+        elif check_ground and len(ranked)>1:
+            other = "screen" if unit=="amplifier" else "amplifier"
+            if any(p["player"]==self.player and p["unit"]==other and p["state"]!="placed"
+                   and not p.get("target") for p in self.team_places):
+                ranked = preserve_bank_capacity(ranked,2,TITAN_CLEARANCE)
+        return ranked,visible,busy,rejected,obstructed
 
     def titan_misses(self,point):
         return sum(count for site,count in self.failed_titan_sites.items() if math.dist(point,site)<25)
@@ -961,7 +978,7 @@ class Alt:
                     self.next_pose_fit = 0
                     return self.wait_for_check(f"{name} · вернул камеру, повторно сверяю дорогу",.8)
                 return self.wait_for_check(f"{name} · сверяю положение камеры по дороге и обломкам",1)
-            candidates,visible,busy,rejected = self.candidate_sites(unit,snap,pose,sites)
+            candidates,visible,busy,rejected,obstructed = self.candidate_sites(unit,snap,pose,sites)
             if kind not in EARLY and self.failed_titan_sites and (not candidates or self.titan_misses(candidates[0])):
                 unexplored = [point for point in sites if not self.titan_misses(point)]
                 if unexplored and self.reframe_sites(unit,snap,pose,unexplored):
@@ -1009,6 +1026,8 @@ class Alt:
             now = time.monotonic()
             self.rescan_at[unit] = now+4
             message = f"{name} · участков в кадре {visible}, занято {busy}, недавних отказов {rejected}"
+            if obstructed:
+                message = f"{name} · ищу свободный песок в своей зоне · занято {busy}, помехи в {obstructed} точках"
             if now>=self.search_log_at.get(kind,0):
                 farm.log(f"Wastelands · твинк {self.player} · {message}")
                 self.search_log_at[kind] = now+12
@@ -1326,7 +1345,8 @@ class Alt:
                 if now<self.rescan_at.get(unit,0):
                     continue
                 return self.place(unit,img)
-            return f"{placement_label(outstanding[0])} · повторю поиск по периметру дороги"
+            area = "по периметру дороги" if first in EARLY else "в зоне титанов"
+            return f"{placement_label(outstanding[0])} · повторю поиск {area}"
         return self.upgrade_tick(img)
 
     def join_private(self, request):
