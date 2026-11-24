@@ -61,6 +61,20 @@ TITAN_OFFSETS = ((0,0),(.09,0),(-.09,0),(.16,0),(-.16,0),
 TITAN_SPARES = tuple((progress, outward) for outward in (0, 28, 54)
                      for progress in (0, .25, .5, .75, 1))
 
+# Distances in map pixels. Continue along the same bank when wrecks or towers
+# obstruct the original patch. The two strips on the same side stay separate.
+TITAN_BANK_GRID = tuple((along,outward) for along in range(-80,81,20)
+                        for outward in (0,20,40,60,80))
+TITAN_LANE_GRID = tuple((fraction,outward) for fraction in (.10,.22,.34,.46,.58,.70,.82,.94)
+                        for outward in (10,35,65,80))
+
+# Rounded canonical positions confirmed by personal counters in played matches.
+CONFIRMED_TITAN_SITES = {
+    1: {"amplifier":(1278,646)},
+    2: {"amplifier":(1024,720),"screen":(1180,797)},
+    3: {"amplifier":(1590,906),"screen":(1570,826)},
+}
+
 
 def mix(a, b, fraction):
     return [x + (y - x) * fraction for x, y in zip(a, b)]
@@ -119,7 +133,7 @@ def bank_slot(player, unit, attempt=0):
 def placement_attempts(unit):
     if unit.partition("_")[0] in EARLY:
         return 5+len(SPARE_BANKS)+len(SHARED_BANKS)
-    return len(TITAN_OFFSETS)+len(TITAN_SPARES)
+    return len(TITAN_OFFSETS)+len(TITAN_SPARES)+len(TITAN_LANE_GRID)+len(TITAN_BANK_GRID)
 
 
 def position(player, unit, attempt=0):
@@ -131,8 +145,15 @@ def position(player, unit, attempt=0):
     if attempt < len(TITAN_OFFSETS):
         along, outward = TITAN_OFFSETS[attempt]
         progress = max(0, min(1, progress + along))
-    else:
+    elif attempt<len(TITAN_OFFSETS)+len(TITAN_SPARES):
         progress, outward = TITAN_SPARES[attempt - len(TITAN_OFFSETS)]
+    else:
+        index = attempt-len(TITAN_OFFSETS)-len(TITAN_SPARES)
+        if index<len(TITAN_LANE_GRID):
+            progress,outward = TITAN_LANE_GRID[index]
+        else:
+            extension,outward = TITAN_BANK_GRID[index-len(TITAN_LANE_GRID)]
+            progress = (0 if extension<0 else 1)+extension/math.dist(a,b)
     base = mix(a,b,progress)
     side = -1 if player==2 else 1
     return [v+side*outward*n for v,n in zip(base,BRANCH)]
@@ -232,7 +253,7 @@ class AltConnection:
 
 
 class Match:
-    def __init__(self):
+    def __init__(self, titan_sites=None):
         self.lock = threading.RLock()
         self.keys = {i: secrets.token_urlsafe(18) for i in PLAYERS}
         self.pins = {}
@@ -246,6 +267,16 @@ class Match:
         self.host = ""
         self.places = {}
         self.rejections = {}
+        self.titan_sites = {}
+        if isinstance(titan_sites,dict):
+            for player in PLAYERS:
+                for unit in ("amplifier","screen"):
+                    key = f"{player}/{unit}"
+                    point = titan_sites.get(key)
+                    if (isinstance(point,(tuple,list)) and len(point)==2
+                            and all(type(v) in (int,float) and math.isfinite(v) for v in point)
+                            and any(math.dist(point,position(player,unit,i))<1 for i in range(placement_attempts(unit)))):
+                        self.titan_sites[key] = list(point)
         self.pending = {}
         self.frames = {}
         self.results = {}
@@ -415,6 +446,7 @@ class Match:
             summon = self.summons.get(player)
             op = req.get("op","poll")
             sites = None
+            preferred_site = None
             claimed = None
             if op == "summon_result":
                 if summon and summon["id"] == req.get("id") and summon["instance"] == owner:
@@ -435,6 +467,7 @@ class Match:
                         raise ValueError("Неизвестный юнит")
                     locate = bank_slot if unit.partition("_")[0] in EARLY else position
                     sites = [locate(player,unit,i) for i in range(placement_attempts(unit))]
+                    preferred_site = self.titan_sites.get(f"{player}/{unit}",CONFIRMED_TITAN_SITES[player].get(unit))
                 elif op in ("reserve","release","commit"):
                     unit = req["unit"]
                     place = self.places[player,unit]
@@ -461,6 +494,9 @@ class Match:
                             self.rejections[footprint_class(unit),tuple(place["target"])] = now+REJECTION_SECONDS
                         place.pop("target",None)
                     elif place.get("target") == req["point"]:
+                        if (unit in ("amplifier","screen") and place["state"]!="placed" and place.get("slot")
+                                and (place.get("count_before") is not None or place.get("total_before") is not None)):
+                            self.titan_sites[f"{player}/{unit}"] = list(place["target"])
                         place.update(point=place.pop("target"),state="placed")
                     elif place["state"] != "placed" or place["point"] != req["point"]:
                         raise ValueError("Резерв не подтверждён")
@@ -494,7 +530,7 @@ class Match:
                 self.results[player] = "Время истекло; результат не подтверждён"
                 cmd = None
             return dict(run="" if player in self.recalled else self.run,
-                        rejected_sites=recent_sites(self.rejections,now),
+                        rejected_sites=recent_sites(self.rejections,now),preferred_site=preferred_site,
                         summon={"id":summon["id"],"link":summon["link"]} if summon and summon["instance"]==owner else None,
                         afk_auto=self.afk_auto, placement_sites=True, placement_totals=True, sites=sites, mode=self.mode,host=self.host,places=list(self.places.values()),claimed=claimed,
                         vote_seconds=max(0,self.vote_until-now) if self.vote_owner==player else 0,

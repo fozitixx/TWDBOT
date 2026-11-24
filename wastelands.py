@@ -67,7 +67,8 @@ class App:
         if self.standalone:
             root.title("TWD · Wastelands")
             root.minsize(760,420)
-        self.match = Match()
+        self.match = Match(prefs.get("titan_sites"))
+        self.saved_titan_sites = dict(self.match.titan_sites)
         self.server = self.worker = self.listener = None
         self.stop = threading.Event()
         self.messages = queue.SimpleQueue()
@@ -260,8 +261,11 @@ class App:
 
     def remember(self):
         if self.save_prefs:
+            with self.match.lock:
+                self.saved_titan_sites = dict(self.match.titan_sites)
             self.save_prefs(dict(address=self.addr.get().strip(),peer_address=self.peer_addr.get().strip(),host=self.host.get().strip(),
                                  mode=self.mode.get(),afk_auto=self.afk_auto.get(),slots={u:v.get() for u,v in self.slot_vars.items()},
+                                 titan_sites=self.saved_titan_sites,
                                  role="alt" if self.tabs.select()==str(self.client) else "main"))
 
     def active(self):
@@ -540,6 +544,8 @@ class App:
 
     def render_players(self):
         now = time.monotonic()
+        if self.save_prefs and self.saved_titan_sites!=self.match.titan_sites:
+            self.remember()
         with self.match.lock:
             running = bool(self.match.run)
             if running != self._run_view:

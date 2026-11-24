@@ -9,6 +9,7 @@ from PIL import Image, ImageDraw, ImageGrab, ImageOps
 from pynput import mouse
 
 import twd_bot as farm
+from wastelands_manager import manager_bounds, titan_cards, upgrade_price
 from wastelands_team import (ABILITIES, BANK_OFFSET, EARLY, EARLY_CLEARANCE, REJECTION_SECONDS,
                             PLACEMENT_ORDER, SPARE_BANKS, Wait, bank_slot, footprint_class, near_rejection, placement_conflict,
                             placement_label, position, private_server_links, recent_sites)
@@ -126,15 +127,6 @@ def level(row):
     return None
 
 
-def manager_bounds(img):
-    rgb=np.asarray(img.convert("RGB")).astype(np.int16)
-    r,g,b=rgb.transpose(2,0,1)
-    cyan=((g>130)&(b>140)&(g-r>65)&(b-r>65)).astype(np.uint8)
-    boxes = color_boxes(cyan)
-    return max((p for p in boxes if .20*img.width<p[2]<.82*img.width and p[3]>.45*img.height),
-               key=lambda p:p[2]*p[3],default=None)
-
-
 MANAGER_TITLES = {
     "scientistscreenman":"tv", "scientisttvman":"tv",
     "herocamcorderman20":"plunger", "plungercameraman20":"plunger",
@@ -192,11 +184,11 @@ def visual_manager_total(panel):
     header = farm.crop_frac(panel,(.014,.044,.28,.091)).convert("RGB")
     white = np.asarray(header).min(axis=2)
     readings = []
-    for threshold in (172,200):
+    for threshold in (110,123,150,172,200):
         mask = white>threshold
         ys = np.flatnonzero(mask.any(axis=1))
         if not len(ys):
-            return None
+            continue
         height = ys[-1]-ys[0]+1
         runs = farm._runs(mask.any(axis=0))
         # The title is several letters wide. Space before the number is
@@ -205,15 +197,15 @@ def visual_manager_total(panel):
                 and 2*height<runs[i-1][1]-runs[0][0]<7*height
                 and runs[-1][1]-left<=2.1*height]
         if not gaps:
-            return None
+            continue
         gap,left = max(gaps)
         if not .16*height<=gap<=1.3*height or height<6:
-            return None
-        total = farm._read_green_number(mask[:,left:],tol=.13,dollar=False)
+            continue
+        total = farm._read_green_number(mask[:,left:],tol=.16 if threshold<130 else .13,dollar=False)
         if total is None or total>99:
-            return None
+            continue
         readings.append(total)
-    return readings[0] if readings[0]==readings[1] else None
+    return readings[0] if len(readings)>=2 and len(set(readings))==1 else None
 
 
 def manager_unit_count(words, kind, limit, total=None):
@@ -353,6 +345,8 @@ class Alt:
         self.points = {}
         self.team_places = state.get("places",[])
         self.sites = {}
+        self.preferred_titans = {}
+        self.failed_titan_sites = {}
         self.rescan_at = {}
         self.local_rejections = {}
         self.team_rejections = state.get("rejected_sites",())
@@ -370,8 +364,10 @@ class Alt:
         self.ocr_retry = 0
         self.funded_lease = None
         self.retry = state["progress"].get("retry",0)
-        self.levels = {"amplifier":0,"screen":0}
-        self.wait_cash = 0
+        self.levels = {"amplifier":None,"screen":None}
+        self.upgrade_note = ""
+        self.upgrade_cost = None
+        self.check_price_at = 0
         self.next_upgrade = 0
         self.game.holding = None
         self.pose = self.shot = None
@@ -581,7 +577,10 @@ class Alt:
     def placement_sites(self,unit):
         if unit not in self.sites:
             if self.host_sites:
-                self.sites[unit] = self.exchange("placement_sites",unit=unit)["sites"]
+                plan = self.exchange("placement_sites",unit=unit)
+                self.sites[unit] = plan["sites"]
+                if unit in ("amplifier","screen") and plan.get("preferred_site"):
+                    self.preferred_titans[unit] = plan["preferred_site"]
             else:
                 locate = bank_slot if unit.partition("_")[0] in EARLY else position
                 # Older coordinators only know the original five titan candidates.
@@ -661,27 +660,31 @@ class Alt:
                     raise Wait("Проверка AFK на экране")
                 bounds = manager_bounds(frame)
                 panel = None
-                total = None
+                total = count = None
                 if bounds:
                     x,y,w,h = bounds
                     panel = frame.crop((x,y,x+w,y+h))
-                    total = manager_total(self.placement_text(panel,(0,.035,.29,.115),zoom=4))
+                    total = visual_manager_total(panel)
                     if total is None:
-                        total = visual_manager_total(panel)
-                if total is None:
-                    # A compressed or clipped border need not hide the UNITS label.
+                        total = manager_total(self.placement_text(panel,(0,.035,.29,.115),zoom=4))
+                    if limit==1 and kind in titan_cards(frame,self.placement_text,bounds):
+                        count = 1
+                if total is None and count is None:
                     words = self.placement_text(frame,(0,0,1,.32))
                     if label(words,"UNIT MANAGER"):
                         total = manager_total(words)
-                if total is None:
-                    previous = UnitCounts()
-                    continue
-                count = 0 if total==0 else None
-                if cards and total and panel is not None:
+                if total==0 and count is None:
+                    count = 0
+                elif cards and count is None and total and panel is not None:
                     count = manager_unit_count(self.placement_text(panel),kind,limit,total)
-                if previous.total==total:
-                    return UnitCounts(count if previous.slot==count else None,total)
-                previous = UnitCounts(count,total)
+                current = UnitCounts(count,total)
+                if total is not None and count is not None and total<count:
+                    current = UnitCounts()
+                if current.known() and current==previous:
+                    return current
+                if total is not None and previous.total==total and current.total==total:
+                    return UnitCounts(None,total)
+                previous = current
             return UnitCounts()
         finally:
             self.close_manager()
@@ -702,13 +705,18 @@ class Alt:
             count = None
         if count==limit or (count is not None and not self.host_totals):
             return UnitCounts(count)
-        if recent_total is not None:
+        # A stale zero can persist over the icon after a titan was placed.
+        # After a rejected titan click, consult the actual roster before another.
+        verify_titan = limit==1 and bool(self.failed_titan_sites)
+        if recent_total is not None and not verify_titan:
             if count is not None and recent_total>=count:
                 return UnitCounts(count,recent_total)
             if count is None and recent_total==len(self.placed):
                 # Every unit in the calibrated roster belongs to a confirmed row.
                 return UnitCounts(confirmed,recent_total)
         manager = self.manager_counts(kind,limit,cards=count is None)
+        if limit==1 and manager.slot==1:
+            return UnitCounts(1,manager.total if self.host_totals else None)
         if manager.slot is not None and manager.slot<confirmed:
             return UnitCounts()
         if count is None:
@@ -739,6 +747,9 @@ class Alt:
         elif count is not None:
             self.manager_until.pop(kind,None)
         if count is not None and manager.slot is not None and count!=manager.slot:
+            if (limit==1 and manager.slot==1 and before.slot==0 and before.total is not None
+                    and manager.total==before.total+1):
+                return manager
             return UnitCounts()
         return UnitCounts(count if count is not None else manager.slot,manager.total)
 
@@ -772,6 +783,9 @@ class Alt:
         if not delta:
             cooldown = REJECTION_SECONDS if funded else 18
             self.local_rejections[footprint_class(unit),tuple(point)] = time.monotonic()+cooldown
+            if kind not in EARLY and funded:
+                site = tuple(point)
+                self.failed_titan_sites[site] = self.failed_titan_sites.get(site,0)+1
         self.confirm = (op,unit,point,since,not delta and funded)
         self.exchange(op,unit=unit,point=point,target_since=since,site_failed=not delta and funded)
         self.confirm = None
@@ -885,15 +899,26 @@ class Alt:
             # Prefer the unit's assigned part of the bank and leave open planned
             # sites to their owners when equally clear ground is available.
             cost = min(math.dist(point,home)/250,1)*(.50 if early else .20)
+            if not early:
+                learned = self.preferred_titans.get(unit)
+                if learned and math.dist(point,learned)<1:
+                    cost -= .42
             if any(math.dist(point,p)<EARLY_CLEARANCE for p in other_plans):
                 cost += .24
             preference.append(cost)
         ranked = rank_build_sites(frame,pose,available,12 if early else 24,preference)
+        if not early and self.failed_titan_sites:
+            # The team cooldown expires, but this helper still explores unused
+            # ground before retrying the exact same wreck later in this match.
+            ranked.sort(key=self.titan_misses)
         if early and len(ranked)>1:
             needed = sum(p["unit"].partition("_")[0] in EARLY and p["state"]!="placed" and not p.get("target")
                          for p in self.team_places)
             ranked = preserve_bank_capacity(ranked,needed)
         return ranked,visible,busy,rejected
+
+    def titan_misses(self,point):
+        return sum(count for site,count in self.failed_titan_sites.items() if math.dist(point,site)<25)
 
     def place(self,unit,img):
         kind = unit.partition("_")[0]
@@ -937,6 +962,10 @@ class Alt:
                     return self.wait_for_check(f"{name} · вернул камеру, повторно сверяю дорогу",.8)
                 return self.wait_for_check(f"{name} · сверяю положение камеры по дороге и обломкам",1)
             candidates,visible,busy,rejected = self.candidate_sites(unit,snap,pose,sites)
+            if kind not in EARLY and self.failed_titan_sites and (not candidates or self.titan_misses(candidates[0])):
+                unexplored = [point for point in sites if not self.titan_misses(point)]
+                if unexplored and self.reframe_sites(unit,snap,pose,unexplored):
+                    return self.wait_for_check(f"{name} · повернул камеру к новому участку, сверяю карту",.5)
             for point in candidates:
                 pt = screen_point(pose,point)
                 try:
@@ -1009,41 +1038,116 @@ class Alt:
                 raise Wait("Не удалось закрыть Unit Manager")
         self.needs_close = False
 
-    def manager(self, unit, action, target=None):
-        cash = placement_cash(self.game.grab(),self.placement_text) if action=="Upgrade" else None
+    def read_titan_list(self,frame,required,upgrading):
+        bounds = manager_bounds(frame)
+        cards = titan_cards(frame,self.placement_text,bounds) if bounds else {}
+        incomplete = upgrading and any(c.level is None or (c.level<8 and not c.button) for c in cards.values())
+        if bounds and (not required.issubset(cards) or incomplete):
+            # Rarity puts the titans first; an already selected sort may still
+            # have a scroll offset from a previous manual visit.
+            x,y,w,h = bounds
+            fw,fh = frame.size
+            header = (x/fw,y/fh,(x+w)/fw,(y+.105*h)/fh)
+            words = self.placement_text(frame,header,zoom=4)
+            sort = label(words,"Rarity") or label(words,"Редкость")
+            if sort:
+                self.game.click(sort)
+            self.game.hover(((x+.5*w)/fw,(y+.40*h)/fh))
+            self.game.m.scroll(0,12)
+            self.game.sleep(.22)
+            frame = self.game.grab()
+            if farm.afk_panel(frame):
+                raise Wait("Проверка AFK на экране")
+            cards = titan_cards(frame,self.placement_text)
+        return frame,cards
+
+    def improve_titans(self,frame,cards,cash):
+        for kind,card in cards.items():
+            if card.level is not None:
+                self.levels[kind] = card.level
+        for kind in self.levels:
+            if kind not in cards or cards[kind].level is None:
+                return f"Сверяю карточку и уровень {kind.title()}"
+        unit = min(self.levels,key=self.levels.get)
+        card = cards[unit]
+        old = card.level
+        if old==8:
+            return "Улучшения завершены"
+        if not card.button:
+            return f"Жду кнопку Upgrade у {unit.title()}"
+        cost = upgrade_price(frame,card,self.placement_text)
+        same_price = self.upgrade_cost==(unit,old,cost)
+        if cost is not None and cash is not None and cash<cost and not (same_price and time.monotonic()>=self.check_price_at):
+            self.upgrade_cost = (unit,old,cost)
+            self.check_price_at = time.monotonic()+8
+            return f"Коплю на {unit.title()} · нужно ${cost:,}"
+        self.upgrade_cost = None
+        def current(image):
+            if farm.afk_panel(image) or image.size!=frame.size:
+                return None
+            live = titan_cards(image,self.placement_text).get(unit)
+            if live and live.level==old and live.upgrade_contains(image,card.button):
+                return card.button
+            return None
+        self.game.click_live(card.button,current,f"Upgrade {unit.title()}")
+        for delay in (.20,.22,.30):
+            self.game.sleep(delay)
+            after = self.game.grab()
+            if farm.afk_panel(after):
+                break
+            updated = titan_cards(after,self.placement_text).get(unit)
+            if updated and updated.level is not None and updated.level!=old:
+                self.levels[unit] = updated.level
+                self.next_upgrade = time.monotonic()+.65
+                message = (f"{unit.title()} · уровень {old} → {updated.level}" if updated.level==old+1
+                           else f"Сверил {unit.title()} · в игре уровень {updated.level}")
+                farm.log(f"Wastelands · твинк {self.player} · {message}")
+                return message
+        self.next_upgrade = time.monotonic()+2
+        return f"Проверю результат Upgrade у {unit.title()}"
+
+    def upgrade_tick(self,img):
+        now = time.monotonic()
+        if all(value==8 for value in self.levels.values()):
+            self.upgrade_note = "Улучшения завершены"
+        elif now>=self.next_upgrade:
+            cash = placement_cash(img,self.placement_text)
+            waiting = self.upgrade_cost
+            self.next_upgrade = now+1.5
+            if (waiting and self.levels[waiting[0]]==waiting[1] and cash is not None
+                    and cash<waiting[2] and now<self.check_price_at):
+                self.upgrade_note = f"Коплю на {waiting[0].title()} · ${cash:,} из ${waiting[2]:,}"
+            else:
+                self.upgrade_note = self.manager(None,"Upgrade",cash=cash)
+        known = [f"{name.title()} ур. {value}/8" for name,value in self.levels.items() if value is not None]
+        return " · ".join(["Титаны 2/2",*known,self.upgrade_note or "Сверяю уровни"])
+
+    def manager(self, unit, action, target=None, *, cash=None):
         self.needs_close = True
         try:
-            if not self.header(self.game.grab()):
-                self.game.key("v")
-                self.game.sleep(.28)
             img = self.game.grab()
-            words = self.text(img)
-            if not label(words,"UNIT MANAGER",(0,0,1,.32)):
-                return "Unit Manager не распознан"
-            row = manager_card(img,words,unit)
-            if not row and label(words,"Rarity"):
-                self.game.click(label(words,"Rarity"))
-                self.game.sleep(.20)
+            if farm.afk_panel(img):
+                raise Wait("Проверка AFK на экране")
+            if not manager_bounds(img) and not self.header(img):
+                self.game.key("v")
+                self.game.sleep(.24)
                 img = self.game.grab()
-                row = manager_card(img,self.text(img),unit)
-            if not row:
-                return "Карточка титана не видна целиком"
-            lvl = level(row)
-            if lvl is not None:
-                self.levels[unit]=lvl
+            if farm.afk_panel(img):
+                raise Wait("Проверка AFK на экране")
+            required = set(self.levels) if action=="Upgrade" else {unit}
+            if not manager_bounds(img) and not self.header(img):
+                return "Жду открытия Unit Manager"
+            img,cards = self.read_titan_list(img,required,action=="Upgrade")
+            if action=="Upgrade":
+                return self.improve_titans(img,cards,cash)
+            def ability_row(frame,card):
+                if card:
+                    box = tuple(v/s for v,s in zip(card.box,frame.size*2))
+                    return self.placement_text(frame,box,zoom=4)
+                # Older panels may be identified by their text and red outline.
+                return manager_card(frame,self.placement_text(frame),unit) or []
+            row = ability_row(img,cards.get(unit))
             button = label(row,action)
-            if action == "Upgrade":
-                if lvl is None or lvl>=8 or unit!=min(self.levels,key=self.levels.get):
-                    return "Уровни сверены"
-                if not button:
-                    return "Улучшение недоступно"
-                prices = [v[0] for v in row if v[1]>button[0] and abs(v[2]+v[4]/2-button[1])<v[4]*.75]
-                cost = re.search(r'\$\s*([\d,]+)'," ".join(prices))
-                if not cost:
-                    return "Не прочитал цену улучшения"
-                self.wait_cash = int(cost[1].replace(",",""))
-                if cash is not None and cash<self.wait_cash:
-                    return f"Коплю {self.wait_cash} на {unit}"
             if not button:
                 return "Способность закрыта или не распознана"
             if action in ABILITIES:
@@ -1067,17 +1171,8 @@ class Alt:
                 self.game.sleep(.4)
                 after=self.game.grab()
                 return "Перенос подтверждён" if not manager_bounds(after) and not self.header(after) else "Перенос не подтверждён"
-            if action=="Upgrade":
-                frame = self.game.grab()
-                updated = manager_card(frame,self.text(frame),unit)
-                actual = level(updated or [])
-                if actual is not None and actual>lvl:
-                    self.levels[unit] = actual
-                    self.wait_cash = 0
-                    return f"{unit} · уровень {actual}/8"
-                return f"{unit}: уровень не изменился или не прочитан"
             frame=self.game.grab()
-            after=manager_card(frame,self.text(frame),unit)
+            after=ability_row(frame,titan_cards(frame,self.placement_text).get(unit))
             if after and countdown(after,action,button):
                 return f"{action}: сработало · началась перезарядка"
             return f"{action}: нажато, срабатывание не подтверждено"
@@ -1181,6 +1276,7 @@ class Alt:
             self.sites.clear()
             self.rescan_at.clear()
             self.local_rejections.clear()
+            self.failed_titan_sites.clear()
             self.retry = state["progress"]["retry"]
         if self.phase=="lobby":
             return self.lobby(state,img)
@@ -1231,13 +1327,7 @@ class Alt:
                     continue
                 return self.place(unit,img)
             return f"{placement_label(outstanding[0])} · повторю поиск по периметру дороги"
-        if min(self.levels.values())<8 and time.monotonic()>self.next_upgrade:
-            self.next_upgrade = time.monotonic()+4
-            cash = placement_cash(img,self.placement_text)
-            if cash is None or cash>=self.wait_cash:
-                unit = min(self.levels,key=self.levels.get)
-                return self.manager(unit,"Upgrade")
-        return f"Amplifier {self.levels['amplifier']}/8 · Screen {self.levels['screen']}/8"
+        return self.upgrade_tick(img)
 
     def join_private(self, request):
         # An ACK can be lost after Windows has already opened the link.
