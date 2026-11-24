@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "6.0.16 (Wasteland: голосование и расстановка)"
+VERSION = "6.0.17 (Wasteland: голосование и расстановка)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2206,12 +2206,13 @@ _update_checked = 0.0
 # 5.x updates only the entry script. These Git blob IDs identify the exact
 # companion files for this version, even after the release branch moves on.
 # Pin the raw download to a commit containing this entire set of files.
-TEAM_REVISION = "676ce2d51d524e38339b06e2bb611890383a592c"
+TEAM_REVISION = "91beefd839c5cf39136540644dd769ce1db71d97"
 TEAM_FILES = {
-    "wastelands.py": "6dcb7574eeb358c0e49c7f8d85aaee8e1bd12e73",
-    "wastelands_alt.py": "0e98df7710cc4d731a45210091ed09b4593de6d8",
+    "wastelands_hotbar.png": "34ec85ea4c91b77596b2fb1c6a22b204332d242b",
+    "wastelands.py": "3a7c24713b93d669a541db3a7ca83be3768ff3d4",
+    "wastelands_alt.py": "3a28f61f9686a32f7b597c9207cc320f2491a99c",
     "wastelands_team.py": "75222e81172fc7a012ea6652e24429ebfdf59c98",
-    "wastelands_view.py": "011967ecd7dd348d3236f260d8e6994b383aa383",
+    "wastelands_view.py": "a8fb45e647a0ae0c09fd4ae182c1abbe0323e23b",
     "wastelands_ocr.ps1": "496e34e723f8a27cd6993fc72f826f398459b5b9",
 }
 

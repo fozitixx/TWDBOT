@@ -426,7 +426,7 @@ class NetworkTest(unittest.TestCase):
         with self.assertRaises(Wait):
             self.alts[0].exchange("commit",unit="screen",point=[1150,540])
 
-    def test_unconfirmed_early_unit_does_not_block_titan(self):
+    def test_unconfirmed_plunger_blocks_later_stages(self):
         a=self.alts[0]
         a.phase="battle"
         for unit in PLACEMENT_ORDER:
@@ -438,10 +438,43 @@ class NetworkTest(unittest.TestCase):
         a.exchange("reserve",unit="plunger_4",point=target)
         frame=Image.new("RGB",(1366,768))
         with patch.object(a.game,"grab",return_value=frame),patch.object(a,"place",return_value="placing") as place:
-            self.assertEqual(a.tick(a.exchange()),"placing")
-            self.assertEqual(place.call_args.args[0],"amplifier")
+            self.assertIn("Plunger",a.tick(a.exchange()))
+            place.assert_not_called()
         self.assertEqual(a.pending_places,{"plunger_4"})
         self.assertEqual(self.match.places[1,"plunger_4"]["target"],target)
+
+    def test_plunger_slot_backoff_and_exhaustion_never_select_tv(self):
+        a=self.alts[0]
+        a.phase="battle"
+        a.slot_wait_until["plunger"]=time.monotonic()+10
+        frame=Image.new("RGB",(1366,768))
+        with patch.object(a.game,"grab",return_value=frame),patch.object(a,"place") as place:
+            self.assertIn("счётчик",a.tick(a.exchange()))
+            place.assert_not_called()
+            a.slot_wait_until.clear()
+            for u in PLACEMENT_ORDER[:4]:
+                a.sites[u]=[position(a.player,u)]
+                a.attempt[u]=1
+            self.assertIn("поиск",a.tick(a.exchange()))
+            place.assert_not_called()
+            a.rescan_at["plunger"]=0
+            a.tick(a.exchange())
+            self.assertEqual(place.call_args.args[0],"plunger")
+            a.full_early.add("plunger")
+            a.tick(a.exchange())
+            self.assertEqual(place.call_args.args[0],"tv")
+
+    def test_all_three_vote_ready_while_plunger_is_unavailable(self):
+        frame=Image.new("RGB",(1366,768))
+        ImageDraw.Draw(frame).rectangle((611,120,755,167),fill=(0,155,0))
+        for i,a in enumerate(self.alts):
+            a.phase="battle"
+            a.slot_wait_until["plunger"]=time.monotonic()+10
+            with patch.object(a.game,"grab",return_value=frame),patch.object(a.game,"click_live") as click, \
+                 patch.object(a,"vote_reading",side_effect=[((i,4),None),((i+1,4),None)]):
+                a.tick(a.exchange())
+                click.assert_called_once()
+                self.assertTrue(a.exchange()["progress"]["ready"])
 
     def test_host_assigns_titan_alternatives_for_all_three_alts(self):
         for a in self.alts:
@@ -602,7 +635,7 @@ class NetworkTest(unittest.TestCase):
             for _ in range(27):
                 a.next_upgrade=0
                 a.tick(a.exchange())
-        self.assertEqual(calls,["plunger","ready","plunger_2","plunger_3","plunger_4",
+        self.assertEqual(calls,["ready","plunger","plunger_2","plunger_3","plunger_4",
                                 "tv","tv_2","tv_3","tv_4","amplifier","screen"]+["amplifier","screen"]*8)
 
     def test_blocked_then_paid_placement(self):
@@ -643,6 +676,21 @@ class NetworkTest(unittest.TestCase):
 
 
 class VisionTest(unittest.TestCase):
+    def test_hotbar_portraits_find_reordered_units_and_reject_ambiguous_layout(self):
+        from wastelands_view import wastelands_slots
+        with Image.open(Path(__file__).with_name("wastelands_hotbar.png")) as refs:
+            icons = [refs.crop((x,0,x+32,32)).resize((50,52),Image.Resampling.BILINEAR)
+                     for x in range(0,128,32)]
+        frame = Image.new("RGB",(1366,768),(41,37,48))
+        def put(slot,icon):
+            x=round(frame.width*.5+(slot-3.5)*.13*frame.height)
+            frame.paste(icon,(x-25,round(frame.height*.874)-26))
+        for slot,icon in zip((6,1,4,3),icons):
+            put(slot,icon)
+        self.assertEqual(wastelands_slots(frame),dict(amplifier=6,screen=1,plunger=4,tv=3))
+        put(2,icons[3])
+        self.assertIsNone(wastelands_slots(frame))
+
     def test_printed_cooldown_is_not_active_timer(self):
         row=[("45s",.3,.4,.03,.02),("cooldown",.34,.4,.05,.02)]
         self.assertIsNone(countdown(row,"Aerial Attack",(.36,.38)))
