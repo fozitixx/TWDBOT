@@ -506,7 +506,7 @@ def framing_turn(pose, sites, size, avoid_sign=0, *, radius=0):
     return best
 
 
-def rank_build_sites(img, pose, sites, radius, preference, *, clear_titan_base=False):
+def rank_build_sites(img, pose, sites, radius, preference, *, clear_titan_base=False, occupied_centers=None):
     """Score sand and texture under each projected base, using the current frame."""
     if not sites:
         return []
@@ -529,12 +529,23 @@ def rank_build_sites(img, pose, sites, radius, preference, *, clear_titan_base=F
         ground = ((r>=54)&(r-g>=.09*r)&(r-g<=.32*r)&(g-b>=.19*r)
                   &(r-b>=.42*r)&(r-b<=.63*r))
         center = (footprint**2).sum(1)<=(radius/2)**2
+        visible_ground = np.ones_like(ground)
+        if occupied_centers is not None:
+            # Only a confirmed small base may hide this disk. Test all the
+            # surrounding sand and repeat the whole-base check after the sale.
+            offsets = points[:,None]+footprint-np.asarray(occupied_centers)[:,None]
+            visible_ground = (offsets**2).sum(2)>13**2
+            sampled = np.where(visible_ground,g,np.nan)
+            spread = np.nanpercentile(sampled,90,axis=1)-np.nanpercentile(sampled,10,axis=1)
+        def enough(mask, fraction):
+            sampled = visible_ground[:,mask]
+            return (ground[:,mask] & sampled).sum(1)>=fraction*sampled.sum(1)
         clear = ((visible & placement_in_view(x/img.width,y/img.height)).all(1)
-                 & (ground.mean(1)>=.86) & (ground[:,center].mean(1)>=.94)
+                 & (visible_ground.mean(1)>=.70) & enough(slice(None),.86) & enough(center,.94)
                  & (spread<=np.maximum(22,.32*np.median(g,axis=1))))
         for sx,sy in ((1,1),(-1,1),(-1,-1),(1,-1)):
             quarter = (sx*footprint[:,0]>=0)&(sy*footprint[:,1]>=0)
-            clear &= ground[:,quarter].mean(1)>=.72
+            clear &= enough(quarter,.72)
         order = order[clear[order]]
     return [sites[index] for index in order]
 

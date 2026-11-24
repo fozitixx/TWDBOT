@@ -2,18 +2,23 @@
 import base64
 import io
 import ipaddress
+import os
 import queue
 import re
 import socket
+import tempfile
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+import zipfile
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
 
-from twd_bot import C, FONT, SETTINGS
-from wastelands_team import ABILITIES, AltConnection, Match, PLAYERS, PORT, UNITS, Wait, connect_by_pin, placement_label, serve
+from twd_bot import C, FONT, SETTINGS, team_profile_dir
+from wastelands_pairing import PairingProfile, valid_key
+from wastelands_team import ABILITIES, AltConnection, Match, PairingExpired, PLAYERS, PORT, UNITS, Wait, connect_by_pin, placement_label, serve
 
 
 def peer_host(value):
@@ -31,6 +36,26 @@ def peer_host(value):
                         for part in labels)):
             return value
         raise ValueError("Введи IP или сетевое имя компьютера основы.") from None
+
+
+def worker_logs(users_dir):
+    logs, missing = {}, []
+    for user in ("test","test2","test3"):
+        source = users_dir/user/"Desktop"/"TWDBOT-release"/"twd_log.txt"
+        try:
+            with source.open("rb") as f:
+                size = f.seek(0,os.SEEK_END)
+                f.seek(max(0,size-512*1024))
+                lines = f.read().decode("utf-8-sig",errors="replace").splitlines()
+        except OSError:
+            missing.append(user)
+            continue
+        tail = [s for s in lines if re.match(r"^\d\d:\d\d:\d\d (?:Wastelands · твинк [123] ·|TWD Farm [\d.]+ готов)",s)]
+        if tail:
+            logs[user] = "\n".join(tail[-350:])+"\n"
+        else:
+            missing.append(user)
+    return logs, missing
 
 
 def text(parent, value, *, size=10, color="text", bold=False, **options):
@@ -64,6 +89,16 @@ class App:
         self.mode_lock = mode_lock or threading.RLock()
         self.save_prefs = save_prefs
         prefs = prefs if isinstance(prefs,dict) else {}
+        self.profile = PairingProfile(team_profile_dir())
+        self.pair_lock = threading.Lock()
+        problem = ""
+        resume, peer = {}, {}
+        try:
+            resume = self.profile.read("resume.json")
+            peer = self.profile.peer()
+        except (ValueError,OSError):
+            problem = "Не удалось прочитать привязку. Для подключения введи новый PIN."
+        prefs = dict(prefs, **resume)
         if self.standalone:
             root.title("TWD · Wastelands")
             root.minsize(760,420)
@@ -106,15 +141,22 @@ class App:
         except OSError:
             addr = "127.0.0.1"
         self.addr = tk.StringVar(value=prefs.get("address") or addr)
-        self.peer_addr = tk.StringVar(value=prefs.get("peer_address",""))
+        self.peer_addr = tk.StringVar(value=peer.get("host") or prefs.get("peer_address",""))
         self.host = tk.StringVar(value=prefs.get("host",""))
         self.mode = tk.StringVar(value="hard" if prefs.get("mode")=="hard" else "nightmare")
         self.afk_auto = tk.BooleanVar(value=prefs.get("afk_auto",True))
+        self.allow_sales = tk.BooleanVar(value=prefs.get("allow_sales") is True)
         self._build_main()
         self._build_client(prefs)
         self._run_view = False
         if prefs.get("role")=="alt":
             tabs.select(self.client)
+        if problem:
+            self.status.configure(text=problem)
+        elif resume.get("role")=="alt" and peer:
+            root.after_idle(self.join)
+        elif resume.get("role")=="main":
+            root.after_idle(self.start_server)
         if self.standalone:
             root.protocol("WM_DELETE_WINDOW",self.close)
         self.timer = root.after(200,self.tick)
@@ -153,6 +195,7 @@ class App:
         self.ip_entry = field(line, textvariable=self.addr, width=16)
         self.ip_entry.pack(side="left", padx=8, ipady=3)
         text(line, "Имя ПК: " + socket.gethostname(), size=9, color="muted").pack(side="left")
+        button(line,"Собрать логи твинков",self.export_logs).pack(side="right")
 
         match = card(body)
         match.pack(fill="x", pady=(0, 6))
@@ -180,6 +223,10 @@ class App:
                        variable=self.afk_auto, bg=C["card"], fg=C["text"], selectcolor=C["entry"],
                        activebackground=C["card"], activeforeground=C["accent"], font=(FONT,9),
                        highlightthickness=0).grid(row=2,column=0,columnspan=2,sticky="w",pady=(4,0))
+        tk.Checkbutton(self.match_fields, text="Разрешить продажу мешающего Plunger или TV под титана",
+                       variable=self.allow_sales, bg=C["card"], fg=C["text"], selectcolor=C["entry"],
+                       activebackground=C["card"], activeforeground=C["accent"], font=(FONT,9),
+                       highlightthickness=0).grid(row=3,column=0,columnspan=2,sticky="w")
 
         top = tk.Frame(body, bg=C["bg"])
         top.pack(fill="x", pady=(2, 4))
@@ -220,7 +267,8 @@ class App:
         conn = card(self.client)
         conn.pack(fill="x",pady=(10,8))
         text(conn,"Подключение к основе",size=12,bold=True).pack(anchor="w")
-        text(conn,"На основе нажми «Показать PIN» в строке этого твинка.",size=9,color="muted").pack(anchor="w",pady=(3,5))
+        text(conn,"При первом подключении введи PIN с основы. Для повторного входа оставь поле пустым.",
+             size=9,color="muted").pack(anchor="w",pady=(3,5))
         fields = tk.Frame(conn,bg=C["card"])
         fields.pack(fill="x")
         text(fields,"IP или имя ПК основы",size=9,color="muted").grid(row=0,column=0,sticky="w")
@@ -253,9 +301,11 @@ class App:
         actions.pack(fill="x")
         self.join_button = button(actions,"Подключиться",self.join,primary=True)
         self.join_button.pack(side="left")
-        self.stop_client = button(actions,"Остановить · F6",self.stop.set)
+        self.stop_client = button(actions,"Остановить · F6",self.disconnect_client)
         self.stop_client.pack(side="left",padx=6)
         self.stop_client.configure(state="disabled")
+        self.forget_button = button(actions,"Забыть основу",self.forget_peer)
+        self.forget_button.pack(side="right")
         self.status = text(self.client,"Твинк отключён",color="muted",wraplength=475)
         self.status.pack(anchor="w",pady=10)
 
@@ -264,7 +314,8 @@ class App:
             with self.match.lock:
                 self.saved_titan_sites = dict(self.match.titan_sites)
             self.save_prefs(dict(address=self.addr.get().strip(),peer_address=self.peer_addr.get().strip(),host=self.host.get().strip(),
-                                 mode=self.mode.get(),afk_auto=self.afk_auto.get(),slots={u:v.get() for u,v in self.slot_vars.items()},
+                                 mode=self.mode.get(),afk_auto=self.afk_auto.get(),allow_sales=self.allow_sales.get(),
+                                 slots={u:v.get() for u,v in self.slot_vars.items()},
                                  titan_sites=self.saved_titan_sites,
                                  role="alt" if self.tabs.select()==str(self.client) else "main"))
 
@@ -277,26 +328,45 @@ class App:
         self.tabs.tab(self.main,state="disabled" if working else "normal")
         self.join_button.configure(state="disabled" if working else "normal")
         self.stop_client.configure(state="normal" if working else "disabled")
+        self.forget_button.configure(state="disabled" if working else "normal")
+
+    def disconnect_client(self):
+        self.stop.set()
+        if self.tabs.select()==str(self.client):
+            with self.pair_lock:
+                self.profile.forget("resume.json")
+
+    def forget_peer(self):
+        self.profile.forget("peer.key")
+        self.profile.forget("resume.json")
+        self.connection_code.set("")
+        self.status.configure(text="Привязка удалена. Для подключения введи PIN.")
 
     def start_server(self):
         if self.server:
             return
         try:
+            self.match.keys = self.profile.host_keys(self.match.keys)
             self.server = serve(self.match,(self.addr.get().strip(),PORT))
-        except OSError as exc:
+        except (OSError,ValueError) as exc:
             messagebox.showerror("Подключение",str(exc))
             return
         self.listen.configure(text="Выключить связь",command=self.disconnect_server)
         self.ip_entry.configure(state="readonly")
         self.network_state.configure(text="●  Включено",fg=C["accent"])
         self.refresh_tabs()
-        self.note.configure(text="Связь включена. Покажи PIN нужного твинка и введи его вместе с IP в RDP.")
+        self.note.configure(text="Связь включена. Знакомые твинки подключатся сами. Для нового твинка покажи PIN.")
+        try:
+            self.profile.write("resume.json",dict(role="main",address=self.addr.get().strip()))
+        except OSError as exc:
+            self.note.configure(text=f"Связь включена. Не удалось сохранить автозапуск: {exc}")
 
     def disconnect_server(self):
         self.match.stop()
         self.server.shutdown()
         self.server.server_close()
         self.server = None
+        self.profile.forget("resume.json")
         with self.match.lock:
             self.match.pins.clear()
             self.match.summons.clear()
@@ -327,7 +397,7 @@ class App:
             messagebox.showinfo("Матч","Сначала останови текущий матч помощника.")
             return
         try:
-            self.match.start(self.mode.get(),self.host.get(),afk_auto=self.afk_auto.get())
+            self.match.start(self.mode.get(),self.host.get(),afk_auto=self.afk_auto.get(),allow_sales=self.allow_sales.get())
             self.remember()
             self.note.configure(text="Пригласи твинков на Wastelands и запусти матч в Roblox с основы.")
             self.render_players()
@@ -371,10 +441,11 @@ class App:
             pin = None
             if "|" in raw:
                 parts = raw.split("|")
-                if len(parts)!=3 or parts[1] not in ("1","2","3") or not parts[0] or not parts[2]:
+                if len(parts)!=3 or parts[1] not in ("1","2","3") or not valid_key(parts[2]):
                     self.status.configure(text="Скопируй полный код на основе или введи IP и PIN вручную.")
                     return
                 host,num,key = parts
+                host = peer_host(host)
                 number = int(num)
             else:
                 try:
@@ -382,18 +453,24 @@ class App:
                 except ValueError as exc:
                     self.status.configure(text=str(exc))
                     return
-                pin = raw.replace(" ","")
-                if len(pin)!=8 or not pin.isascii() or not pin.isdigit():
+                if not raw:
+                    saved = self.profile.peer()
+                    if not saved or host.lower()!=saved["host"].lower():
+                        self.status.configure(text="Для первого подключения к этой основе введи её PIN.")
+                        return
+                    number,key = saved["player"],saved["key"]
+                elif len(raw.replace(" ",""))==8 and raw.replace(" ","").isascii() and raw.replace(" ","").isdigit():
+                    number,key,pin = None,None,raw.replace(" ","")
+                else:
                     self.status.configure(text="Введи все 8 цифр PIN, включая начальные нули.")
                     return
-                number = key = None
             slots = {u:int(v.get()) for u,v in self.slot_vars.items()}
             if len(set(slots.values()))!=4:
                 self.status.configure(text="У двух юнитов выбран один слот. Укажи четыре разных номера.")
                 return
             self.stop.clear()
             if self.standalone:
-                self.listener = keyboard.Listener(on_press=lambda k:self.stop.set() if k==keyboard.Key.f6 else None)
+                self.listener = keyboard.Listener(on_press=lambda k:self.root.after(0,self.disconnect_client) if k==keyboard.Key.f6 else None)
                 self.listener.start()
             self.worker = threading.Thread(target=self.worker_loop,args=(host,number,key,pin,slots),daemon=True)
             self.worker.start()
@@ -406,24 +483,39 @@ class App:
     def worker_loop(self,host,number,key,pin,slots):
         try:
             if pin is not None:
-                try:
-                    host = socket.gethostbyname(host)
-                except OSError as exc:
-                    raise ValueError("Не удалось найти основу по имени. Введи IP из её окна.") from exc
                 number,key = connect_by_pin(host,pin)
             connection = AltConnection(host, number, key)
             while not self.stop.is_set():
                 try:
                     connection.exchange(status="Загружаю распознавание")
+                except PairingExpired:
+                    raise
                 except Wait as exc:
                     self.messages.put(str(exc))
                     self.stop.wait(1)
                     continue
+                if hasattr(self,"profile"):
+                    try:
+                        with self.pair_lock:
+                            if self.stop.is_set():
+                                break
+                            self.profile.write("peer.key",dict(host=host,player=number,key=key))
+                            self.profile.write("resume.json",dict(role="alt",peer_address=host,slots=slots))
+                            self.messages.put(("paired",host))
+                    except OSError:
+                        self.messages.put(("save_error","Не удалось сохранить привязку в профиле Windows"))
                 self.messages.put(f"Твинк {number} на связи. Загружаю распознавание…")
                 from wastelands_alt import Alt
                 Alt(connection,slots,self.stop,self.messages.put).loop()
                 break
             self.messages.put("Твинк остановлен")
+        except PairingExpired as exc:
+            if hasattr(self,"profile"):
+                with self.pair_lock:
+                    if self.profile.peer()==dict(host=host,player=number,key=key):
+                        self.profile.forget("resume.json")
+                        self.profile.forget("peer.key")
+            self.messages.put(str(exc))
         except Exception as exc:
             self.messages.put(f"Твинк остановлен: {exc}")
 
@@ -448,6 +540,34 @@ class App:
             self.match.command(player,"snapshot" if name=="Teleport" else name)
         except ValueError as exc:
             self.note.configure(text=f"Твинк {player} · {exc}")
+
+    def export_logs(self):
+        users = Path(os.environ.get("SystemDrive","C:")+os.sep)/"Users"
+        logs, missing = worker_logs(users)
+        if not logs:
+            self.note.configure(text="Нет доступных записей Wastelands в папках test, test2 и test3.")
+            return
+        path = filedialog.asksaveasfilename(parent=self.root,title="Сохранить логи твинков",
+                defaultextension=".zip",filetypes=[("ZIP","*.zip")],initialfile="wastelands-logs.zip")
+        if path:
+            temp = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=Path(path).parent,delete=False) as output:
+                    temp = Path(output.name)
+                    with zipfile.ZipFile(output,"w",zipfile.ZIP_DEFLATED) as archive:
+                        for user,lines in logs.items():
+                            archive.writestr(user+"/twd_log.txt",lines)
+                os.replace(temp,path)
+            except OSError as exc:
+                self.note.configure(text=f"Не удалось сохранить логи: {exc}")
+                return
+            finally:
+                if temp is not None:
+                    temp.unlink(missing_ok=True)
+            message = "Логи сохранены: "+", ".join(logs)
+            if missing:
+                message += ". Нет доступных записей: "+", ".join(missing)
+            self.note.configure(text=message)
 
     def send_all(self):
         sent = []
@@ -491,6 +611,10 @@ class App:
             line.pack(fill="x")
             text(line,placement_label(unit),bold=True).pack(side="left")
             status = "Поставлен" if placed else "Место в плане"
+            if row["state"]=="sold":
+                status = "Продан под титана"
+            elif row.get("clear_site") and not placed:
+                status = "Место освобождено" if row.get("sale_used") else "Запрошено место под титана"
             if not placed and row.get("target"):
                 status = "Проверка постановки"
             text(line,status,size=9,
@@ -616,7 +740,15 @@ class App:
 
     def tick(self):
         while not self.messages.empty():
-            self.status.configure(text=self.messages.get())
+            item = self.messages.get()
+            if isinstance(item,tuple):
+                if item[0]=="paired":
+                    self.peer_addr.set(item[1])
+                    self.connection_code.set("")
+                else:
+                    messagebox.showwarning("Привязка",item[1])
+            else:
+                self.status.configure(text=item)
         if self.worker and not self.worker.is_alive():
             self.worker = None
             if self.listener:

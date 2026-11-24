@@ -196,18 +196,36 @@ def placement_conflict(player,unit,point,places):
     for other in places:
         if other["player"]==player and other["unit"]==unit:
             continue
-        both_early = unit.partition("_")[0] in EARLY and other["unit"].partition("_")[0] in EARLY
+        if other["state"]=="sold":
+            continue
+        other_early = other["unit"].partition("_")[0] in EARLY
+        both_early = unit.partition("_")[0] in EARLY and other_early
         clearance = EARLY_CLEARANCE if both_early else TITAN_CLEARANCE
         target = other.get("target")
         # The third helper's two titans can exchange unclaimed positions on
         # their small patch. Every pending or built base still owns its radius.
         same_titan_bank = (player==other["player"]==3 and unit in ("amplifier","screen")
                            and other["unit"] in ("amplifier","screen"))
-        protect_plan = other["state"]=="placed" or (not (both_early or same_titan_bank) and not target)
-        for occupied in (other["point"] if protect_plan else None, target):
+        protect_plan = other["state"]=="placed" or (not (other_early or same_titan_bank) and not target)
+        for occupied in (other["point"] if protect_plan else None, target, other.get("clear_site")):
             if occupied and math.dist(point, occupied) < clearance:
                 return "Рядом занят участок"
     return None
+
+
+def single_blocker(player, titan, point, places):
+    """Return the confirmed small tower whose removal alone frees this site."""
+    blocked = [p for p in places if p["unit"].partition("_")[0] in EARLY and p["state"]=="placed"
+               and math.dist(point,p["point"])<TITAN_CLEARANCE]
+    if len(blocked)!=1:
+        return None
+    tower = blocked[0]
+    if (tower.get("slot") is None or tower.get("target") or
+            (tower.get("count_before") is None and tower.get("total_before") is None)):
+        return None
+    if placement_conflict(player,titan,point,(p for p in places if p is not tower)):
+        return None
+    return tower
 
 
 def footprint_class(unit):
@@ -223,11 +241,16 @@ def recent_sites(history, now):
 
 def near_rejection(unit, point, sites):
     group = footprint_class(unit)
-    clearance = EARLY_CLEARANCE if group=="early" else 50
+    # An unsuccessful click proves only that spot. A real tower still owns 54.
+    clearance = EARLY_CLEARANCE if group=="early" else 18
     return any(group==other and math.dist(point,center)<clearance for other,center in sites)
 
 
 class Wait(Exception):
+    pass
+
+
+class PairingExpired(Wait):
     pass
 
 
@@ -263,7 +286,8 @@ class AltConnection:
         self.http = build_opener(ProxyHandler({}))
 
     def exchange(self, op="poll", *, run="", status="Подключение", **fields):
-        payload = dict(instance=self.instance, run=run, status=status, op=op, can_summon=True, uses_host_sites=True, **fields)
+        payload = dict(instance=self.instance, run=run, status=status, op=op, can_summon=True,
+                       uses_host_sites=True, can_clear_space=True, **fields)
         request = Request(self.url, data=json.dumps(payload).encode(), headers={
             "Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
         try:
@@ -271,6 +295,8 @@ class AltConnection:
                 return json.load(response)
         except HTTPError as exc:
             with exc:
+                if exc.code == 403:
+                    raise PairingExpired("Основа отклонила сохранённую привязку. Введи новый PIN.") from exc
                 if exc.code == 409:
                     raise Wait(json.load(exc)["error"]) from exc
                 raise Wait(f"Основа ответила HTTP {exc.code}. Проверь номер и код подключения.") from exc
@@ -307,6 +333,9 @@ class Match:
         self.frames = {}
         self.results = {}
         self.progress = {}
+        self.sales = {}
+        self.sale_retry = {}
+        self.allow_sales = False
         self.vote_owner = None
         self.vote_until = 0
 
@@ -340,7 +369,7 @@ class Match:
             self.pair_failures.append(now)
             raise ValueError("PIN неверен, уже использован или истёк. Проверь PIN на основе.")
 
-    def start(self, mode, host, *, afk_auto=True):
+    def start(self, mode, host, *, afk_auto=True, allow_sales=False):
         if mode not in ("hard", "nightmare") or not host.strip():
             raise ValueError("Укажи сложность и имя основы из PARTY INVITE")
         with self.lock:
@@ -349,6 +378,9 @@ class Match:
             self.rejections.clear()
             self.mode, self.host = mode, host.strip()
             self.afk_auto = afk_auto
+            self.allow_sales = allow_sales
+            self.sales.clear()
+            self.sale_retry.clear()
             self.vote_owner = None
             self.places = {(i, u): {"unit": u, "player": i, "point": position(i, u),
                                     "state": "reserved"} for i in PLAYERS for u in PLACEMENT_ORDER}
@@ -360,6 +392,7 @@ class Match:
     def stop(self):
         with self.lock:
             self.run = ""
+            self.sales.clear()
             self.recalled.clear()
             self.pending.clear()
             self.frames.clear()
@@ -422,6 +455,10 @@ class Match:
         if not (0 < x < 2048 and 0 < y < 1152):
             raise ValueError("Точка вне карты")
         place = self.places[player, unit]
+        if place["state"]=="sold":
+            raise ValueError("Это место освобождено под титана")
+        if player in self.sales or any(s["requester"]==player and s["titan"]==unit for s in self.sales.values()):
+            raise ValueError("Идёт освобождение места под титана")
         if place["state"]=="placed" and (slot is not None or count_before is not None or total_before is not None):
             raise ValueError("Постановка уже подтверждена")
         if place.get("target"):
@@ -459,6 +496,67 @@ class Match:
         place["target"] = point
         place["target_since"] = time.monotonic()
 
+    def request_space(self, player, titan, point, now):
+        if not self.allow_sales or titan not in ("amplifier","screen"):
+            return
+        row = self.places[player,titan]
+        if (row["state"]=="placed" or row.get("target") or row.get("clear_site") or row.get("sale_issued")
+                or any(s["requester"]==player for s in self.sales.values())):
+            return
+        if not isinstance(point,list) or len(point)!=2 or not all(type(v) in (float,int) and math.isfinite(v) for v in point):
+            return
+        if not any(math.dist(point,position(player,titan,i))<1 for i in range(placement_attempts(titan))):
+            return
+        tower = single_blocker(player,titan,point,self.places.values())
+        if tower is None:
+            return
+        owner,unit = tower["player"],tower["unit"]
+        client = self.clients.get(owner,{})
+        if (owner in self.sales or owner in self.recalled or owner in self.summons or not client.get("can_clear_space")
+                or now-client["seen"]>8 or any(p.get("target") for (i,_),p in self.places.items() if i==owner)
+                or now<self.sale_retry.get((player,titan,owner,unit),0)):
+            return
+        row["clear_site"] = list(point)
+        self.sales[owner] = dict(id=secrets.token_hex(12),requester=player,titan=titan,owner=owner,
+                                 unit=unit,point=list(tower["point"]),slot=tower["slot"],until=now+40)
+
+    def finish_sale(self, sale, sold, now):
+        owner,unit = sale["owner"],sale["unit"]
+        row = self.places[sale["requester"],sale["titan"]]
+        if sold:
+            self.places[owner,unit]["state"] = "sold"
+            row.update(sale_used=True,clear_until=now+20)
+        else:
+            row.pop("clear_site",None)
+            # After issuing a sale, never send another click for the same tower
+            # and request within this match, even if the response was lost.
+            self.sale_retry[sale["requester"],sale["titan"],owner,unit] = (
+                float("inf") if "before" in sale else now+35)
+        del self.sales[owner]
+
+    def sale_action(self, player, op, req, now):
+        sale = self.sales.get(player)
+        if not sale or req.get("id")!=sale["id"]:
+            return False
+        count = req.get("count")
+        if op=="arm_sale":
+            requester = self.clients.get(sale["requester"],{})
+            if ("before" not in sale and now-requester.get("seen",-1e9)<10
+                    and type(count) is int and 1<=count<=4
+                    and not any(p.get("target") for (i,_),p in self.places.items() if i==player)):
+                sale.update(before=count,armed=now)
+                self.places[sale["requester"],sale["titan"]]["sale_issued"] = True
+                return True
+        elif "before" not in sale:
+            if op=="cancel_sale":
+                self.finish_sale(sale,False,now)
+        elif op=="sale_count" and type(count) is int:
+            if count==sale["before"]-1:
+                self.finish_sale(sale,True,now)
+            elif count==sale["before"] and now-sale["armed"]>=8:
+                self.finish_sale(sale,False,now)
+        return False
+
     def exchange(self, player, req):
         with self.lock:
             now = time.monotonic()
@@ -467,13 +565,23 @@ class Match:
             if client and client["instance"] != owner and now-client["seen"] < 10:
                 raise ValueError("Этот номер твинка уже подключён")
             self.clients[player] = dict(instance=owner, seen=now, status=str(req.get("status",""))[:180],
-                                        can_summon=req.get("can_summon") is True)
+                                        can_summon=req.get("can_summon") is True,
+                                        can_clear_space=req.get("can_clear_space") is True)
+            for sale in list(self.sales.values()):
+                if "before" not in sale and (sale["until"]<now or sale["requester"] in self.recalled
+                        or sale["owner"] in self.summons or sale["requester"] in self.summons):
+                    self.finish_sale(sale,False,now)
+            for row in self.places.values():
+                if "clear_until" in row and row["clear_until"]<=now:
+                    row.pop("clear_until")
+                    row.pop("clear_site",None)
             self.expire_summon(player, now)
             summon = self.summons.get(player)
             op = req.get("op","poll")
             sites = None
             preferred_site = None
             claimed = None
+            send_sale = False
             if op == "summon_result":
                 if summon and summon["id"] == req.get("id") and summon["instance"] == owner:
                     opened = req.get("opened") is True
@@ -487,7 +595,11 @@ class Match:
             elif op != "poll":
                 if not self.run or self.run != req.get("run") or player in self.recalled:
                     raise ValueError("Матч сменился")
-                if op=="placement_sites":
+                if op=="need_space":
+                    self.request_space(player,req.get("unit"),req.get("point"),now)
+                elif op in ("arm_sale","cancel_sale","sale_count"):
+                    send_sale = self.sale_action(player,op,req,now)
+                elif op=="placement_sites":
                     unit = req["unit"]
                     if unit not in PLACEMENT_ORDER:
                         raise ValueError("Неизвестный юнит")
@@ -524,6 +636,8 @@ class Match:
                                 and (place.get("count_before") is not None or place.get("total_before") is not None)):
                             self.titan_sites[f"{player}/{unit}"] = list(place["target"])
                         place.update(point=place.pop("target"),state="placed")
+                        place.pop("clear_site",None)
+                        place.pop("clear_until",None)
                     elif place["state"] != "placed" or place["point"] != req["point"]:
                         raise ValueError("Резерв не подтверждён")
                 elif op == "vote_turn":
@@ -556,9 +670,11 @@ class Match:
                 self.results[player] = "Время истекло; результат не подтверждён"
                 cmd = None
             return dict(run="" if player in self.recalled else self.run,
+                        allow_sales=self.allow_sales, sale=dict(self.sales[player]) if player in self.sales else None,
+                        send_sale=send_sale,
                         rejected_sites=recent_sites(self.rejections,now),preferred_site=preferred_site,
                         summon={"id":summon["id"],"link":summon["link"]} if summon and summon["instance"]==owner else None,
-                        afk_auto=self.afk_auto, placement_sites=True, placement_totals=True, sites=sites, mode=self.mode,host=self.host,places=list(self.places.values()),claimed=claimed,
+                        afk_auto=self.afk_auto, placement_sites=True, placement_totals=True, sites=sites, mode=self.mode,host=self.host,places=[dict(p) for p in self.places.values()],claimed=claimed,
                         vote_seconds=max(0,self.vote_until-now) if self.vote_owner==player else 0,
                         progress=self.progress.get(player,{}),
                         command=dict(cmd,remaining=cmd["until"]-now) if cmd and not cmd.get("claimed")

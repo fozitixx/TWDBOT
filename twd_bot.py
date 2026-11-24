@@ -2364,6 +2364,11 @@ def settings_path():
     return os.path.join(HERE, "settings.json")
 
 
+def team_profile_dir():
+    return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.local/share"),
+                        "TWD Farm", "Wastelands")
+
+
 def load_settings():
     SETTINGS.update(DEFAULT_SETTINGS)
     try:
@@ -5477,7 +5482,7 @@ class FarmApp:
             self.ttk = None
         self.vars = {}
         self._build()
-        self.show("home")
+        self.show("wastelands" if os.path.isfile(os.path.join(team_profile_dir(), "resume.json")) else "home")
         self.hotkeys = keyboard.Listener(on_press=self._on_hotkey)
         self.hotkeys.start()
         self.restart_discord()
@@ -6173,6 +6178,8 @@ class FarmApp:
                 self.team.stop.set()
                 if self.team.match.run:
                     self.root.after(0, self.team.stop_match)
+                elif self.team.worker:
+                    self.root.after(0,self.team.disconnect_client)
 
     def tick(self):
         if self.team_install is not None and not self.team_install.empty():

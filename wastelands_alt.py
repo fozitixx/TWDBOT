@@ -10,7 +10,7 @@ from pynput import mouse
 
 import twd_bot as farm
 from wastelands_manager import manager_bounds, titan_cards, upgrade_price
-from wastelands_team import (ABILITIES, BANK_OFFSET, EARLY, EARLY_CLEARANCE, TITAN_CLEARANCE, REJECTION_SECONDS,
+from wastelands_team import (ABILITIES, BANK_OFFSET, EARLY, EARLY_CLEARANCE, TITAN_CLEARANCE, REJECTION_SECONDS, PairingExpired, single_blocker,
                             PLACEMENT_ORDER, SPARE_BANKS, Wait, bank_slot, footprint_class, near_rejection, placement_conflict,
                             on_third_titan_bank, placement_label, position, private_server_links, recent_sites)
 from wastelands_view import (OCR, color_boxes, framing_turn, invite_buttons, label, read_invite, map_point, preview,
@@ -344,6 +344,9 @@ class Alt:
         self.placed = set()
         self.points = {}
         self.team_places = state.get("places",[])
+        self.retired = set()
+        self.allow_sales = state.get("allow_sales",False)
+        self.sale_checks = {}
         self.sites = {}
         self.preferred_titans = {}
         self.failed_titan_sites = {}
@@ -552,6 +555,7 @@ class Alt:
         if not all(unit in own for unit in PLACEMENT_ORDER):
             raise Wait("Основа не передала десять мест. Обнови основу до 6.0.4.")
         placed = {u for u,p in own.items() if p["state"]=="placed"}
+        self.retired = {u for u,p in own.items() if p["state"]=="sold"}
         pending = {u for u,p in own.items() if p.get("target")}
         if placed!=self.placed or self.pending_places-pending:
             # A manual decision on the host invalidates our previous observation.
@@ -887,7 +891,7 @@ class Alt:
             measured = sites
             home = sites[0]
         recent = recent_sites(self.local_rejections,time.monotonic()) + list(self.team_rejections)
-        other_plans = [p["point"] for p in self.team_places if early and p["state"]!="placed"
+        other_plans = [p["point"] for p in self.team_places if early and p["state"]=="reserved"
                        and not p.get("target") and p["unit"].partition("_")[0] in EARLY
                        and (p["player"],p["unit"])!=(self.player,unit)]
         visible = busy = rejected = 0
@@ -923,8 +927,14 @@ class Alt:
             # The team cooldown expires, but this helper still explores unused
             # ground before retrying the exact same wreck later in this match.
             ranked.sort(key=self.titan_misses)
+        if not early and not check_ground and len(ranked)>1:
+            # Check the same full base as helper 3 before falling back to
+            # the broader visual score used on the first two banks.
+            clear = rank_build_sites(frame,pose,ranked,TITAN_CLEARANCE//2,[0]*len(ranked),clear_titan_base=True)
+            clear = {tuple(p) for p in clear}
+            ranked.sort(key=lambda p:(self.titan_misses(p)>0,tuple(p) not in clear))
         if early and len(ranked)>1:
-            needed = sum(p["unit"].partition("_")[0] in EARLY and p["state"]!="placed" and not p.get("target")
+            needed = sum(p["unit"].partition("_")[0] in EARLY and p["state"]=="reserved" and not p.get("target")
                          for p in self.team_places)
             ranked = preserve_bank_capacity(ranked,needed)
         elif check_ground and len(ranked)>1:
@@ -936,6 +946,47 @@ class Alt:
 
     def titan_misses(self,point):
         return sum(count for site,count in self.failed_titan_sites.items() if math.dist(point,site)<25)
+
+    def ask_for_space(self,unit,frame,pose,sites,candidates):
+        if not self.allow_sales:
+            return None
+        row = next(p for p in self.team_places if p["player"]==self.player and p["unit"]==unit)
+        if row.get("clear_site") or row.get("sale_issued"):
+            return None
+        # Prefer an untried open base. After repeated funded failures compare
+        # the remaining terrain with sites obstructed by one known small tower.
+        if candidates:
+            if len(self.failed_titan_sites)<2:
+                return None
+            untried = [p for p in candidates if not self.titan_misses(p)]
+            if rank_build_sites(frame,pose,untried,TITAN_CLEARANCE//2,[0]*len(untried),clear_titan_base=True):
+                return None
+        possible, costs, blockers = [], [], {}
+        recent = recent_sites(self.local_rejections,time.monotonic())+list(self.team_rejections)
+        for point in dict.fromkeys(map(tuple,sites)):
+            if self.titan_misses(point) or near_rejection(unit,point,recent):
+                continue
+            tower = single_blocker(self.player,unit,point,self.team_places)
+            if tower:
+                possible.append(list(point))
+                costs.append(0 if tower["player"]==self.player else .15)
+                blockers[point] = tower
+        ranked = rank_build_sites(frame,pose,possible,TITAN_CLEARANCE//2,costs,clear_titan_base=True,
+                                  occupied_centers=[p["point"] for p in blockers.values()])
+        tried = set()
+        for point in ranked:
+            tower = blockers[tuple(point)]
+            key = tower["player"],tower["unit"]
+            if key in tried:
+                continue
+            tried.add(key)
+            state = self.exchange("need_space",unit=unit,point=point)
+            if any(p["player"]==self.player and p["unit"]==unit and p.get("clear_site")==point
+                   for p in state["places"]):
+                msg = f"{unit.title()} · запросил у твинка {key[0]} место, мешает {placement_label(key[1])}"
+                farm.log(f"Wastelands · твинк {self.player} · {msg}")
+                return msg
+        return None
 
     def place(self,unit,img):
         kind = unit.partition("_")[0]
@@ -979,6 +1030,19 @@ class Alt:
                     return self.wait_for_check(f"{name} · вернул камеру, повторно сверяю дорогу",.8)
                 return self.wait_for_check(f"{name} · сверяю положение камеры по дороге и обломкам",1)
             candidates,visible,busy,rejected,obstructed = self.candidate_sites(unit,snap,pose,sites)
+            if kind not in EARLY:
+                row = next(p for p in self.team_places if p["player"]==self.player and p["unit"]==unit)
+                if row.get("sale_used") and row.get("clear_site"):
+                    freed = row["clear_site"]
+                    if freed in candidates:
+                        candidates.remove(freed)
+                        if rank_build_sites(snap,pose,[freed],TITAN_CLEARANCE//2,[0],clear_titan_base=True):
+                            candidates.insert(0,freed)
+                elif cash is not None and cash>=price and (before.slot==0 or
+                        before.slot is None and before.total==len(self.placed) and unit not in self.placed):
+                    requested = self.ask_for_space(unit,snap,pose,sites,candidates)
+                    if requested:
+                        return requested
             if kind not in EARLY and self.failed_titan_sites and (not candidates or self.titan_misses(candidates[0])):
                 unexplored = [point for point in sites if not self.titan_misses(point)]
                 if unexplored and self.reframe_sites(unit,snap,pose,unexplored):
@@ -1272,6 +1336,86 @@ class Alt:
         self.afk_retry_at = time.monotonic()+2
         return "AFK CHECK · ответ отправлен, проверяю закрытие"
 
+    def sale_button(self,frame,kind=None):
+        if manager_bounds(frame) or farm.afk_panel(frame):
+            return None
+        words = self.placement_text(frame,(0,.12,.30,.86),zoom=3)
+        sell = (label(words,"Sell X") or label(words,"Продать X") or label(words,"Продать Х"))
+        if kind is None:
+            return sell or label(words,"Owner") or label(words,"Владелец")
+        titles = {"tv":("Scientist Screen Man","Scientist TV Man"),
+                  "plunger":("Hero Camcorderman 2.0","Plunger Cameraman 2.0")}
+        title = next((pos for name in titles[kind] if (pos:=label(words,name))),None)
+        if sell and title and title[1]<sell[1] and (label(words,"Owner") or label(words,"Владелец")):
+            return sell
+        return None
+
+    def clear_space(self,sale):
+        unit,kind = sale["unit"],sale["unit"].partition("_")[0]
+        if kind not in EARLY or sale["owner"]!=self.player:
+            return "Неизвестная башня для освобождения места"
+        name = placement_label(unit)
+        slot = self.slots[kind]
+        def cancel(reason):
+            self.exchange("cancel_sale",id=sale["id"])
+            return f"{name} · пропускаю продажу: {reason}"
+        def count_units():
+            count = self.hover_count(slot,4)
+            return self.manager_counts(kind,4,cards=True).slot if count is None else count
+        if "before" in sale:
+            if time.monotonic()<self.sale_checks.get(sale["id"],0):
+                return f"{name} · проверяю продажу"
+            self.sale_checks[sale["id"]] = time.monotonic()+1
+            count = count_units()
+            if count is None:
+                return f"{name} · жду личный счётчик после продажи"
+            updated = self.exchange("sale_count",id=sale["id"],count=count)
+            if any(p["player"]==self.player and p["unit"]==unit and p["state"]=="sold" for p in updated["places"]):
+                msg = f"Продал {name} под {sale['titan'].title()} твинка {sale['requester']} · слот {sale['before']} → {count}"
+                farm.log(f"Wastelands · твинк {self.player} · {msg}")
+                return msg
+            return f"{name} · продажа пока не подтверждена"
+        if (unit not in self.points or self.points[unit]!=sale["point"] or slot!=sale["slot"]
+                or self.pending_places):
+            return cancel("состояние башни изменилось")
+        count = count_units()
+        if not count or count!=sum(u.partition("_")[0]==kind for u in self.placed):
+            return cancel("личный счётчик не подтвердил состав")
+        if not self.game.take(slot):
+            return cancel("не видна дорога")
+        try:
+            self.game.hover(farm.IDLE_POINT)
+            reference = self.game.grab()
+            pose = self.map_pose(reference)
+        finally:
+            self.game.drop()
+        if pose is None:
+            return cancel("не подтверждён ракурс")
+        def locate(frame):
+            if farm.afk_panel(frame) or manager_bounds(frame):
+                return None
+            current = tracked_pose(reference,pose,frame)
+            if current is not None:
+                point = screen_point(current,sale["point"])
+                if placement_in_view(*point):
+                    return point
+            return None
+        self.game.click(farm.IDLE_POINT)
+        self.game.sleep(.18)
+        frame = self.game.grab()
+        point = locate(frame)
+        if not point or self.sale_button(frame):
+            return cancel("не удалось выделить точку отдельно")
+        self.game.click_live(point,locate,name)
+        self.game.sleep(.25)
+        button = self.sale_button(self.game.grab(),kind)
+        if not button:
+            return cancel("карточка выбранного юнита не совпала")
+        if self.exchange("arm_sale",id=sale["id"],count=count)["send_sale"]:
+            self.game.click_live(button,lambda live:self.sale_button(live,kind),"Продать "+name)
+            self.sale_checks[sale["id"]] = time.monotonic()+.5
+        return f"{name} · проверяю продажу по слоту {slot}"
+
     def tick(self,state):
         self.guard()
         if self.needs_close:
@@ -1309,6 +1453,8 @@ class Alt:
                 self.slots = detected
                 self.last_inventory = None
             self.next_slot_check = float("inf") if detected else time.monotonic()+2
+        if state.get("sale"):
+            return self.clear_space(state["sale"])
         cmd = state["command"]
         if cmd:
             cmd = self.exchange("claim",id=cmd["id"])["claimed"]
@@ -1331,7 +1477,7 @@ class Alt:
             if status:
                 return status
 
-        outstanding = [u for u in PLACEMENT_ORDER if u not in self.placed
+        outstanding = [u for u in PLACEMENT_ORDER if u not in self.placed and u not in self.retired
                        and u.partition("_")[0] not in self.at_limit]
         # A different copy can use another bank, but TV must wait for all
         # Plungers, and both titans must wait for all TVs.
@@ -1342,6 +1488,9 @@ class Alt:
                     break
                 if unit in self.pending_places:
                     continue
+                if any(p["player"]==self.player and p["unit"]==unit and p.get("clear_site")
+                       and not p.get("sale_used") for p in self.team_places):
+                    return f"{placement_label(unit)} · жду освобождения места владельцем башни"
                 if now<self.rescan_at.get(unit,0):
                     continue
                 return self.place(unit,img)
@@ -1376,6 +1525,8 @@ class Alt:
                         self.status = self.tick(state)
                     else:
                         self.status = "На связи · жду матч"
+                except PairingExpired:
+                    raise
                 except (Wait,OSError,ValueError,RuntimeError) as exc:
                     self.status = str(exc)
                 if self.run and self.phase=="battle" and time.monotonic()>=self.next_status_log:
