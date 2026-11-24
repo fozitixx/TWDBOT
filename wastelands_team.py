@@ -38,6 +38,8 @@ SPARE_BANKS = (
     *((0,s,1) for s in (-300,-340,-380,-420,340)),
     *((0,s,-1) for s in (164,202,240,278,-260,-298,-336,-374,-412)),
     *((276,s,side) for s in (-82,-122,-162,-202) for side in (-1,1)),
+    *((276,s,side) for s in (-242,-282,-322) for side in (-1,1)),
+    *((0,s,side) for s in (-458,-496,-534) for side in (-1,1)),
 )
 EDGE_GAP = 14
 BANK_OFFSET = 24 + EDGE_GAP  # nominal half road width plus clearance for the base
@@ -316,7 +318,10 @@ class Match:
                 continue
             both_early = unit.partition("_")[0] in EARLY and other["unit"].partition("_")[0] in EARLY
             clearance = 26 if both_early else 54
-            for occupied in (other["point"], other.get("target")):
+            target = other.get("target")
+            # Early copies can share fallback candidates until someone claims one.
+            protect_plan = other["state"]=="placed" or (not both_early and not target)
+            for occupied in (other["point"] if protect_plan else None, target):
                 if occupied and math.dist(point, occupied) < clearance:
                     raise ValueError("Рядом занят участок")
         place["count_before"] = count_before

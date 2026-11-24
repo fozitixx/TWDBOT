@@ -128,6 +128,40 @@ def manager_bounds(img):
                key=lambda p:p[2]*p[3],default=None)
 
 
+MANAGER_TITLES = {
+    "scientistscreenman":"tv", "scientisttvman":"tv",
+    "herocamcorderman20":"plunger", "plungercameraman20":"plunger",
+    "titanamplifierman":"amplifier", "titanscreenman":"screen",
+    "scientistcamcorderman":"farm", "scientistcameraman":"farm",
+    "titancamcorderman":"tcam",
+}
+COUNT_TRIES = 3
+
+
+def manager_unit_count(words, kind, limit):
+    """Words use panel-local coordinates. An incomplete list cannot prove zero."""
+    if not label(words,"UNIT MANAGER",(0,0,1,.10)):
+        return None
+    def lines(left,top,right,bottom):
+        inside = sorted((v for v in words if left<=v[1]+v[3]/2<right
+                         and top<=v[2]+v[4]/2<bottom),key=lambda v:v[2]+v[4]/2)
+        while inside:
+            first = inside[0]
+            mid = first[2]+first[4]/2
+            row = [v for v in inside if abs(v[2]+v[4]/2-mid)<max(first[4],v[4])*.55]
+            inside = [v for v in inside if v not in row]
+            yield re.sub(r"[^a-z0-9]","","".join(v[0].lower() for v in sorted(row,key=lambda v:v[1])))
+    totals = [int(line[5:]) for line in lines(0,.038,.28,.119) if re.fullmatch(r"units[0-9]{1,2}",line)]
+    if len(totals)!=1:
+        return None
+    cards = [MANAGER_TITLES[line] for left in (0,.5)
+             for line in lines(left,.116,left+.5,.92) if line in MANAGER_TITLES]
+    count = cards.count(kind)
+    if count<=limit and len(cards)<=totals[0] and (len(cards)==totals[0] or count==limit):
+        return count
+    return None
+
+
 def countdown(row,action,button):
     # The printed "45s cooldown" describes the skill even when it is ready.
     # Only a separate countdown without the caption is evidence of an active timer.
@@ -190,9 +224,11 @@ class Alt:
         self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
         self.sites = {}
         self.rescan_at = {}
+        self.site_rescans = {}
         self.host_sites = state.get("placement_sites",False)
         self.pending_places = set()
         self.count_retry_at = {}
+        self.count_failures = {}
         self.slot_wait_until = {}
         self.retry = state["progress"].get("retry",0)
         self.levels = {"amplifier":0,"screen":0}
@@ -354,6 +390,8 @@ class Alt:
             self.confirm = None
             return True
         pending = {unit for unit,row in own.items() if row.get("target")}
+        for unit in self.pending_places-pending:
+            self.count_failures.pop(unit.partition("_")[0],None)
         for unit in self.pending_places-pending-self.placed:
             self.attempt[unit] += 1
         self.pending_places = pending
@@ -420,16 +458,60 @@ class Alt:
             previous = count
         return None
 
+    def manager_count(self,kind,limit):
+        frame = self.game.grab()
+        if farm.afk_panel(frame):
+            raise Wait("Проверка AFK на экране")
+        self.game.drop()
+        self.needs_close = True
+        try:
+            if not self.header(frame):
+                self.game.key("v")
+                self.game.sleep(.28)
+            previous = None
+            for _ in range(2):
+                frame = self.game.grab()
+                bounds = manager_bounds(frame)
+                if not bounds:
+                    return None
+                x,y,w,h = bounds
+                panel = frame.crop((x,y,x+w,y+h))
+                count = manager_unit_count(self.text(panel),kind,limit)
+                if count is None:
+                    return None
+                if count==previous:
+                    return count
+                previous = count
+                self.game.sleep(.12)
+            return None
+        finally:
+            self.close_manager()
+
+    def verified_count(self,slot,limit):
+        count = self.hover_count(slot,limit)
+        if count is None:
+            kind = next((k for k,v in self.slots.items() if v==slot),None)
+            if kind:
+                count = self.manager_count(kind,limit)
+        return count
+
+    def failed_count(self,kind):
+        tries = self.count_failures.get(kind,0)+1
+        self.count_failures[kind] = tries
+        if tries>=COUNT_TRIES:
+            return f"{kind.upper()} · проверка приостановлена. Места юнитов → Повторить поиск места"
+        return f"{kind.upper()} · счётчик не подтверждён ({tries}/{COUNT_TRIES})"
+
     def placement_outcome(self,slot,limit,before_count):
         # Income, slot price and a disappearing preview cannot prove ownership.
         # Give the server time to publish the new count before a rejected retry.
         self.game.sleep(.60)
-        count = self.hover_count(slot,limit)
+        count = self.verified_count(slot,limit)
         if count==before_count+1:
             return "commit"
         if count==before_count:
             self.game.sleep(.65)
-            count = self.hover_count(slot,limit)
+            count = self.verified_count(slot,limit)
             if count==before_count+1:
                 return "commit"
             if count==before_count:
@@ -445,15 +527,18 @@ class Alt:
                     or before is None or now<self.count_retry_at.get(unit,0)):
                 continue
             kind = unit.partition("_")[0]
+            if self.count_failures.get(kind,0)>=COUNT_TRIES:
+                continue
             outcome = self.placement_outcome(self.slots[kind],4 if kind in EARLY else 1,before)
             self.count_retry_at[unit] = time.monotonic()+5
             if outcome:
+                self.count_failures.pop(kind,None)
                 self.confirm = (outcome,unit,point)
                 self.exchange(outcome,unit=unit,point=point)
                 self.confirm = None
-                return (f"Поставил {placement_label(unit)} · проверено по слоту" if outcome=="commit"
+                return (f"Поставил {placement_label(unit)} · счётчик подтверждён" if outcome=="commit"
                         else f"{placement_label(unit)} · счётчик прежний, ищу другое место")
-            break
+            return self.failed_count(kind)
         return None
 
     def place(self, unit, img):
@@ -478,11 +563,12 @@ class Alt:
         if self.attempt[unit]>=len(sites):
             return f"{name} · свободное место не найдено, проверь разметку"
         limit = 4 if kind in EARLY else 1
-        before_count = self.hover_count(slot,limit)
+        before_count = self.verified_count(slot,limit)
         if before_count is None or before_count==limit:
             self.slot_wait_until[kind] = time.monotonic()+4
         if before_count is None:
-            return f"Не прочитал счётчик {name} в слоте {slot} · повторяю наведение"
+            return self.failed_count(kind)
+        self.count_failures.pop(kind,None)
         if before_count==limit:
             if kind in EARLY:
                 self.full_early.add(kind)
@@ -502,6 +588,8 @@ class Alt:
             if titan:
                 sites[start:] = rank_titan_sites(snap,pose,sites[start:],sites[:start])
             clicks = 0
+            conflicts = 0
+            outside_zone = 0
             for attempt in range(start,len(sites)):
                 self.attempt[unit] = attempt
                 if titan:
@@ -518,10 +606,12 @@ class Alt:
                 except Wait as exc:
                     if any(reason in str(exc) for reason in
                            ("Рядом занят участок","Зона ранней защиты основы","Зона титанов основы")):
+                        conflicts += 1
                         continue
                     if "За пределами назначенной зоны" in str(exc):
                         if not self.host_sites:
                             raise Wait("Разметка основы и твинка различается · обнови и перезапусти оба приложения") from exc
+                        outside_zone += 1
                         continue
                     raise
                 outcome = self.try_place(point,pt,snap,unit,slot,limit,before_count)
@@ -539,7 +629,7 @@ class Alt:
                 self.attempt[unit] = attempt+1
                 clicks += 1
                 if not titan or clicks>=3 or not self.game.path_visible():
-                    return "Точка занята · пробую рядом"
+                    return f"{name} · счётчик прежний, пробую другую точку"
                 # The preview stayed open. Keep its pose and slot, and try a
                 # different footprint after verifying the scene at click time.
                 cash = self.game.money()
@@ -547,7 +637,11 @@ class Alt:
                     return f"Перепроверяю баланс для {name}"
                 sites[attempt+1:] = rank_titan_sites(snap,pose,sites[attempt+1:],sites[:attempt+1])
             self.attempt[unit] = len(sites)
-            return f"{name} · места заняты или кромка не видна, проверь расстановку"
+            if conflicts:
+                return f"{name} · основа отклонила {conflicts} точек у защищённых или занятых мест"
+            if outside_zone:
+                return f"{name} · точки вне назначенной зоны"
+            return f"{name} · не вижу подходящего участка дороги в окне"
         finally:
             self.game.drop()
 
@@ -757,8 +851,11 @@ class Alt:
             self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
             self.full_early.clear()
             self.slot_wait_until.clear()
+            self.count_failures.clear()
+            self.count_retry_at.clear()
             self.sites.clear()
             self.rescan_at.clear()
+            self.site_rescans.clear()
             self.retry = state["progress"]["retry"]
         if self.phase=="lobby":
             return self.lobby(state,img)
@@ -802,21 +899,31 @@ class Alt:
         now = time.monotonic()
         for unit in stage:
             kind = unit.partition("_")[0]
+            if self.count_failures.get(kind,0)>=COUNT_TRIES:
+                continue
             if kind in pending_kinds or now<self.slot_wait_until.get(kind,0):
                 continue
             if unit in self.sites and self.attempt[unit]>=len(self.sites[unit]):
-                due = self.rescan_at.setdefault(unit,now+4)
+                scans = self.site_rescans.get(unit,0)
+                if scans>=2:
+                    continue
+                due = self.rescan_at.setdefault(unit,now+4*(scans+1))
                 if now<due:
                     continue
+                self.site_rescans[unit] = scans+1
                 del self.rescan_at[unit]
                 self.attempt[unit] = 0
             return self.place(unit,img)
         if stage:
             kind = stage[0].partition("_")[0]
+            if self.count_failures.get(kind,0)>=COUNT_TRIES:
+                return f"{kind.upper()} · проверка приостановлена. Места юнитов → Повторить поиск места"
             if kind in pending_kinds:
                 return f"{placement_label(stage[0])} · жду подтверждения постановки"
             if now<self.slot_wait_until.get(kind,0):
                 return f"{placement_label(stage[0])} · перепроверяю счётчик слота {self.slots[kind]}"
+            if all(self.site_rescans.get(u,0)>=2 and self.attempt[u]>=len(self.sites.get(u,())) for u in stage):
+                return f"{kind.upper()} · участки проверены. Места юнитов → Повторить поиск места"
             return f"{placement_label(stage[0])} · повторю поиск свободного места"
         if min(self.levels.values())<8 and time.monotonic()>self.next_upgrade:
             self.next_upgrade = time.monotonic()+4
