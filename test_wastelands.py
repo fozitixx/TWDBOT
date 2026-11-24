@@ -7,6 +7,7 @@ import base64
 import json
 import tempfile
 import queue
+from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +16,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from wastelands_alt import Alt, Game, Wait, level, manager_card, manager_unit_count, countdown
+from wastelands_alt import Alt, Game, Wait, UnitCounts, level, manager_card, manager_total, manager_unit_count, placement_cash, visual_manager_total, countdown
 from wastelands_team import AltConnection, Match, PAIR_LIFETIME, PLACEMENT_ORDER, PLAYERS, UNITS, connect_by_pin, position, serve
 from wastelands_view import OCR, label, road_pose, screen_point
 
@@ -446,12 +447,12 @@ class NetworkTest(unittest.TestCase):
     def test_plunger_slot_backoff_and_exhaustion_never_select_tv(self):
         a=self.alts[0]
         a.phase="battle"
-        a.slot_wait_until["plunger"]=time.monotonic()+10
+        a.wait_for_check("Plunger · жду счётчик",10)
         frame=Image.new("RGB",(1366,768))
         with patch.object(a.game,"grab",return_value=frame),patch.object(a,"place") as place:
             self.assertIn("счётчик",a.tick(a.exchange()))
             place.assert_not_called()
-            a.slot_wait_until.clear()
+            a.next_check=0
             for u in PLACEMENT_ORDER[:4]:
                 a.sites[u]=[position(a.player,u)]
                 a.attempt[u]=1
@@ -460,7 +461,7 @@ class NetworkTest(unittest.TestCase):
             a.rescan_at["plunger"]=0
             a.tick(a.exchange())
             self.assertEqual(place.call_args.args[0],"plunger")
-            a.full_early.add("plunger")
+            a.at_limit.add("plunger")
             a.tick(a.exchange())
             self.assertEqual(place.call_args.args[0],"tv")
 
@@ -469,7 +470,7 @@ class NetworkTest(unittest.TestCase):
         ImageDraw.Draw(frame).rectangle((611,120,755,167),fill=(0,155,0))
         for i,a in enumerate(self.alts):
             a.phase="battle"
-            a.slot_wait_until["plunger"]=time.monotonic()+10
+            a.wait_for_check("Plunger · жду счётчик",10)
             with patch.object(a.game,"grab",return_value=frame),patch.object(a.game,"click_live") as click, \
                  patch.object(a,"vote_reading",side_effect=[((i,4),None),((i+1,4),None)]):
                 a.tick(a.exchange())
@@ -487,37 +488,36 @@ class NetworkTest(unittest.TestCase):
                 a.exchange("commit",unit=unit,point=point)
                 self.assertEqual(self.match.places[a.player,unit]["point"],point)
 
-    def test_screen_skips_debris_and_reuses_preview_after_rejection(self):
-        a = self.alts[0]
-        frame = Image.new("RGB",(1366,768),(112,90,53))
-        pose = (np.array([.41,.41]),np.diag([1/2048,1/1152]))
-        preferred = position(1,"screen")
-        cx,cy = np.asarray(screen_point(pose,preferred))*frame.size
+    def test_screen_skips_debris_and_tries_a_new_site_after_verified_rejection(self):
+        a=self.alts[0]
+        frame=Image.new("RGB",(1366,768),(112,90,53))
+        pose=(np.array([.41,.41]),np.diag([1/2048,1/1152]))
+        preferred=position(1,"screen")
+        cx,cy=np.asarray(screen_point(pose,preferred))*frame.size
         ImageDraw.Draw(frame).rectangle((cx-22,cy-22,cx+22,cy+22),fill=(72,72,70))
-        with patch.object(a,"game") as game, patch("wastelands_alt.placement_pose",return_value=pose), \
-             patch.object(a,"hover_count",return_value=0),patch("twd_bot.read_hotbar",return_value=[]), \
-             patch.object(a,"placement_outcome",side_effect=["release","commit"]),patch("twd_bot.log"):
-            game.money.return_value=16000
+        with patch.object(a,"game") as game,patch("wastelands_alt.placement_pose",return_value=pose), \
+             patch.object(a,"hover_count",side_effect=[0,0,0,1]),patch.object(a,"manager_counts",return_value=UnitCounts(0,0)):
             game.grab.return_value=frame
-            self.assertIn("Поставил",a.place("screen",frame))
-            self.assertEqual(game.take.call_count,1)
-            first,second = [call.args[0] for call in game.click_live.call_args_list]
+            a.place("screen",frame)
+            self.assertIn("жду обновления",a.recheck_pending(a.exchange()))
+            self.assertIn("прежнее",a.recheck_pending(a.exchange()))
+            a.place("screen",frame)
+            self.assertIn("Поставил",a.recheck_pending(a.exchange()))
+            first,second=[call.args[0] for call in game.click_live.call_args_list]
             self.assertGreater(np.linalg.norm((np.array(first)-screen_point(pose,preferred))*frame.size),22)
             self.assertGreater(np.linalg.norm((np.array(first)-second)*frame.size),26)
-            point = self.match.places[1,"screen"]["point"]
-            np.testing.assert_allclose(screen_point(pose,point),second)
+            np.testing.assert_allclose(screen_point(pose,self.match.places[1,"screen"]["point"]),second)
 
     def test_ambiguous_screen_keeps_single_reservation(self):
         a=self.alts[1]
         frame=Image.new("RGB",(1366,768),(110,86,52))
         pose=(np.array([.4,.4]),np.diag([1/2048,1/1152]))
         with patch.object(a,"game") as game,patch("wastelands_alt.placement_pose",return_value=pose), \
-             patch.object(a,"hover_count",return_value=0),patch("twd_bot.read_hotbar",return_value=[]), \
-             patch.object(a,"placement_outcome",return_value=None),patch("twd_bot.log"):
-            game.money.return_value=16000
+             patch.object(a,"hover_count",side_effect=[0,None]),patch.object(a,"manager_counts",return_value=UnitCounts()):
             game.grab.return_value=frame
-            self.assertIn("не подтверждён",a.place("screen",frame))
-            self.assertEqual(game.click_live.call_count,1)
+            a.place("screen",frame)
+            self.assertIn("сверяю",a.recheck_pending(a.exchange()))
+            game.click_live.assert_called_once()
             self.assertTrue(self.match.places[a.player,"screen"]["target"])
 
     def test_manager_proves_zero_only_with_every_card_accounted_for(self):
@@ -530,35 +530,40 @@ class NetworkTest(unittest.TestCase):
         cards[-1]=word("Scientist Screen Man",.55,.48)
         self.assertEqual(manager_unit_count(words+cards,"tv",4),1)
 
-    def test_tv_count_fallback_closes_manager_and_retries_only_on_request(self):
+    def test_manager_reads_personal_total_when_list_is_clipped(self):
+        a=self.alts[1]
+        frame=Image.new("RGB",(1366,768))
+        words=[("UNITS",.04,.065,.09,.018),("7",.137,.065,.025,.018)]
+        with patch.object(a,"game") as game,patch.object(a,"header",return_value=None), \
+             patch.object(a,"placement_text",return_value=words),patch.object(a,"close_manager") as close, \
+             patch("wastelands_alt.manager_bounds",side_effect=[None,(300,20,620,710),(300,20,620,710)]):
+            game.grab.return_value=frame
+            self.assertEqual(a.manager_counts("tv",4,cards=True),UnitCounts(None,7))
+            game.key.assert_called_once_with("v")
+            close.assert_called_once()
+        self.assertEqual(manager_total([("UNITS 0",.04,.065,.09,.018)]),0)
+        self.assertIsNone(manager_total([("Upgrade",.04,.065,.09,.018),("7",.139,.065,.025,.018)]))
+
+    def test_pending_placement_recovers_without_manual_retry_or_second_click(self):
         a=self.alts[1]
         a.phase="battle"
         a.ready=True
-        for unit in PLACEMENT_ORDER[:4]:
-            point=position(a.player,unit)
-            a.exchange("reserve",unit=unit,point=point)
-            a.exchange("commit",unit=unit,point=point)
+        p=position(a.player,"plunger")
+        a.exchange("reserve",unit="plunger",point=p,count_before=0,total_before=0,slot=3)
         frame=Image.new("RGB",(1366,768))
-        words=[("UNIT MANAGER",.30,.02,.35,.02),("UNITS 0",.03,.06,.10,.02)]
-        with patch.object(a,"game") as game,patch.object(a,"header",return_value=None), patch.object(a,"text",return_value=words), \
-             patch("wastelands_alt.manager_bounds",return_value=(300,25,680,720)),patch.object(a,"close_manager") as close, \
-             patch.object(a,"hover_count",return_value=None),patch("twd_bot.read_hotbar",return_value=[]):
-            game.grab.return_value=frame
-            game.money.return_value=12000
-            self.assertEqual(a.verified_count(a.slots["tv"],4),0)
-            game.key.assert_called_once_with("v")
-            close.assert_called_once()
-            a.needs_close=False
-            with patch.object(a,"manager_count",return_value=None) as fallback:
-                for _ in range(7):
-                    a.slot_wait_until.clear()
-                    status=a.tick(a.exchange())
-                self.assertIn("Повторить поиск",status)
-                self.assertEqual(fallback.call_count,3)
-                game.click_live.assert_not_called()
-                self.match.progress[a.player]["retry"]+=1
-                a.tick(a.exchange())
-                self.assertEqual(fallback.call_count,4)
+        with patch.object(a.game,"grab",return_value=frame),patch.object(a.game,"click_live") as click, \
+             patch.object(a,"hover_count",return_value=None), \
+             patch.object(a,"manager_counts",side_effect=[UnitCounts()]*4+[UnitCounts(None,1)]) as manager:
+            for i in range(4):
+                a.next_check=0
+                status=a.tick(a.exchange())
+                self.assertIn("сверяю",status)
+                self.assertEqual(status,a.tick(a.exchange()))
+                self.assertEqual(manager.call_count,i+1)
+            a.next_check=0
+            self.assertIn("Поставил",a.tick(a.exchange()))
+            self.assertEqual(self.match.places[2,"plunger"]["state"],"placed")
+            click.assert_not_called()
 
     def test_unbuilt_early_plans_release_ground_but_actual_claims_block_it(self):
         a,b=self.alts[1:]
@@ -574,33 +579,33 @@ class NetworkTest(unittest.TestCase):
         with self.assertRaisesRegex(Wait,"Рядом занят"):
             a.exchange("reserve",unit="tv",point=first)
 
-    def test_unreadable_pending_tv_preserves_claim_without_endless_rechecks(self):
-        a=self.alts[1]
-        point=position(a.player,"tv")
-        a.exchange("reserve",unit="tv",point=point,count_before=0)
-        state=a.exchange()
-        with patch.object(a,"placement_outcome",return_value=None) as check:
-            for _ in range(8):
-                a.count_retry_at.clear()
-                a.recheck_pending(state)
-            self.assertEqual(check.call_count,3)
-            self.assertEqual(self.match.places[a.player,"tv"]["target"],point)
-            self.assertNotEqual(self.match.places[a.player,"tv"]["state"],"placed")
+    def test_personal_totals_cannot_resolve_two_concurrent_clicks(self):
+        a,other=self.alts[:2]
+        site=position(a.player,"tv")
+        a.exchange("reserve",unit="tv",point=site,total_before=4,slot=5)
+        with self.assertRaisesRegex(Wait,"предыдущей постановки"):
+            a.exchange("reserve",unit="amplifier",point=position(a.player,"amplifier"),total_before=4)
+        other.exchange("reserve",unit="tv",point=position(other.player,"tv"),total_before=4)
+        self.assertEqual(a.exchange()["places"],other.exchange()["places"])
+        self.assertEqual(self.match.places[1,"tv"]["slot"],5)
 
-    def test_hover_decides_placement_even_when_cash_or_preview_changes(self):
-        a=self.alts[0]
-        for reads,expected in (([1],"commit"),([0,1],"commit"),([0,0],"release"),
-                               ([0,None],None),([None],None)):
-            with patch.object(a,"game") as game,patch.object(a,"hover_count",side_effect=reads),patch.object(a,"manager_count",return_value=None):
-                self.assertEqual(a.placement_outcome(1,1,0),expected)
-                game.money.assert_not_called()
-                game.path_visible.assert_not_called()
+    def test_counter_comparison_requires_a_common_source_and_agreement(self):
+        for before,after,delta in (
+            (UnitCounts(0,None),UnitCounts(None,1),None),
+            (UnitCounts(2,6),UnitCounts(2,7),None),
+            (UnitCounts(2,6),UnitCounts(None,7),1),
+            (UnitCounts(2,6),UnitCounts(2,6),0),
+            (UnitCounts(2,6),UnitCounts(3,None),1),
+            (UnitCounts(2,6),UnitCounts(4,8),2),
+        ):
+            self.assertEqual(before.delta(after),delta)
 
     def test_hover_samples_only_selected_icon_without_click(self):
         a=self.alts[0]
         frame=Image.new("RGB",(1356,698))
         for reads,expected in (([2,2],2),([None,0,0],0),([0,1,0,1],None),([2,None,2,None],None)):
-            with patch.object(a,"game") as game,patch.object(a,"slot_count",side_effect=reads) as count:
+            with patch.object(a,"game") as game,patch.object(a,"slot_count",side_effect=reads) as count, \
+                 patch.object(a,"placement_text",return_value=[]):
                 game.grab.return_value=frame
                 self.assertEqual(a.hover_count(4,4),expected)
                 x,y=game.hover.call_args.args[0]
@@ -609,6 +614,32 @@ class NetworkTest(unittest.TestCase):
                 game.click.assert_not_called()
                 game.key.assert_not_called()
 
+    def test_lost_commit_reply_and_stale_release_preserve_the_new_reservation(self):
+        a=self.alts[1]
+        p=position(a.player,"tv")
+        a.exchange("reserve",unit="tv",point=p,total_before=4,slot=5)
+        first=self.match.places[a.player,"tv"]["target_since"]
+        a.exchange("release",unit="tv",point=p,target_since=first)
+        a.exchange("reserve",unit="tv",point=p,total_before=4,slot=5)
+        with self.assertRaisesRegex(Wait,"Резерв изменился"):
+            a.exchange("release",unit="tv",point=p,target_since=first)
+        state=a.exchange()
+        a.reset(state)
+        a.update_places(state)
+        exchange=a.exchange
+        def lose_receipt(op,**fields):
+            exchange(op,**fields)
+            raise Wait("Соединение потеряно после подтверждения")
+        with patch.object(a,"placement_readback",return_value=UnitCounts(None,5)), \
+             patch.object(a,"exchange",side_effect=lose_receipt),self.assertRaises(Wait):
+            a.recheck_pending(state)
+        with patch.object(a.game,"click_live") as click:
+            self.assertTrue(a.update_places(a.exchange()))
+            a.update_places(a.exchange())
+            self.assertIsNone(a.recheck_pending(a.exchange()))
+            self.assertIn("tv",a.placed)
+            click.assert_not_called()
+
     def test_pending_titan_reconciles_after_restart_without_second_click(self):
         a=self.alts[0]
         for unit,count,expected in (("screen",0,"reserved"),("amplifier",1,"placed")):
@@ -616,7 +647,10 @@ class NetworkTest(unittest.TestCase):
             a.exchange("reserve",unit=unit,point=point,count_before=0)
             state=a.exchange()
             a.reset(state)
-            with patch.object(a,"game") as game,patch.object(a,"hover_count",return_value=count):
+            with patch.object(a,"game") as game,patch.object(a,"hover_count",return_value=count), \
+                 patch.object(a,"manager_counts",return_value=UnitCounts()):
+                if count==0:
+                    self.assertIn("жду обновления",a.recheck_pending(state))
                 self.assertIsNotNone(a.recheck_pending(state))
                 game.click_live.assert_not_called()
                 game.key.assert_not_called()
@@ -629,7 +663,7 @@ class NetworkTest(unittest.TestCase):
         frame=Image.new("RGB",(1366,768))
         for count in (None,1):
             with patch.object(a,"game") as game,patch.object(a,"hover_count",return_value=count), \
-                 patch.object(a,"manager_count",return_value=None), patch("twd_bot.read_hotbar",return_value=[]):
+                 patch.object(a,"manager_counts",return_value=UnitCounts()), patch("twd_bot.read_hotbar",return_value=[]):
                 game.money.return_value=22000
                 a.place("amplifier",frame)
                 game.click_live.assert_not_called()
@@ -705,28 +739,54 @@ class NetworkTest(unittest.TestCase):
         self.assertEqual(calls,["ready","plunger","plunger_2","plunger_3","plunger_4",
                                 "tv","tv_2","tv_3","tv_4","amplifier","screen"]+["amplifier","screen"]*8)
 
-    def test_blocked_then_paid_placement(self):
-        alt=self.alts[0]
-        game=Mock()
-        frame=Image.new("RGB",(1366,768))
-        game.grab.return_value=frame
-        game.take.return_value=True
-        game.money.return_value=900
-        game.path_visible.side_effect=[True]*6+[False,False]
-        pose=(np.array([.41,.41]),np.diag([1/2048,1/1152]))
-        def nominal(frame,pose,center,tangent,normal):
+    def test_all_three_complete_the_build_with_partial_and_delayed_readings(self):
+        frame=Image.new("RGB",(1366,768),(110,90,53))
+        pose=(np.array([835/2048,475/1152]),np.diag([1/2048,1/1152]))
+        def bank(frame,pose,center,tangent,normal):
             from wastelands_team import BANK_OFFSET
             return [v+BANK_OFFSET*n for v,n in zip(center,normal)]
-        with patch.object(alt,"game",game),patch("wastelands_alt.perimeter_point",side_effect=nominal), \
-             patch("wastelands_alt.placement_pose",return_value=pose),patch.object(alt,"hover_count",side_effect=[1,1,1,1,2]), \
-             patch("twd_bot.read_hotbar",return_value=[(.532,700)]):
-            self.assertIn("счётчик прежний",alt.place("plunger_2",frame))
-            self.assertNotIn("target",self.match.places[1,"plunger_2"])
-            self.assertIn("Поставил Plunger 2/4",alt.place("plunger_2",frame))
-        self.assertEqual(self.match.places[1,"plunger_2"]["point"],position(1,"plunger_2",1))
-        self.assertEqual(self.match.places[1,"plunger"]["state"],"reserved")
-        self.assertEqual([call.args for call in game.take.call_args_list], [(4,), (4,)])
-        self.assertEqual(game.click_live.call_count,2)
+        rosters=[[] for _ in self.alts]
+        clicks=[[] for _ in self.alts]
+        with ExitStack() as stack:
+            stack.enter_context(patch("twd_bot.log"))
+            stack.enter_context(patch("wastelands_alt.placement_pose",return_value=pose))
+            stack.enter_context(patch("wastelands_alt.perimeter_point",side_effect=bank))
+            stack.enter_context(patch("wastelands_alt.placement_cash",return_value=None))
+            for i,a in enumerate(self.alts):
+                a.phase="battle"
+                a.ready=True
+                a.next_slot_check=float("inf")
+                def click(pt,locate,name,i=i,a=a):
+                    self.assertEqual(locate(frame),pt)
+                    pending=[r for r in self.match.places.values() if r["player"]==a.player and r.get("target")]
+                    self.assertEqual(len(pending),1)
+                    unit=pending[0]["unit"]
+                    clicks[i].append(unit)
+                    if i!=1 or len(clicks[i])!=1:  # the first physical site was rejected
+                        rosters[i].append(unit)
+                def hover(slot,limit,i=i,a=a):
+                    kind=next(k for k,v in a.slots.items() if v==slot)
+                    if i==0 or (i==2 and len(rosters[i])%3==2):
+                        return None
+                    return sum(u.partition("_")[0]==kind for u in rosters[i])
+                def manager(kind,limit,*,cards,i=i):
+                    # After the first unit all card titles may be clipped.
+                    return UnitCounts(None,len(rosters[i]))
+                game=stack.enter_context(patch.object(a,"game"))
+                game.grab.return_value=frame
+                game.click_live.side_effect=click
+                stack.enter_context(patch.object(a,"hover_count",side_effect=hover))
+                stack.enter_context(patch.object(a,"manager_counts",side_effect=manager))
+            for _ in range(40):
+                for a in self.alts:
+                    if len(a.placed)<10:
+                        a.next_check=0
+                        a.tick(a.exchange())
+                if all(len(roster)==10 and len(a.placed)==10 for a,roster in zip(self.alts,rosters)):
+                    break
+        self.assertEqual(rosters,[list(PLACEMENT_ORDER) for _ in PLAYERS])
+        self.assertEqual([len(c) for c in clicks],[10,11,10])
+        self.assertTrue(all(r["state"]=="placed" and not r.get("target") for r in self.match.places.values()))
 
     def test_teleport_frame_and_ack(self):
         a=self.alts[1]
@@ -779,6 +839,40 @@ class VisionTest(unittest.TestCase):
                 a.ocr.read.assert_not_called()
                 self.assertIsNone(a.slot_count(frame,slot,1 if limit==4 else 4))
                 self.assertIsNone(a.slot_count(frame,slot+1,limit))
+
+    def test_balance_on_rdp_over_green_arrows_and_wave_effects(self):
+        import twd_bot as farm
+        for value,size in ((1140,(1353,697)),(21535,(1354,697))):
+            frame=Image.new("RGB",size)
+            l,t,_,_=farm.MONEY_REGION
+            with Image.open(Path(__file__).parent/"tests"/"fixtures"/f"cash_rdp_{value}.png") as crop:
+                # Only the two green masks from the HUD are kept in the fixture.
+                self.assertIsNone(farm.read_money_image(crop))
+                frame.paste(crop,(int(size[0]*l),int(size[1]*t)))
+            read=Mock()
+            self.assertEqual(placement_cash(frame,read),value)
+            read.assert_not_called()
+
+    def test_manager_total_from_zero_through_ten_requires_footer_and_suffix(self):
+        import twd_bot as farm
+        panel=Image.new("RGB",(400,700),(20,30,32))
+        draw=ImageDraw.Draw(panel)
+        draw.rectangle((18,651,190,682),fill=(18,99,29))
+        draw.rectangle((208,651,378,682),fill=(99,20,15))
+        for i in range(5):
+            draw.rectangle((15+7*i,40,19+7*i,50),fill="white")
+        self.assertIsNone(visual_manager_total(panel))
+        for n in range(11):
+            draw.rectangle((53,36,105,55),fill=(20,30,32))
+            x=56
+            for char in str(n):
+                glyph,aspect=farm._get_templates()[char]
+                ink=Image.fromarray((glyph*255).astype("uint8")).resize((round(aspect*11),11),Image.Resampling.LANCZOS)
+                panel.paste("white",(x,40,x+ink.width,51),ink)
+                x+=ink.width+1
+            self.assertEqual(visual_manager_total(panel),n)
+        draw.rectangle((0,640,399,699),fill="black")
+        self.assertIsNone(visual_manager_total(panel))
 
     def test_printed_cooldown_is_not_active_timer(self):
         row=[("45s",.3,.4,.03,.02),("cooldown",.34,.4,.05,.02)]
