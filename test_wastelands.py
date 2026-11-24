@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from wastelands_alt import Alt, Game, Wait, UnitCounts, level, manager_card, manager_total, manager_unit_count, placement_cash, preserve_bank_capacity, visual_manager_total, countdown
-from wastelands_team import AltConnection, BRANCH, JUNCTION, Match, PAIR_LIFETIME, PLACEMENT_ORDER, PLAYERS, TRUNK, UNITS, bank_slot, connect_by_pin, position, serve
+from wastelands_team import AltConnection, BRANCH, JUNCTION, Match, PAIR_LIFETIME, PLACEMENT_ORDER, PLAYERS, TRUNK, UNITS, bank_slot, connect_by_pin, placement_attempts, position, serve
 from wastelands_view import ANCHOR, OCR, label, placement_in_view, road_pose, screen_point
 from wastelands_manager import titan_cards, upgrade_price
 
@@ -536,6 +536,81 @@ class NetworkTest(unittest.TestCase):
             self.assertGreater(np.linalg.norm((np.array(first)-second)*frame.size),26)
             np.testing.assert_allclose(screen_point(pose,self.match.places[1,"screen"]["point"]),second)
 
+    def test_third_helper_skips_rubble_then_places_both_on_two_clear_patches(self):
+        a = self.alts[2]
+        size = np.array([1366,768])
+        sand = Image.new("RGB",(72,72),(95,77,46))
+        tile = Image.new("RGB",(24,24),(95,77,46))
+        stones = ImageDraw.Draw(tile)
+        stones.polygon([(0,5),(9,0),(19,4),(13,16),(2,20)],fill=(94,82,64))
+        stones.polygon([(14,15),(23,7),(23,22),(16,23)],fill=(81,71,57))
+        repeats = (math.ceil(size[1]/tile.height),math.ceil(size[0]/tile.width),1)
+        rubble = np.tile(np.asarray(tile),repeats)[:size[1],:size[0]]
+        for angle in (.35,.35+math.pi):
+            with self.subTest(angle=angle):
+                self.match.start("nightmare","Host")
+                remembered = position(3,"amplifier",placement_attempts("amplifier")-1)
+                self.match.titan_sites["3/amplifier"] = remembered
+                a.reset(a.exchange())
+                frame = Image.fromarray(rubble.copy())
+                co,si = math.cos(angle),math.sin(angle)
+                mat = 1.12*np.array([[co,-si],[si,co]])/size[:,None]
+                pose = (np.array([.51,.46])-mat@(position(3,"amplifier")-ANCHOR),mat)
+                pads = [np.array(screen_point(pose,position(3,kind)))*size for kind in ("amplifier","screen")]
+                built = []
+                def click(point,locate,title):
+                    self.assertEqual(locate(frame),point)
+                    xy = np.array(point)*size
+                    self.assertLess(min(np.linalg.norm(xy-pad) for pad in pads),20)
+                    self.assertGreater(np.linalg.norm(xy-np.array(screen_point(pose,remembered))*size),28)
+                    built.append(title)
+                with patch.object(a,"game") as game,patch.object(a,"map_pose",return_value=pose), \
+                     patch("wastelands_alt.placement_cash",return_value=30000), \
+                     patch.object(a,"placement_baseline",side_effect=lambda *args:UnitCounts(0,8+len(built))), \
+                     patch.object(a,"hover_count",return_value=1):
+                    game.grab.return_value = frame
+                    game.click_live.side_effect = click
+                    self.assertIn("ищу свободный песок",a.place("amplifier",frame))
+                    self.assertEqual(a.preferred_titans["amplifier"],remembered)
+                    game.click_live.assert_not_called()
+                    self.assertNotIn("target",self.match.places[3,"amplifier"])
+                    for pad in pads:
+                        frame.paste(sand,tuple(np.rint(pad-36).astype(int)))
+                    for kind in ("amplifier","screen"):
+                        a.update_places(a.exchange())
+                        a.place(kind,frame)
+                        self.assertIn("Поставил",a.recheck_pending(a.exchange()))
+                    self.assertEqual(built,["Amplifier","Screen"])
+                    a_pt,s_pt = (self.match.places[3,k]["point"] for k in ("amplifier","screen"))
+                    self.assertGreaterEqual(math.dist(a_pt,s_pt),54)
+
+    def test_old_coordinator_cannot_send_third_helper_back_across_the_road(self):
+        a = self.alts[2]
+        old = {"sites":[[1590,906],[1570,826]],"preferred_site":[1590,906]}
+        with patch.object(a,"exchange",return_value=old):
+            with self.assertRaisesRegex(Wait,"Обнови основу"):
+                a.placement_sites("amplifier")
+            self.assertNotIn("amplifier",a.sites)
+
+    def test_shifted_third_view_needs_two_matching_landmark_fits(self):
+        a = self.alts[2]
+        frame = Image.new("RGB",(1366,768))
+        mat = np.diag(1/np.array(frame.size))
+        first = (np.array([.32,.53]),mat)
+        shifted = (first[0]+[.003,-.002],mat)
+        with patch.object(a.game,"rect",return_value=(0,0,1366,768)), \
+             patch("wastelands_alt.placement_pose",return_value=None), \
+             patch("wastelands_view.landmark_pose") as landmarks:
+            for other in (None,(first[0],-mat),(first[0]+[.05,0],mat)):
+                landmarks.side_effect = [first,other]
+                self.assertIsNone(a.map_pose(frame))
+                self.assertIsNone(a.reference)
+            landmarks.side_effect = [first,shifted]
+            origin,transform = a.map_pose(frame)
+            np.testing.assert_allclose(origin,(first[0]+shifted[0])/2)
+            np.testing.assert_allclose(transform,mat)
+            self.assertIs(a.reference,frame)
+
     def test_first_screen_explores_past_five_rejected_patches_and_remembers_success(self):
         a = self.alts[0]
         amp = min(a.placement_sites("amplifier"),key=lambda p:math.dist(p,(1278,646)))
@@ -621,8 +696,9 @@ class NetworkTest(unittest.TestCase):
         a=self.alts[2]
         frame=Image.new("RGB",(1366,768),(110,88,53))
         size=np.asarray(frame.size)
-        origin=np.array([.596,.670])
         mat=np.array([[-.0004268,.0002371],[-.0004639,-.0008350]])
+        # Put the new near bank above the initial viewport.
+        origin=np.array([.53,-.12])-mat@(position(3,"amplifier")-ANCHOR)
         view=[(origin,mat)]
         def turn(px):
             angle=math.radians(px/5)
