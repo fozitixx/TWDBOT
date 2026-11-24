@@ -8,7 +8,7 @@ from pynput import mouse
 
 import twd_bot as farm
 from wastelands_team import ABILITIES, EARLY, PLACEMENT_ORDER, bank_slot, placement_attempts, Wait, placement_label, position, private_server_links
-from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, perimeter_point, rank_titan_sites, placement_pose, mission_button, ready_button, wastelands_slots, scene, screen_point, tracked_pose
+from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, perimeter_point, rank_titan_sites, placement_pose, mission_button, ready_button, visual_slot_count, wastelands_slots, scene, screen_point, tracked_pose
 
 
 class Game(farm.Bot):
@@ -381,16 +381,17 @@ class Alt:
         # White glyphs have a dark outline, even on the white TV portrait.
         # Remove bright background regions touching the edges before OCR.
         gray = icon.convert("L")
-        for threshold in (155,120,None):
-            if threshold is None:
-                sample = icon
-            else:
-                mask = ImageOps.expand(gray.point(lambda v: 255 if v>=threshold else 0),1,fill=255)
-                ImageDraw.floodfill(mask,(0,0),0)
-                bounds = mask.getbbox()
-                if not bounds:
-                    continue
-                sample = ImageOps.expand(ImageOps.invert(mask.crop(bounds)),4,fill=255)
+        samples = []
+        for threshold in (155,135,120):
+            mask = ImageOps.expand(gray.point(lambda v: 255 if v>=threshold else 0),1,fill=255)
+            ImageDraw.floodfill(mask,(0,0),0)
+            bounds = mask.getbbox()
+            if bounds:
+                count = visual_slot_count(mask,limit)
+                if count is not None:
+                    return count
+                samples.append(ImageOps.expand(ImageOps.invert(mask.crop(bounds)),4,fill=255))
+        for sample in (*samples,icon):
             words = self.ocr.read(sample,zoom=5)
             text = "".join(word[0] for word in words).replace(" ","")
             text = text.translate(str.maketrans({"O":"0", "o":"0", "I":"1", "l":"1"}))
@@ -406,15 +407,18 @@ class Alt:
             return None
         self.game.hover((self.slot_center(frame,slot),.875))
         self.game.sleep(.25)
-        reads = []
-        for _ in range(2):
+        previous = None
+        for attempt in range(4):
+            if attempt:
+                self.game.sleep(.19)
             frame = self.game.grab()
             if self.game.rect()!=rect or farm.afk_panel(frame):
                 return None
-            reads.append(self.slot_count(frame,slot,limit))
-            if len(reads)==1:
-                self.game.sleep(.19)
-        return reads[0] if reads[0]==reads[1] else None
+            count = self.slot_count(frame,slot,limit)
+            if count is not None and count==previous:
+                return count
+            previous = count
+        return None
 
     def placement_outcome(self,slot,limit,before_count):
         # Income, slot price and a disappearing preview cannot prove ownership.

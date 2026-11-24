@@ -169,6 +169,49 @@ def mission_button(img, mode):
 
 
 @lru_cache(maxsize=1)
+def _counter_glyphs():
+    # Reference masks in game font order: 0, 1, 2, 3, 4, slash.
+    with Image.open(Path(__file__).with_name("wastelands_digits.png")) as atlas:
+        return np.stack([np.asarray(atlas.crop((x,0,x+24,32)))>=128 for x in range(0,144,24)])
+
+
+def visual_slot_count(mask,limit):
+    """Read three outlined glyphs on one card; require the correct denominator."""
+    refs = _counter_glyphs()
+    work = mask.copy()
+    glyphs = []
+    component_lut = [255 if i==128 else 0 for i in range(256)]
+    while (area := work.getbbox()) is not None:
+        left,top,right,_ = area
+        start = work.crop((left,top,right,top+1)).getbbox()[0]
+        ImageDraw.floodfill(work,(left+start,top),128)
+        component = work.point(component_lut)
+        work.paste(0,mask=component)
+        x,y,r,b = component.getbbox()
+        h,w = b-y,r-x
+        if not (.24*mask.height<=h<=.78*mask.height and .20*h<=w<=1.18*h):
+            continue
+        sample = np.asarray(component.crop((x,y,r,b)).resize((24,32),Image.Resampling.BILINEAR))>=128
+        scores = (refs & sample).sum(axis=(1,2))/(refs | sample).sum(axis=(1,2))
+        runner,best = np.argsort(scores)[-2:]
+        if scores[best]>=.65 and scores[best]-scores[runner]>=.075:
+            glyphs.append((int(best),x,r,(y+b)/2,h))
+    results = set()
+    for slash,sx,sr,sy,sh in glyphs:
+        if slash!=5:
+            continue
+        for number,x,r,y,h in glyphs:
+            if number>limit or not (-.1*h<=sx-r<=.38*h and abs(y-sy)<.28*h):
+                continue
+            for digit,dx,dr,dy,dh in glyphs:
+                if (digit==limit and -.12*h<=dx-sr<=.38*h and abs(y-dy)<.20*h
+                        and .72*h<=dh<=1.35*h and .9*h<=sh<=1.8*h
+                        and .25*mask.width<(x+dr)/2<.77*mask.width):
+                    results.add(number)
+    return results.pop() if len(results)==1 else None
+
+
+@lru_cache(maxsize=1)
 def _hotbar_portraits():
     with Image.open(Path(__file__).with_name("wastelands_hotbar.png")) as strip:
         return np.stack([np.asarray(strip.crop((x,0,x+32,32)),dtype=np.int16)
