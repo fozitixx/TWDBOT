@@ -495,17 +495,17 @@ class App:
             text(line,f"{x:.0f}, {y:.0f}",size=9,color="muted").pack(side="right")
             if row.get("target") and time.monotonic()-row.get("target_since",0)>12:
                 target = row["target"]
-                def resolve(ok,u=unit,p=target):
+                def resolve(ok,u=unit,p=target,since=row.get("target_since")):
                     with self.match.lock:
                         current=self.match.places.get((player,u),{})
-                        if self.match.run!=run or current.get("target")!=p:
+                        if self.match.run!=run or current.get("target")!=p or current.get("target_since")!=since:
                             win.destroy()
                             return
                         if ok:
                             current.update(point=p,state="placed")
                         current.pop("target",None)
                     win.destroy()
-                text(area,f"Проверь в игре точку {target[0]:.0f}, {target[1]:.0f}. Юнит встал?",color="yellow").pack(anchor="w")
+                text(area,f"Ручная сверка точки {target[0]:.0f}, {target[1]:.0f}. Юнит встал?",color="yellow").pack(anchor="w")
                 button(area,"Да, стоит",lambda f=resolve:f(True)).pack(side="left")
                 button(area,"Нет, место свободно",lambda f=resolve:f(False)).pack(side="left",padx=4)
         def retry():
@@ -579,7 +579,7 @@ class App:
                                                 fg=C["accent" if online else "muted"])
                 if running:
                     pending = sum(1 for (owner,_),place in self.match.places.items() if owner==i and
-                                  place.get("target") and now-place.get("target_since",now)>12)
+                                  place.get("target") and not place.get("slot") and now-place.get("target_since",now)>12)
                     caption = f"Проверить места ({pending})" if pending else "Места юнитов"
                     if self.place_buttons[i].cget("text")!=caption:
                         self.place_buttons[i].configure(text=caption)

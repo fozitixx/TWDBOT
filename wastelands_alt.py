@@ -1,13 +1,14 @@
 """One foreground Roblox client. All game input is serialized in this worker."""
 import re
 import time
+from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageGrab, ImageOps
 from pynput import mouse
 
 import twd_bot as farm
-from wastelands_team import ABILITIES, EARLY, PLACEMENT_ORDER, bank_slot, placement_attempts, Wait, placement_label, position, private_server_links
+from wastelands_team import ABILITIES, EARLY, PLACEMENT_ORDER, bank_slot, placement_attempts, Wait, placement_conflict, placement_label, position, private_server_links
 from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, perimeter_point, rank_titan_sites, placement_pose, mission_button, ready_button, visual_slot_count, wastelands_slots, scene, screen_point, tracked_pose
 
 
@@ -82,7 +83,8 @@ class Game(farm.Bot):
             raise Wait(f"Курсор не попал на «{title}» · повторяю наведение")
         self.m.press(mouse.Button.left)
         try:
-            self.sleep(.15)
+            # After mouse-down a network interruption cannot mean "never clicked".
+            time.sleep(.15)
         finally:
             self.m.release(mouse.Button.left)
 
@@ -135,12 +137,87 @@ MANAGER_TITLES = {
     "scientistcamcorderman":"farm", "scientistcameraman":"farm",
     "titancamcorderman":"tcam",
 }
-COUNT_TRIES = 3
+
+@dataclass(frozen=True)
+class UnitCounts:
+    """Two independent counters for one player's serialized placement."""
+    slot: int | None = None
+    total: int | None = None
+
+    def delta(self, after):
+        changes = {new-old for old,new in ((self.slot,after.slot),(self.total,after.total))
+                   if old is not None and new is not None}
+        return changes.pop() if len(changes)==1 else None
+
+    def known(self):
+        return self.slot is not None or self.total is not None
+
+    def __str__(self):
+        return ", ".join(f"{name} {value}" for name,value in (("слот",self.slot),("UNITS",self.total))
+                         if value is not None) or "не прочитано"
 
 
-def manager_unit_count(words, kind, limit):
+def manager_total(words):
+    """Read UNITS N as one label, even if OCR splits its words."""
+    for text,x,y,w,h in words:
+        token = text.casefold().strip()
+        labels = ("units","юниты","юнитов","единицы")
+        if not token.startswith(labels):
+            continue
+        if token.rstrip(":") in labels:
+            following = sorted((v for v in words if x+w-.003<=v[1]<x+w+max(.025,h)
+                                and abs(v[2]+v[4]/2-y-h/2)<h*.55),key=lambda v:v[1])
+            if following:
+                token += following[0][0]
+        hit = re.fullmatch(r"(?:units|юниты|юнитов|единицы)\s*:?\s*(\d{1,2})",token)
+        if hit:
+            return int(hit[1])
+    return None
+
+
+def visual_manager_total(panel):
+    """Read the numeric suffix of UNITS, anchored by the two footer buttons."""
+    footer = farm.crop_frac(panel,(.035,.91,.965,.992))
+    r,g,b = np.asarray(footer.convert("RGB"),dtype=np.int16).transpose(2,0,1)
+    mid = footer.width//2
+    green = (g>60)&(g-r>25)&(g-b>18)
+    red = (r>60)&(r-g>28)&(r-b>22)
+    if green[:,:mid].any(axis=0).mean()<.58 or red[:,mid:].any(axis=0).mean()<.58:
+        return None
+    header = farm.crop_frac(panel,(.014,.044,.28,.091)).convert("RGB")
+    white = np.asarray(header).min(axis=2)
+    readings = []
+    for threshold in (172,200):
+        mask = white>threshold
+        ys = np.flatnonzero(mask.any(axis=1))
+        if not len(ys):
+            return None
+        height = ys[-1]-ys[0]+1
+        runs = farm._runs(mask.any(axis=0))
+        # The title is several letters wide. Space before the number is
+        # wider than letter spacing; the suffix occupies one or two digits.
+        gaps = [(left-runs[i-1][1],left) for i,(left,_) in enumerate(runs) if i>=5
+                and 2*height<runs[i-1][1]-runs[0][0]<7*height
+                and runs[-1][1]-left<=2.1*height]
+        if not gaps:
+            return None
+        gap,left = max(gaps)
+        if not .16*height<=gap<=1.3*height or height<6:
+            return None
+        total = farm._read_green_number(mask[:,left:],tol=.13,dollar=False)
+        if total is None or total>99:
+            return None
+        readings.append(total)
+    return readings[0] if readings[0]==readings[1] else None
+
+
+def manager_unit_count(words, kind, limit, total=None):
     """Words use panel-local coordinates. An incomplete list cannot prove zero."""
-    if not label(words,"UNIT MANAGER",(0,0,1,.10)):
+    if total is None:
+        if not label(words,"UNIT MANAGER",(0,0,1,.10)):
+            return None
+        total = manager_total([v for v in words if v[1]<.28 and v[2]<.12])
+    if total is None:
         return None
     def lines(left,top,right,bottom):
         inside = sorted((v for v in words if left<=v[1]+v[3]/2<right
@@ -151,14 +228,40 @@ def manager_unit_count(words, kind, limit):
             row = [v for v in inside if abs(v[2]+v[4]/2-mid)<max(first[4],v[4])*.55]
             inside = [v for v in inside if v not in row]
             yield re.sub(r"[^a-z0-9]","","".join(v[0].lower() for v in sorted(row,key=lambda v:v[1])))
-    totals = [int(line[5:]) for line in lines(0,.038,.28,.119) if re.fullmatch(r"units[0-9]{1,2}",line)]
-    if len(totals)!=1:
-        return None
     cards = [MANAGER_TITLES[line] for left in (0,.5)
              for line in lines(left,.116,left+.5,.92) if line in MANAGER_TITLES]
     count = cards.count(kind)
-    if count<=limit and len(cards)<=totals[0] and (len(cards)==totals[0] or count==limit):
+    if count<=limit and len(cards)<=total and (len(cards)==total or count==limit):
         return count
+    return None
+
+
+def placement_cash(frame, read):
+    region = farm.crop_frac(frame,farm.MONEY_REGION)
+    cash = farm.read_money_image(region)
+    if cash is not None:
+        return cash
+    # Isolate the amount next to the banknote. Glowing green road arrows on
+    # Wastelands otherwise join the digits, particularly on compressed RDP frames.
+    r,g,b = np.asarray(region.convert("RGB"),dtype=np.int16).transpose(2,0,1)
+    green = (g>110)&(g-r>30)&(g-b>30)
+    icon = farm._find_icon(green[:,:region.width//2])
+    if icon is None:
+        return None
+    top,bottom,right = icon
+    height = bottom-top+1
+    ink = (g>116)&(g-r>19)&(g-b>18)&(r>52)&(b>51)&(np.abs(r-b)<28)&(g-r<108)
+    band = ink[max(0,top-height//4):bottom+height//3+1, right+1:right+9*height]
+    if not band.any():
+        return None
+    cash = farm._read_green_number(band,tol=farm.MONEY_TOL)
+    if cash is not None:
+        return cash
+    digits = ImageOps.expand(Image.fromarray(np.where(band,0,255).astype(np.uint8)),4,fill=255)
+    words = read(digits,zoom=5)
+    value = "".join(v[0] for v in words).replace(" ","")
+    if re.fullmatch(r"\$(?:\d{1,3}(?:,\d{3})+|\d{1,7})",value):
+        return int(value[1:].replace(",",""))
     return None
 
 
@@ -209,7 +312,7 @@ class Alt:
         self.phase = "lobby"
         self.slots = dict(getattr(self,"configured_slots",{}))
         self.next_slot_check = 0
-        self.full_early = set()
+        self.at_limit = set()
         self.afk_signature = None
         self.afk_clicks = 0
         self.afk_retry_at = 0
@@ -221,15 +324,23 @@ class Alt:
         self.last_invite = None
         self.invite_attempts = 0
         self.placed = set()
+        self.points = {}
+        self.team_places = state.get("places",[])
         self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
         self.sites = {}
         self.rescan_at = {}
         self.site_rescans = {}
         self.host_sites = state.get("placement_sites",False)
+        self.host_totals = state.get("placement_totals",False)
         self.pending_places = set()
-        self.count_retry_at = {}
-        self.count_failures = {}
-        self.slot_wait_until = {}
+        self.last_inventory = None
+        self.manager_until = {}
+        self.unchanged = None
+        self.next_check = 0
+        self.read_delay = 0
+        self.wait_status = ""
+        self.ocr_retry = 0
+        self.cash_uncertain = False
         self.retry = state["progress"].get("retry",0)
         self.levels = {"amplifier":0,"screen":0}
         self.wait_cash = 0
@@ -242,6 +353,25 @@ class Alt:
 
     def text(self, img, box=(0,0,1,1)):
         return self.ocr.read(img,box)
+
+    def placement_text(self,img,box=(0,0,1,1),*,zoom=2):
+        if time.monotonic()<self.ocr_retry:
+            return []
+        try:
+            return self.ocr.read(img,box,zoom=zoom)
+        except (OSError,RuntimeError) as exc:
+            self.ocr_retry = time.monotonic()+8
+            farm.log(f"Wastelands · твинк {self.player} · OCR: {exc}")
+            return []
+
+    def wait_for_check(self,message,delay=None):
+        if delay is None:
+            self.read_delay = min(8,max(1,2*self.read_delay))
+            delay = self.read_delay
+            message += f" · повтор через {delay} с"
+        self.next_check = time.monotonic()+delay
+        self.wait_status = message
+        return message
 
     def confirm_group(self):
         if not self.invited:
@@ -344,8 +474,15 @@ class Alt:
         if self.last_invite is not None and now-self.last_invite > 45:
             self.last_invite = None
             self.invite_attempts = 0
-        if ((self.invited or self.voted) and (img is not None and ready_button(img) or self.game.ready_visible())
-                or self.placed and self.game.money() is not None):
+        at_ready = (self.invited or self.voted) and (img is not None and ready_button(img) or self.game.ready_visible())
+        in_battle = False
+        if not at_ready and img is not None and (self.ready or self.voted or self.placed or self.pending_places):
+            words = self.placement_text(img,(.23,.043,.51,.16),zoom=3)
+            in_battle = bool(re.search(r"(?:wave|волна)\d{1,2}/(?:25|30)\b",
+                                       "".join(v[0] for v in words).replace(" ",""),re.I))
+            if not in_battle and (self.placed or self.pending_places):
+                in_battle = self.game.money() is not None
+        if at_ready or in_battle:
             self.phase = "battle"
             self.game.camera_top_down()
             return "Подготовка расстановки"
@@ -378,20 +515,25 @@ class Alt:
         return "Жду приглашение или голосование"
 
     def update_places(self,state):
-        own = {p["unit"]:p for p in state["places"] if p["player"]==self.player}
+        self.team_places = state["places"]
+        own = {p["unit"]:p for p in self.team_places if p["player"]==self.player}
         if not all(unit in own for unit in PLACEMENT_ORDER):
             raise Wait("Основа не передала десять мест. Обнови основу до 6.0.4.")
-        self.placed = {u for u,p in own.items() if p["state"]=="placed"}
+        placed = {u for u,p in own.items() if p["state"]=="placed"}
+        pending = {u for u,p in own.items() if p.get("target")}
+        if placed!=self.placed or self.pending_places-pending:
+            # A manual decision on the host invalidates our previous observation.
+            self.last_inventory = self.unchanged = None
+            self.next_check = self.read_delay = 0
+            self.manager_until.clear()
+        self.placed = placed
         self.points = {u:p["point"] for u,p in own.items() if u in self.placed}
         if self.confirm:
-            op,unit,point = self.confirm
-            if own[unit].get("target")==point:
-                self.exchange(op,unit=unit,point=point)
+            op,unit,point,since = self.confirm
+            if own[unit].get("target")==point and (since is None or own[unit].get("target_since")==since):
+                self.exchange(op,unit=unit,point=point,target_since=since)
             self.confirm = None
             return True
-        pending = {unit for unit,row in own.items() if row.get("target")}
-        for unit in self.pending_places-pending:
-            self.count_failures.pop(unit.partition("_")[0],None)
         for unit in self.pending_places-pending-self.placed:
             self.attempt[unit] += 1
         self.pending_places = pending
@@ -412,197 +554,258 @@ class Alt:
     def slot_center(frame,slot):
         return .5 + (slot-3.5)*.13*frame.height/frame.width
 
-    def slot_count(self,frame,slot,limit):
-        x = self.slot_center(frame,slot)*frame.width
+    def slot_icon(self,frame,slot):
         h = frame.height
-        icon = frame.crop((round(x-.046*h),round(.854*h),round(x+.046*h),round(.897*h)))
-        # White glyphs have a dark outline, even on the white TV portrait.
-        # Remove bright background regions touching the edges before OCR.
-        gray = icon.convert("L")
-        samples = []
+        x = self.slot_center(frame,slot)*frame.width
+        return frame.crop((round(x-.046*h),round(.854*h),round(x+.046*h),round(.897*h)))
+
+    def slot_count(self,frame,slot,limit):
+        gray = self.slot_icon(frame,slot).convert("L")
         for threshold in (155,135,120):
             mask = ImageOps.expand(gray.point(lambda v: 255 if v>=threshold else 0),1,fill=255)
             ImageDraw.floodfill(mask,(0,0),0)
-            bounds = mask.getbbox()
-            if bounds:
-                count = visual_slot_count(mask,limit)
-                if count is not None:
-                    return count
-                samples.append(ImageOps.expand(ImageOps.invert(mask.crop(bounds)),4,fill=255))
-        for sample in (*samples,icon):
-            words = self.ocr.read(sample,zoom=5)
-            text = "".join(word[0] for word in words).replace(" ","")
-            text = text.translate(str.maketrans({"O":"0", "o":"0", "I":"1", "l":"1"}))
-            found = re.fullmatch(r"([0-4])/"+str(limit),text)
-            if found and int(found[1])<=limit:
-                return int(found[1])
+            count = visual_slot_count(mask,limit)
+            if count is not None:
+                return count
         return None
 
     def hover_count(self,slot,limit):
         rect = self.game.rect()
         frame = self.game.grab()
         if farm.afk_panel(frame):
-            return None
+            raise Wait("Проверка AFK на экране")
         self.game.hover((self.slot_center(frame,slot),.875))
-        self.game.sleep(.25)
+        self.game.sleep(.16)
         previous = None
+        frames = []
         for attempt in range(4):
             if attempt:
-                self.game.sleep(.19)
+                self.game.sleep(.12)
             frame = self.game.grab()
             if self.game.rect()!=rect or farm.afk_panel(frame):
-                return None
+                raise Wait("Игровое окно изменилось во время проверки слота")
             count = self.slot_count(frame,slot,limit)
             if count is not None and count==previous:
                 return count
             previous = count
-        return None
+            frames.append(frame)
+        # Do the inexpensive visual pass before calling Windows OCR. Only two
+        # recent, independently captured fractions with the right limit can agree.
+        observed = []
+        for frame in frames[-2:]:
+            icon = self.slot_icon(frame,slot)
+            words = self.placement_text(icon,zoom=5)
+            digits = "".join(v[0] for v in words).replace(" ","")
+            digits = digits.translate(str.maketrans({"O":"0","o":"0","I":"1","l":"1"}))
+            hit = re.fullmatch(r"([0-4])/"+str(limit),digits)
+            if not hit or int(hit[1])>limit:
+                return None
+            observed.append(int(hit[1]))
+        return observed[0] if observed[0]==observed[1] else None
 
-    def manager_count(self,kind,limit):
+    def manager_counts(self,kind,limit,*,cards):
         frame = self.game.grab()
         if farm.afk_panel(frame):
             raise Wait("Проверка AFK на экране")
         self.game.drop()
         self.needs_close = True
         try:
-            if not self.header(frame):
+            if not manager_bounds(frame) and not self.header(frame):
                 self.game.key("v")
-                self.game.sleep(.28)
-            previous = None
-            for _ in range(2):
+                self.game.sleep(.22)
+            previous = UnitCounts()
+            for attempt in range(3):
+                if attempt:
+                    self.game.sleep(.13)
                 frame = self.game.grab()
+                if farm.afk_panel(frame):
+                    raise Wait("Проверка AFK на экране")
                 bounds = manager_bounds(frame)
-                if not bounds:
-                    return None
-                x,y,w,h = bounds
-                panel = frame.crop((x,y,x+w,y+h))
-                count = manager_unit_count(self.text(panel),kind,limit)
-                if count is None:
-                    return None
-                if count==previous:
-                    return count
-                previous = count
-                self.game.sleep(.12)
-            return None
+                panel = None
+                total = None
+                if bounds:
+                    x,y,w,h = bounds
+                    panel = frame.crop((x,y,x+w,y+h))
+                    total = manager_total(self.placement_text(panel,(0,.035,.29,.115),zoom=4))
+                    if total is None:
+                        total = visual_manager_total(panel)
+                if total is None:
+                    # A compressed or clipped border need not hide the UNITS label.
+                    words = self.placement_text(frame,(0,0,1,.32))
+                    if label(words,"UNIT MANAGER"):
+                        total = manager_total(words)
+                if total is None:
+                    previous = UnitCounts()
+                    continue
+                count = 0 if total==0 else None
+                if cards and total and panel is not None:
+                    count = manager_unit_count(self.placement_text(panel),kind,limit,total)
+                if previous.total==total:
+                    return UnitCounts(count if previous.slot==count else None,total)
+                previous = UnitCounts(count,total)
+            return UnitCounts()
         finally:
             self.close_manager()
 
-    def verified_count(self,slot,limit):
+    def placement_baseline(self,kind,slot,limit):
+        # An observed result is the next baseline while this worker has kept
+        # exclusive control. Reacquire on a stage change, manual edit or idle gap.
+        recent_total = None
+        if self.last_inventory:
+            last_kind,expires,reading = self.last_inventory
+            if time.monotonic()<expires:
+                if last_kind==kind:
+                    return reading
+                recent_total = reading.total
         count = self.hover_count(slot,limit)
+        confirmed = sum(u.partition("_")[0]==kind for u in self.placed)
+        if count is not None and count<confirmed:
+            count = None
+        if count==limit or (count is not None and not self.host_totals):
+            return UnitCounts(count)
+        if recent_total is not None:
+            if count is not None and recent_total>=count:
+                return UnitCounts(count,recent_total)
+            if count is None and recent_total==len(self.placed):
+                # Every unit in the calibrated roster belongs to a confirmed row.
+                return UnitCounts(confirmed,recent_total)
+        manager = self.manager_counts(kind,limit,cards=count is None)
+        if manager.slot is not None and manager.slot<confirmed:
+            return UnitCounts()
         if count is None:
-            kind = next((k for k,v in self.slots.items() if v==slot),None)
-            if kind:
-                count = self.manager_count(kind,limit)
-        return count
+            if manager.total is not None:
+                self.manager_until[kind] = time.monotonic()+12
+            count = manager.slot
+        if manager.total is not None and manager.total<max(len(self.placed),count or 0):
+            return UnitCounts()
+        reading = UnitCounts(count,manager.total if self.host_totals else None)
+        if reading.known():
+            self.last_inventory = (kind,time.monotonic()+8,reading)
+        return reading
 
-    def failed_count(self,kind):
-        tries = self.count_failures.get(kind,0)+1
-        self.count_failures[kind] = tries
-        if tries>=COUNT_TRIES:
-            return f"{kind.upper()} · проверка приостановлена. Места юнитов → Повторить поиск места"
-        return f"{kind.upper()} · счётчик не подтверждён ({tries}/{COUNT_TRIES})"
-
-    def placement_outcome(self,slot,limit,before_count):
-        # Income, slot price and a disappearing preview cannot prove ownership.
-        # Give the server time to publish the new count before a rejected retry.
-        self.game.sleep(.60)
-        count = self.verified_count(slot,limit)
-        if count==before_count+1:
-            return "commit"
-        if count==before_count:
-            self.game.sleep(.65)
-            count = self.verified_count(slot,limit)
-            if count==before_count+1:
-                return "commit"
-            if count==before_count:
-                return "release"
-        return None
+    def placement_readback(self,kind,slot,before,double_check):
+        limit = 4 if kind in EARLY else 1
+        manager = None
+        if before.total is not None and (before.slot is None or time.monotonic()<self.manager_until.get(kind,0)):
+            manager = self.manager_counts(kind,limit,cards=False)
+            if before.delta(manager) in (0,1) or before.slot is None:
+                return manager
+        count = self.hover_count(slot,limit)
+        if manager is None:
+            if count is not None and (count==before.slot+1 or count==before.slot and not double_check):
+                return UnitCounts(count)
+            manager = self.manager_counts(kind,limit,cards=before.total is None)
+        if count is None and manager.total is not None:
+            self.manager_until[kind] = time.monotonic()+12
+        elif count is not None:
+            self.manager_until.pop(kind,None)
+        if count is not None and manager.slot is not None and count!=manager.slot:
+            return UnitCounts()
+        return UnitCounts(count if count is not None else manager.slot,manager.total)
 
     def recheck_pending(self,state):
-        now = time.monotonic()
-        for row in state["places"]:
-            unit, point = row["unit"],row.get("target")
-            before = row.get("count_before")
-            if (row["player"]!=self.player or row["state"]=="placed" or not point
-                    or before is None or now<self.count_retry_at.get(unit,0)):
-                continue
-            kind = unit.partition("_")[0]
-            if self.count_failures.get(kind,0)>=COUNT_TRIES:
-                continue
-            outcome = self.placement_outcome(self.slots[kind],4 if kind in EARLY else 1,before)
-            self.count_retry_at[unit] = time.monotonic()+5
-            if outcome:
-                self.count_failures.pop(kind,None)
-                self.confirm = (outcome,unit,point)
-                self.exchange(outcome,unit=unit,point=point)
-                self.confirm = None
-                return (f"Поставил {placement_label(unit)} · счётчик подтверждён" if outcome=="commit"
-                        else f"{placement_label(unit)} · счётчик прежний, ищу другое место")
-            return self.failed_count(kind)
-        return None
-
-    def place(self, unit, img):
-        prices = farm.read_hotbar(img)
-        slot = self.slots[unit.partition("_")[0]]
-        name = placement_label(unit)
-        # Associate the physical card with its slot even when another price is unreadable.
-        center = self.slot_center(img,slot)
-        price = next((v for x,v in prices if abs(x-center)<.032 and v),None)
-        cash = self.game.money()
-        # A selected early unit can cover its own price at RDP scale.
+        row = next((p for p in state["places"] if p["player"]==self.player
+                    and p.get("target") and p["state"]!="placed"),None)
+        if row is None:
+            return None
+        unit,point = row["unit"],row["target"]
         kind = unit.partition("_")[0]
+        name = placement_label(unit)
+        before = UnitCounts(row.get("count_before"),row.get("total_before"))
+        if not before.known():
+            return f"{name} · нет исходного счётчика. Проверь точку в «Места юнитов»"
+        key = (unit,tuple(point),row.get("target_since"))
+        second = self.unchanged==key
+        after = self.placement_readback(kind,row.get("slot") or self.slots[kind],before,second)
+        delta = before.delta(after)
+        if delta not in (0,1):
+            self.unchanged = None
+            if not self.read_delay:
+                farm.log(f"Wastelands · твинк {self.player} · {name} · ожидание: {before} → {after}")
+            return self.wait_for_check(f"{name} · сверяю постановку по слоту и UNITS")
+        if delta==0 and not second:
+            self.unchanged = key
+            return self.wait_for_check(f"{name} · счётчик прежний, жду обновления игры",1.1)
+
+        op = "commit" if delta else "release"
+        since = row.get("target_since")
+        self.confirm = (op,unit,point,since)
+        self.exchange(op,unit=unit,point=point,target_since=since)
+        self.confirm = None
+        self.unchanged = None
+        self.pending_places.discard(unit)
+        self.next_check = self.read_delay = 0
+        if delta:
+            self.placed.add(unit)
+            self.points[unit] = point
+        else:
+            self.attempt[unit] += 1
+        # Carry a calibrated total across consecutive confirmed changes only.
+        # Never derive it from reserved places, a balance change, or a click.
+        count = after.slot if after.slot is not None else (before.slot+delta if before.slot is not None else None)
+        total = after.total if after.total is not None else (before.total+delta if before.total is not None else None)
+        self.last_inventory = (kind,time.monotonic()+8,UnitCounts(count,total if self.host_totals else None))
+
+        evidence = f"слот {after.slot}" if before.slot is not None and after.slot is not None else f"UNITS {before.total} → {after.total}"
+        farm.log(f"Wastelands · твинк {self.player} · {name} · {op} · {evidence}")
+        if delta:
+            return f"Поставил {name} · {evidence}"
+        if self.cash_uncertain:
+            return self.wait_for_check(f"{name} · число прежнее, перепроверю средства и место",2.5)
+        return f"{name} · число прежнее, пробую другую точку"
+
+    def place(self,unit,img):
+        kind = unit.partition("_")[0]
+        slot = self.slots[kind]
+        name = placement_label(unit)
+        center = self.slot_center(img,slot)
+        price = next((v for x,v in farm.read_hotbar(img) if abs(x-center)<.032 and v),None)
         if kind in EARLY and any(other!=kind and price==farm.UNITS[other]["price"] for other in EARLY):
-            return f"{name} · в слоте {slot} видна цена другого юнита, проверь номера слотов"
-        if price is None and kind in ("plunger","tv"):
-            price = farm.UNITS[kind]["price"]
-        if price is None and kind in ("amplifier","screen"):
-            price = {"amplifier":7000,"screen":7750}[kind]
-        if price is None or cash is None or cash < price:
-            return f"Жду {name} · баланс {cash}, цена слота {slot}: {price}"
-        sites = self.placement_sites(unit)
-        if self.attempt[unit]>=len(sites):
-            return f"{name} · свободное место не найдено, проверь разметку"
+            return self.wait_for_check(f"{name} · в слоте {slot} видна цена другого юнита",2)
+        if price is None:
+            price = farm.UNITS[kind]["price"] if kind in EARLY else {"amplifier":7000,"screen":7750}[kind]
+        cash = placement_cash(img,self.placement_text)
+        if cash is not None and cash<price:
+            return self.wait_for_check(f"Жду {name} · есть ${cash:,}, нужно ${price:,}",.8)
+
         limit = 4 if kind in EARLY else 1
-        before_count = self.verified_count(slot,limit)
-        if before_count is None or before_count==limit:
-            self.slot_wait_until[kind] = time.monotonic()+4
-        if before_count is None:
-            return self.failed_count(kind)
-        self.count_failures.pop(kind,None)
-        if before_count==limit:
-            if kind in EARLY:
-                self.full_early.add(kind)
-            return f"{name} · в игре уже {limit}/{limit}, проверь места юнитов"
+        before = self.placement_baseline(kind,slot,limit)
+        if before.slot==limit:
+            self.at_limit.add(kind)
+            return f"{name} · в игре уже {limit}/{limit}"
+        if not before.known():
+            return self.wait_for_check(f"{name} · жду счётчик слота {slot} или UNITS")
+        self.read_delay = 0
+        sites = self.placement_sites(unit)
         if not self.game.take(slot):
-            return "Не появилась подсветка дороги"
+            return self.wait_for_check(f"{name} · жду подсветку дороги",1)
         try:
             self.game.hover(farm.IDLE_POINT)
             snap = self.game.grab()
             pose = placement_pose(snap)
-            if pose is None and self.reference is not None:
-                pose = tracked_pose(self.reference,self.pose,snap) if self.game.rect()==self.reference_rect else None
+            if pose is None and self.reference is not None and self.game.rect()==self.reference_rect:
+                pose = tracked_pose(self.reference,self.pose,snap)
             if pose is None:
                 return "Проверяю направление Wastelands по дороге и обломкам"
             titan = kind not in EARLY
             start = self.attempt[unit]
             if titan:
                 sites[start:] = rank_titan_sites(snap,pose,sites[start:],sites[:start])
-            clicks = 0
             conflicts = 0
-            outside_zone = 0
             for attempt in range(start,len(sites)):
                 self.attempt[unit] = attempt
-                if titan:
-                    point = sites[attempt]
-                else:
-                    point = perimeter_point(snap,pose,*sites[attempt])
-                    if point is None:
-                        continue
+                point = sites[attempt] if titan else perimeter_point(snap,pose,*sites[attempt])
+                if point is None:
+                    continue
                 pt = screen_point(pose,point)
                 if not (.015<pt[0]<.985 and .10<pt[1]<.92) or (.27<pt[0]<.74 and pt[1]>.81):
                     continue
+                if placement_conflict(self.player,unit,point,self.team_places):
+                    conflicts += 1
+                    continue
                 try:
-                    self.exchange("reserve",unit=unit,point=point,count_before=before_count)
+                    reserved = self.exchange("reserve",unit=unit,point=point,slot=slot,
+                                             count_before=before.slot,total_before=before.total)
                 except Wait as exc:
                     if any(reason in str(exc) for reason in
                            ("Рядом занят участок","Зона ранней защиты основы","Зона титанов основы")):
@@ -611,62 +814,37 @@ class Alt:
                     if "За пределами назначенной зоны" in str(exc):
                         if not self.host_sites:
                             raise Wait("Разметка основы и твинка различается · обнови и перезапусти оба приложения") from exc
-                        outside_zone += 1
                         continue
                     raise
-                outcome = self.try_place(point,pt,snap,unit,slot,limit,before_count)
-                if titan:
-                    farm.log(f"Wastelands · твинк {self.player} · {name} · место {attempt+1}/{len(sites)} "
-                             f"({point[0]:.0f}, {point[1]:.0f}) · {outcome or 'требует проверки'}")
-                if outcome=="commit":
-                    self.placed.add(unit)
-                    self.game.drop()
-                    self.pose,self.reference = pose,self.game.grab()
-                    self.reference_rect = self.game.rect()
-                    return f"Поставил {name}"
-                if outcome is None:
-                    return f"{name} · результат не подтверждён, перепроверю счётчик"
-                self.attempt[unit] = attempt+1
-                clicks += 1
-                if not titan or clicks>=3 or not self.game.path_visible():
-                    return f"{name} · счётчик прежний, пробую другую точку"
-                # The preview stayed open. Keep its pose and slot, and try a
-                # different footprint after verifying the scene at click time.
-                cash = self.game.money()
-                if cash is None or cash<price:
-                    return f"Перепроверяю баланс для {name}"
-                sites[attempt+1:] = rank_titan_sites(snap,pose,sites[attempt+1:],sites[:attempt+1])
+                self.pending_places.add(unit)
+                self.last_inventory = None
+                self.cash_uncertain = cash is None
+                reference_scene = scene(snap)
+                def live_point(frame):
+                    if frame.size==snap.size and not farm.afk_panel(frame) and np.median(abs(scene(frame)-reference_scene))<4:
+                        return pt
+                    return None
+                try:
+                    self.game.click_live(pt,live_point,name)
+                except Wait:
+                    # Game.click_live checks its guard before sending mouse-down.
+                    since = next((p.get("target_since") for p in reserved["places"]
+                                  if p["player"]==self.player and p["unit"]==unit),None)
+                    self.confirm = ("release",unit,point,since)
+                    raise
+                self.pose,self.reference,self.reference_rect = pose,snap,self.game.rect()
+                farm.log(f"Wastelands · твинк {self.player} · {name} · клик, слот {slot}, "
+                         f"точка ({point[0]:.0f}, {point[1]:.0f}), {before}")
+                return self.wait_for_check(f"{name} · проверяю результат клика",.60)
             self.attempt[unit] = len(sites)
             if conflicts:
-                return f"{name} · основа отклонила {conflicts} точек у защищённых или занятых мест"
-            if outside_zone:
-                return f"{name} · точки вне назначенной зоны"
+                return f"{name} · основа защитила {conflicts} точек, ищу дальше по периметру"
             return f"{name} · не вижу подходящего участка дороги в окне"
         finally:
             self.game.drop()
 
-    def try_place(self,point,pt,snap,unit,slot,limit,before_count):
-        reference_scene = scene(snap)
-        def live_point(frame):
-            if frame.size==snap.size and np.median(abs(scene(frame)-reference_scene))<4:
-                return pt
-            return None
-        try:
-            self.game.click_live(pt,live_point,placement_label(unit))
-        except Wait:
-            self.confirm = ("release",unit,point)
-            raise
-        outcome = self.placement_outcome(slot,limit,before_count)
-        if outcome is None:
-            self.count_retry_at[unit] = time.monotonic()+3
-        if outcome:
-            self.confirm = (outcome,unit,point)
-            self.exchange(outcome,unit=unit,point=point)
-            self.confirm = None
-        return outcome
-
     def header(self, img):
-        return label(self.text(img,(0,0,1,.32)),"UNIT MANAGER")
+        return label(self.placement_text(img,(0,0,1,.32)),"UNIT MANAGER")
 
     def close_manager(self):
         img=self.game.grab()
@@ -686,6 +864,7 @@ class Alt:
         self.needs_close = False
 
     def manager(self, unit, action, target=None):
+        cash = placement_cash(self.game.grab(),self.placement_text) if action=="Upgrade" else None
         self.needs_close = True
         try:
             if not self.header(self.game.grab()):
@@ -717,8 +896,7 @@ class Alt:
                 if not cost:
                     return "Не прочитал цену улучшения"
                 self.wait_cash = int(cost[1].replace(",",""))
-                cash = self.game.money()
-                if cash is None or cash<self.wait_cash:
+                if cash is not None and cash<self.wait_cash:
                     return f"Коплю {self.wait_cash} на {unit}"
             if not button:
                 return "Способность закрыта или не распознана"
@@ -766,11 +944,13 @@ class Alt:
         unit = "amplifier" if name=="Aerial Attack" else "screen"
         if unit in self.pending_places:
             return {"result":"Место титана ещё не подтверждено"}
-        if self.phase!="battle" or unit not in self.placed:
+        if self.phase!="battle" or (unit not in self.placed and unit not in self.at_limit):
             return {"result":"Титан ещё не поставлен"}
         live=self.game.grab()
         current=tracked_pose(self.reference,self.pose,live) if self.reference is not None else None
-        if current is not None and name!="snapshot":
+        if name in ("snapshot","Teleport") and unit not in self.points:
+            return {"result":"Для переноса нужна подтверждённая точка Screen"}
+        if current is not None and unit in self.points and name!="snapshot":
             location=screen_point(current,self.points[unit])
             if all(.02<x<.98 for x in location) and farm.stun_fraction(live,location)>.25:
                 return {"result":"Титан оглушён"}
@@ -802,7 +982,7 @@ class Alt:
             self.shot = None
             result = self.manager(unit,name,pt)
             op = "commit" if result=="Перенос подтверждён" else "release"
-            self.confirm = (op,unit,point)
+            self.confirm = (op,unit,point,None)
             self.exchange(op,unit=unit,point=point)
             self.confirm = None
             return {"result":result}
@@ -849,10 +1029,10 @@ class Alt:
             return "Состояние постановки синхронизировано"
         if state["progress"]["retry"]!=self.retry:
             self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
-            self.full_early.clear()
-            self.slot_wait_until.clear()
-            self.count_failures.clear()
-            self.count_retry_at.clear()
+            self.at_limit.clear()
+            self.manager_until.clear()
+            self.next_check = self.read_delay = 0
+            self.last_inventory = self.unchanged = None
             self.sites.clear()
             self.rescan_at.clear()
             self.site_rescans.clear()
@@ -862,11 +1042,12 @@ class Alt:
         if (not self.ready and "ready" not in self.uncertain_votes
                 and time.monotonic()>=self.vote_retry and ready_button(img)):
             return self.vote("ready")
-        if time.monotonic()>=self.next_slot_check and not self.placed and not self.pending_places:
+        if time.monotonic()>=self.next_slot_check:
             detected = wastelands_slots(img)
             if detected and detected!=self.slots:
                 farm.log(f"Wastelands · твинк {self.player} · слоты по карточкам: {detected}")
                 self.slots = detected
+                self.last_inventory = None
             self.next_slot_check = float("inf") if detected else time.monotonic()+2
         cmd = state["command"]
         if cmd:
@@ -882,53 +1063,39 @@ class Alt:
                 self.deadline = None
             self.exchange("result",id=cmd["id"],**response)
             return response["result"]
-        if self.pending_places:
-            checked = self.recheck_pending(state)
-            if checked:
-                return checked
-        outstanding = [u for u in PLACEMENT_ORDER if u not in self.placed
-                       and u.partition("_")[0] not in self.full_early]
-        pending_kinds = {u.partition("_")[0] for u in self.pending_places}
-        # Finish one early unit type before moving on to the next stage.
-        stage = outstanding
-        for kind in EARLY:
-            copies = [u for u in outstanding if u.partition("_")[0]==kind]
-            if copies:
-                stage = copies
-                break
         now = time.monotonic()
-        for unit in stage:
-            kind = unit.partition("_")[0]
-            if self.count_failures.get(kind,0)>=COUNT_TRIES:
-                continue
-            if kind in pending_kinds or now<self.slot_wait_until.get(kind,0):
-                continue
-            if unit in self.sites and self.attempt[unit]>=len(self.sites[unit]):
-                scans = self.site_rescans.get(unit,0)
-                if scans>=2:
+        if now<self.next_check:
+            return self.wait_status
+        if self.pending_places:
+            status = self.recheck_pending(state)
+            if status:
+                return status
+
+        outstanding = [u for u in PLACEMENT_ORDER if u not in self.placed
+                       and u.partition("_")[0] not in self.at_limit]
+        # A different copy can use another bank, but TV must wait for all
+        # Plungers, and both titans must wait for all TVs.
+        if outstanding:
+            first = outstanding[0].partition("_")[0]
+            for unit in outstanding:
+                if first in EARLY and unit.partition("_")[0]!=first:
+                    break
+                if unit in self.pending_places:
                     continue
-                due = self.rescan_at.setdefault(unit,now+4*(scans+1))
-                if now<due:
-                    continue
-                self.site_rescans[unit] = scans+1
-                del self.rescan_at[unit]
-                self.attempt[unit] = 0
-            return self.place(unit,img)
-        if stage:
-            kind = stage[0].partition("_")[0]
-            if self.count_failures.get(kind,0)>=COUNT_TRIES:
-                return f"{kind.upper()} · проверка приостановлена. Места юнитов → Повторить поиск места"
-            if kind in pending_kinds:
-                return f"{placement_label(stage[0])} · жду подтверждения постановки"
-            if now<self.slot_wait_until.get(kind,0):
-                return f"{placement_label(stage[0])} · перепроверяю счётчик слота {self.slots[kind]}"
-            if all(self.site_rescans.get(u,0)>=2 and self.attempt[u]>=len(self.sites.get(u,())) for u in stage):
-                return f"{kind.upper()} · участки проверены. Места юнитов → Повторить поиск места"
-            return f"{placement_label(stage[0])} · повторю поиск свободного места"
+                if unit in self.sites and self.attempt[unit]>=len(self.sites[unit]):
+                    rescans = self.site_rescans.get(unit,0)
+                    due = self.rescan_at.setdefault(unit,now+min(16,4*(1+rescans)))
+                    if now<due:
+                        continue
+                    del self.rescan_at[unit]
+                    self.site_rescans[unit] = rescans+1
+                    self.attempt[unit] = 0
+                return self.place(unit,img)
+            return f"{placement_label(outstanding[0])} · повторю поиск по периметру дороги"
         if min(self.levels.values())<8 and time.monotonic()>self.next_upgrade:
             self.next_upgrade = time.monotonic()+4
-            cash = self.game.money()
-            if cash is not None and cash>=self.wait_cash:
+            cash = placement_cash(img,self.placement_text)
+            if cash is None or cash>=self.wait_cash:
                 unit = min(self.levels,key=self.levels.get)
                 return self.manager(unit,"Upgrade")
         return f"Amplifier {self.levels['amplifier']}/8 · Screen {self.levels['screen']}/8"

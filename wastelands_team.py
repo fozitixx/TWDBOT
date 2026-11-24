@@ -114,6 +114,25 @@ def segment_distance(p, a, b):
     return math.dist(p, mix(a, b, min(1, max(0, t))))
 
 
+def placement_conflict(player,unit,point,places):
+    if segment_distance(point, (638,438),(886,604)) < 58:
+        return "Зона титанов основы"
+    if any(math.dist(point, reserved) < 30 for reserved in MAIN_EARLY):
+        return "Зона ранней защиты основы"
+    for other in places:
+        if other["player"]==player and other["unit"]==unit:
+            continue
+        both_early = unit.partition("_")[0] in EARLY and other["unit"].partition("_")[0] in EARLY
+        clearance = 26 if both_early else 54
+        target = other.get("target")
+        # Early copies can share fallback candidates until someone claims one.
+        protect_plan = other["state"]=="placed" or (not both_early and not target)
+        for occupied in (other["point"] if protect_plan else None, target):
+            if occupied and math.dist(point, occupied) < clearance:
+                return "Рядом занят участок"
+    return None
+
+
 class Wait(Exception):
     pass
 
@@ -280,7 +299,7 @@ class Match:
             if name == "snapshot":
                 self.frames.pop(player, None)
 
-    def reserve(self, player, unit, point, count_before=None):
+    def reserve(self, player, unit, point, count_before=None, total_before=None, slot=None):
         if not isinstance(point, list) or len(point) != 2 or not all(
                 type(x) in (int,float) and math.isfinite(x) for x in point):
             raise ValueError("Некорректная точка")
@@ -288,15 +307,29 @@ class Match:
             limit = 4 if unit.partition("_")[0] in EARLY else 1
             if type(count_before) is not int or not 0<=count_before<limit:
                 raise ValueError("Некорректный счётчик перед постановкой")
+        if total_before is not None and (type(total_before) is not int or not 0<=total_before<=99
+                                          or count_before is not None and total_before<count_before):
+            raise ValueError("Некорректное число UNITS перед постановкой")
+        if slot is not None and (type(slot) is not int or not 1<=slot<=6):
+            raise ValueError("Некорректный слот юнита")
         x,y = point
         if not (0 < x < 2048 and 0 < y < 1152):
             raise ValueError("Точка вне карты")
         place = self.places[player, unit]
+        if place["state"]=="placed" and (slot is not None or count_before is not None or total_before is not None):
+            raise ValueError("Постановка уже подтверждена")
         if place.get("target"):
             if place["target"]==point:
                 return
             raise ValueError("Предыдущий резерв ещё не подтверждён")
         if place["state"] != "placed":
+            # A counter-aware placement needs exclusive use of this player's
+            # total. Legacy geometry-only reservations remain independent.
+            if any(p.get("target") and p["state"]!="placed" and
+                   (slot is not None or total_before is not None or
+                    p.get("slot") is not None or p.get("total_before") is not None)
+                   for (owner,_),p in self.places.items() if owner==player):
+                raise ValueError("Жду результат предыдущей постановки этого твинка")
             def allowed(attempt):
                 planned = position(player,unit,attempt)
                 if unit.partition("_")[0] not in EARLY:
@@ -309,22 +342,12 @@ class Match:
                 raise ValueError("За пределами назначенной зоны")
         elif unit != "screen":
             raise ValueError("Перенос доступен только для Screen")
-        if segment_distance(point, (638,438),(886,604)) < 58:
-            raise ValueError("Зона титанов основы")
-        if any(math.dist(point, reserved) < 30 for reserved in MAIN_EARLY):
-            raise ValueError("Зона ранней защиты основы")
-        for key, other in self.places.items():
-            if key == (player,unit):
-                continue
-            both_early = unit.partition("_")[0] in EARLY and other["unit"].partition("_")[0] in EARLY
-            clearance = 26 if both_early else 54
-            target = other.get("target")
-            # Early copies can share fallback candidates until someone claims one.
-            protect_plan = other["state"]=="placed" or (not both_early and not target)
-            for occupied in (other["point"] if protect_plan else None, target):
-                if occupied and math.dist(point, occupied) < clearance:
-                    raise ValueError("Рядом занят участок")
+        conflict = placement_conflict(player,unit,point,self.places.values())
+        if conflict:
+            raise ValueError(conflict)
         place["count_before"] = count_before
+        place["total_before"] = total_before
+        place["slot"] = slot
         place["target"] = point
         place["target_since"] = time.monotonic()
 
@@ -364,9 +387,13 @@ class Match:
                 elif op in ("reserve","release","commit"):
                     unit = req["unit"]
                     place = self.places[player,unit]
+                    if (op!="reserve" and place.get("target") and req.get("target_since") is not None
+                            and req["target_since"]!=place.get("target_since")):
+                        raise ValueError("Резерв изменился")
                     if op == "reserve":
                         try:
-                            self.reserve(player,unit,req["point"],req.get("count_before"))
+                            self.reserve(player,unit,req["point"],req.get("count_before"),
+                                         req.get("total_before"),req.get("slot"))
                         except ValueError as exc:
                             if str(exc)=="За пределами назначенной зоны" and not req.get("uses_host_sites"):
                                 raise ValueError("Разметка твинка устарела · обнови и перезапусти твинк") from exc
@@ -410,7 +437,7 @@ class Match:
                 cmd = None
             return dict(run="" if player in self.recalled else self.run,
                         summon={"id":summon["id"],"link":summon["link"]} if summon and summon["instance"]==owner else None,
-                        afk_auto=self.afk_auto, placement_sites=True, sites=sites, mode=self.mode,host=self.host,places=list(self.places.values()),claimed=claimed,
+                        afk_auto=self.afk_auto, placement_sites=True, placement_totals=True, sites=sites, mode=self.mode,host=self.host,places=list(self.places.values()),claimed=claimed,
                         vote_seconds=max(0,self.vote_until-now) if self.vote_owner==player else 0,
                         progress=self.progress.get(player,{}),
                         command=dict(cmd,remaining=cmd["until"]-now) if cmd and not cmd.get("claimed")
