@@ -44,6 +44,8 @@ SPARE_BANKS = (
 EDGE_GAP = 14
 BANK_OFFSET = 24 + EDGE_GAP  # nominal half road width plus clearance for the base
 EDGE_ADJUST = 21  # maximum correction from the nominal boundary, in map pixels
+EARLY_CLEARANCE = 26
+REJECTION_SECONDS = 35
 PLACEMENT_ORDER = ("plunger", "plunger_2", "plunger_3", "plunger_4",
                    "tv", "tv_2", "tv_3", "tv_4", "amplifier", "screen")
 LANES = [((1159, 631), (1336, 751)), ((1022, 690), (1285, 868)),
@@ -72,6 +74,30 @@ def placement_label(unit):
     return unit.title()
 
 
+def shared_bank_sections():
+    # Sample along the calibrated banks, including between the original slots.
+    # A long gap separates distinct strips (for example the main player's pair).
+    strips = {(JUNCTION,tangent,normal):set(stops) for tangent,normal,stops in PERIMETER}
+    for leg,distance,side in SPARE_BANKS:
+        origin = tuple(v+leg*n for v,n in zip(JUNCTION,BRANCH))
+        normal = tuple(side*n for n in BRANCH)
+        strips.setdefault((origin,TRUNK,normal),set()).add(distance)
+    sections = []
+    for (origin,tangent,normal),stops in strips.items():
+        distances = sorted(stops)
+        for left,right in zip(distances,distances[1:]):
+            if right-left<=48:
+                steps = math.ceil((right-left)/8)
+                stops.update(left+i*(right-left)/steps for i in range(1,steps))
+        for distance in sorted(stops):
+            center = tuple(v+distance*t for v,t in zip(origin,tangent))
+            sections.append((center,tangent,normal))
+    return tuple(sections)
+
+
+SHARED_BANKS = shared_bank_sections()
+
+
 def bank_slot(player, unit, attempt=0):
     kind, _, number = unit.partition("_")
     copy = int(number or 1)-1 + (4 if kind=="tv" else 0)
@@ -80,16 +106,20 @@ def bank_slot(player, unit, attempt=0):
     start = JUNCTION
     if attempt<5:
         distance = along[rank] + (0, 7, -7, 14, -14)[attempt]
-    else:
+    elif attempt < 5+len(SPARE_BANKS):
         branch_distance,distance,side = SPARE_BANKS[(attempt-5+rank+bank)%len(SPARE_BANKS)]
         start = [v+branch_distance*n for v,n in zip(JUNCTION,BRANCH)]
         tangent, normal = TRUNK, tuple(side*n for n in BRANCH)
+    else:
+        return SHARED_BANKS[attempt-5-len(SPARE_BANKS)]
     center = [v+distance*t for v,t in zip(start,tangent)]
     return center, tangent, normal
 
 
 def placement_attempts(unit):
-    return 5+len(SPARE_BANKS) if unit.partition("_")[0] in EARLY else len(TITAN_OFFSETS) + len(TITAN_SPARES)
+    if unit.partition("_")[0] in EARLY:
+        return 5+len(SPARE_BANKS)+len(SHARED_BANKS)
+    return len(TITAN_OFFSETS)+len(TITAN_SPARES)
 
 
 def position(player, unit, attempt=0):
@@ -123,7 +153,7 @@ def placement_conflict(player,unit,point,places):
         if other["player"]==player and other["unit"]==unit:
             continue
         both_early = unit.partition("_")[0] in EARLY and other["unit"].partition("_")[0] in EARLY
-        clearance = 26 if both_early else 54
+        clearance = EARLY_CLEARANCE if both_early else 54
         target = other.get("target")
         # Early copies can share fallback candidates until someone claims one.
         protect_plan = other["state"]=="placed" or (not both_early and not target)
@@ -131,6 +161,23 @@ def placement_conflict(player,unit,point,places):
             if occupied and math.dist(point, occupied) < clearance:
                 return "Рядом занят участок"
     return None
+
+
+def footprint_class(unit):
+    return "early" if unit.partition("_")[0] in EARLY else "titan"
+
+
+def recent_sites(history, now):
+    for key, until in list(history.items()):
+        if until<=now:
+            del history[key]
+    return list(history)
+
+
+def near_rejection(unit, point, sites):
+    group = footprint_class(unit)
+    clearance = EARLY_CLEARANCE if group=="early" else 50
+    return any(group==other and math.dist(point,center)<clearance for other,center in sites)
 
 
 class Wait(Exception):
@@ -198,6 +245,7 @@ class Match:
         self.mode = "nightmare"
         self.host = ""
         self.places = {}
+        self.rejections = {}
         self.pending = {}
         self.frames = {}
         self.results = {}
@@ -241,6 +289,7 @@ class Match:
         with self.lock:
             self.run = secrets.token_hex(8)
             self.recalled.clear()
+            self.rejections.clear()
             self.mode, self.host = mode, host.strip()
             self.afk_auto = afk_auto
             self.vote_owner = None
@@ -342,6 +391,8 @@ class Match:
                 raise ValueError("За пределами назначенной зоны")
         elif unit != "screen":
             raise ValueError("Перенос доступен только для Screen")
+        if place["state"]!="placed" and near_rejection(unit,point,recent_sites(self.rejections,time.monotonic())):
+            raise ValueError("Игра недавно отклонила этот участок")
         conflict = placement_conflict(player,unit,point,self.places.values())
         if conflict:
             raise ValueError(conflict)
@@ -401,6 +452,13 @@ class Match:
                     elif op == "release":
                         if place.get("target") and place["target"]!=req.get("point"):
                             raise ValueError("Резерв изменился")
+                        # Share a funded, counted failure only for the exact active
+                        # lease. A cancelled click, teleport or replay is not evidence.
+                        if (req.get("site_failed") is True and place.get("target")
+                                and place["state"]!="placed" and place.get("slot") is not None
+                                and req.get("target_since")==place["target_since"]
+                                and (place.get("count_before") is not None or place.get("total_before") is not None)):
+                            self.rejections[footprint_class(unit),tuple(place["target"])] = now+REJECTION_SECONDS
                         place.pop("target",None)
                     elif place.get("target") == req["point"]:
                         place.update(point=place.pop("target"),state="placed")
@@ -436,6 +494,7 @@ class Match:
                 self.results[player] = "Время истекло; результат не подтверждён"
                 cmd = None
             return dict(run="" if player in self.recalled else self.run,
+                        rejected_sites=recent_sites(self.rejections,now),
                         summon={"id":summon["id"],"link":summon["link"]} if summon and summon["instance"]==owner else None,
                         afk_auto=self.afk_auto, placement_sites=True, placement_totals=True, sites=sites, mode=self.mode,host=self.host,places=list(self.places.values()),claimed=claimed,
                         vote_seconds=max(0,self.vote_until-now) if self.vote_owner==player else 0,

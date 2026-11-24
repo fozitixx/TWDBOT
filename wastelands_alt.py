@@ -1,4 +1,5 @@
 """One foreground Roblox client. All game input is serialized in this worker."""
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -8,8 +9,12 @@ from PIL import Image, ImageDraw, ImageGrab, ImageOps
 from pynput import mouse
 
 import twd_bot as farm
-from wastelands_team import ABILITIES, EARLY, PLACEMENT_ORDER, bank_slot, placement_attempts, Wait, placement_conflict, placement_label, position, private_server_links
-from wastelands_view import OCR, color_boxes, invite_buttons, label, read_invite, map_point, preview, perimeter_point, rank_titan_sites, placement_pose, mission_button, ready_button, visual_slot_count, wastelands_slots, scene, screen_point, tracked_pose
+from wastelands_team import (ABILITIES, BANK_OFFSET, EARLY, EARLY_CLEARANCE, REJECTION_SECONDS,
+                            PLACEMENT_ORDER, SPARE_BANKS, Wait, bank_slot, footprint_class, near_rejection, placement_conflict,
+                            placement_label, position, private_server_links, recent_sites)
+from wastelands_view import (OCR, color_boxes, framing_turn, invite_buttons, label, read_invite, map_point, preview,
+                            perimeter_points, rank_build_sites, placement_in_view, placement_pose, mission_button, ready_button,
+                            visual_slot_count, wastelands_slots, scene, screen_point, tracked_pose)
 
 
 class Game(farm.Bot):
@@ -265,6 +270,27 @@ def placement_cash(frame, read):
     return None
 
 
+def preserve_bank_capacity(ranked,needed):
+    """Prefer a base that leaves space for the other helpers' remaining towers."""
+    if needed<=1:
+        return ranked
+    coords = np.asarray(ranked)
+    nearby = ((coords[:,None]-coords)**2).sum(axis=2)<EARLY_CLEARANCE**2
+    free = np.ones(len(coords),dtype=bool)
+    degree = nearby.sum(axis=1)
+    packing = []
+    while free.any():
+        # Claim an endpoint before a midpoint that would consume two bases.
+        index = np.argmin(np.where(free,degree,len(coords)+1))
+        packing.append(index)
+        removed = free & nearby[index]
+        degree -= nearby[:,removed].sum(axis=1)
+        free[removed] = False
+    lost = nearby[:,packing].sum(axis=1)
+    budget = max(1,len(packing)-needed+1)
+    return [ranked[i] for i in np.argsort(lost>budget,kind="stable")]
+
+
 def countdown(row,action,button):
     # The printed "45s cooldown" describes the skill even when it is ready.
     # Only a separate countdown without the caption is evidence of an active timer.
@@ -326,10 +352,12 @@ class Alt:
         self.placed = set()
         self.points = {}
         self.team_places = state.get("places",[])
-        self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
         self.sites = {}
         self.rescan_at = {}
-        self.site_rescans = {}
+        self.local_rejections = {}
+        self.team_rejections = state.get("rejected_sites",())
+        self.search_log_at = {}
+        self.next_status_log = 0
         self.host_sites = state.get("placement_sites",False)
         self.host_totals = state.get("placement_totals",False)
         self.pending_places = set()
@@ -340,7 +368,7 @@ class Alt:
         self.read_delay = 0
         self.wait_status = ""
         self.ocr_retry = 0
-        self.cash_uncertain = False
+        self.funded_lease = None
         self.retry = state["progress"].get("retry",0)
         self.levels = {"amplifier":0,"screen":0}
         self.wait_cash = 0
@@ -348,6 +376,12 @@ class Alt:
         self.game.holding = None
         self.pose = self.shot = None
         self.reference = None
+        self.next_pose_fit = 0
+        self.turn_scale = None
+        self.last_turn = None
+        self.next_turn_at = 0
+        self.max_turn = 90
+        self.failed_heading = None
         self.confirm = None
         self.needs_close = False
 
@@ -515,7 +549,9 @@ class Alt:
         return "Жду приглашение или голосование"
 
     def update_places(self,state):
+        previous = self.team_places
         self.team_places = state["places"]
+        self.team_rejections = state.get("rejected_sites",())
         own = {p["unit"]:p for p in self.team_places if p["player"]==self.player}
         if not all(unit in own for unit in PLACEMENT_ORDER):
             raise Wait("Основа не передала десять мест. Обнови основу до 6.0.4.")
@@ -529,13 +565,16 @@ class Alt:
         self.placed = placed
         self.points = {u:p["point"] for u,p in own.items() if u in self.placed}
         if self.confirm:
-            op,unit,point,since = self.confirm
+            op,unit,point,since,site_failed = self.confirm
             if own[unit].get("target")==point and (since is None or own[unit].get("target_since")==since):
-                self.exchange(op,unit=unit,point=point,target_since=since)
+                self.exchange(op,unit=unit,point=point,target_since=since,site_failed=site_failed)
             self.confirm = None
             return True
-        for unit in self.pending_places-pending-self.placed:
-            self.attempt[unit] += 1
+        cleared = self.pending_places-pending-self.placed
+        for row in previous:
+            if row["player"]==self.player and row["unit"] in cleared and row.get("target"):
+                self.local_rejections.setdefault((footprint_class(row["unit"]),tuple(row["target"])),
+                                                 time.monotonic()+8)
         self.pending_places = pending
         return False
 
@@ -546,7 +585,7 @@ class Alt:
             else:
                 locate = bank_slot if unit.partition("_")[0] in EARLY else position
                 # Older coordinators only know the original five titan candidates.
-                count = placement_attempts(unit) if unit.partition("_")[0] in EARLY else 5
+                count = 5+len(SPARE_BANKS) if unit.partition("_")[0] in EARLY else 5
                 self.sites[unit] = [locate(self.player,unit,i) for i in range(count)]
         return self.sites[unit]
 
@@ -729,17 +768,20 @@ class Alt:
 
         op = "commit" if delta else "release"
         since = row.get("target_since")
-        self.confirm = (op,unit,point,since)
-        self.exchange(op,unit=unit,point=point,target_since=since)
+        funded = self.funded_lease==key
+        if not delta:
+            cooldown = REJECTION_SECONDS if funded else 18
+            self.local_rejections[footprint_class(unit),tuple(point)] = time.monotonic()+cooldown
+        self.confirm = (op,unit,point,since,not delta and funded)
+        self.exchange(op,unit=unit,point=point,target_since=since,site_failed=not delta and funded)
         self.confirm = None
+        self.funded_lease = None
         self.unchanged = None
         self.pending_places.discard(unit)
         self.next_check = self.read_delay = 0
         if delta:
             self.placed.add(unit)
             self.points[unit] = point
-        else:
-            self.attempt[unit] += 1
         # Carry a calibrated total across consecutive confirmed changes only.
         # Never derive it from reserved places, a balance change, or a click.
         count = after.slot if after.slot is not None else (before.slot+delta if before.slot is not None else None)
@@ -750,9 +792,108 @@ class Alt:
         farm.log(f"Wastelands · твинк {self.player} · {name} · {op} · {evidence}")
         if delta:
             return f"Поставил {name} · {evidence}"
-        if self.cash_uncertain:
-            return self.wait_for_check(f"{name} · число прежнее, перепроверю средства и место",2.5)
+        if not funded:
+            return self.wait_for_check(f"{name} · число прежнее, перепроверю средства и место",1)
         return f"{name} · число прежнее, пробую другую точку"
+
+    def map_pose(self,snap):
+        rect = self.game.rect()
+        can_track = self.reference is not None and self.reference_rect==rect and self.reference.size==snap.size
+        now = time.monotonic()
+        if can_track and now<self.next_pose_fit:
+            current = tracked_pose(self.reference,self.pose,snap)
+            if current is not None:
+                return current
+        current = placement_pose(snap)
+        if current is not None:
+            # Only a fresh landmark fit becomes the reference. Tracking always
+            # starts at that frame, so motion between attempts cannot accumulate.
+            self.reference,self.pose,self.reference_rect = snap,current,rect
+            self.next_pose_fit = now+12
+        elif can_track:
+            current = tracked_pose(self.reference,self.pose,snap)
+        if current is not None and self.last_turn:
+            old_heading,pixels,angle = self.last_turn
+            change = (self.camera_heading(current,snap.size)-old_heading+180)%360-180
+            if abs(change)>3 and .3<abs(pixels/change)<90:
+                self.turn_scale = pixels/change
+                self.max_turn = min(90,max(20,2*abs(angle)))
+            self.last_turn = None
+        return current
+
+    @staticmethod
+    def camera_heading(pose,size):
+        x,y = pose[1][:,0]*size
+        return math.degrees(math.atan2(y,x))
+
+    def reframe_sites(self,unit,frame,pose,sites):
+        now = time.monotonic()
+        if now<self.next_turn_at:
+            return False
+        if unit.partition("_")[0] in EARLY:
+            sites = [[v+BANK_OFFSET*n for v,n in zip(center,normal)] for center,_,normal in sites]
+        recent = recent_sites(self.local_rejections,now) + list(self.team_rejections)
+        free = [point for point in sites if not placement_conflict(self.player,unit,point,self.team_places)
+                and not near_rejection(unit,point,recent)]
+        heading = self.camera_heading(pose,frame.size)
+        avoid_sign = 0
+        if self.failed_heading:
+            failed,sign,until = self.failed_heading
+            if now<until and abs((heading-failed+180)%360-180)<12:
+                avoid_sign = sign
+        angle = max(-self.max_turn,min(self.max_turn,framing_turn(pose,free,frame.size,avoid_sign)))
+        if not angle or farm.afk_panel(self.game.grab()):
+            return False
+        scale = self.turn_scale if self.turn_scale is not None else self.game.px_per_deg
+        pixels = round(angle*scale)
+        self.game.drop()
+        self.game.turn_camera(pixels)
+        self.last_turn = heading,pixels,angle
+        self.next_turn_at = now+6
+        self.next_pose_fit = 0
+        self.rescan_at.clear()
+        return True
+
+    def candidate_sites(self,unit,frame,pose,sites):
+        early = unit.partition("_")[0] in EARLY
+        if early:
+            measured = perimeter_points(frame,pose,sites)
+            center,_,normal = sites[0]
+            home = [v+BANK_OFFSET*n for v,n in zip(center,normal)]
+        else:
+            measured = sites
+            home = sites[0]
+        recent = recent_sites(self.local_rejections,time.monotonic()) + list(self.team_rejections)
+        other_plans = [p["point"] for p in self.team_places if early and p["state"]!="placed"
+                       and not p.get("target") and p["unit"].partition("_")[0] in EARLY
+                       and (p["player"],p["unit"])!=(self.player,unit)]
+        visible = busy = rejected = 0
+        available,preference = [],[]
+        unique = dict.fromkeys(tuple(p) for p in measured if p is not None)
+        for point in unique:
+            x,y = screen_point(pose,point)
+            if not placement_in_view(x,y):
+                continue
+            visible += 1
+            if placement_conflict(self.player,unit,point,self.team_places):
+                busy += 1
+                continue
+            if near_rejection(unit,point,recent):
+                rejected += 1
+                continue
+            available.append(list(point))
+            # Prefer the unit's assigned part of the bank and leave open planned
+            # sites to their owners when equally clear ground is available.
+            cost = min(math.dist(point,home)/250,1)*(.50 if early else .20)
+            if any(math.dist(point,p)<EARLY_CLEARANCE for p in other_plans):
+                cost += .24
+            preference.append(cost)
+        ranked = rank_build_sites(frame,pose,available,12 if early else 24,preference)
+        if early and len(ranked)>1:
+            needed = sum(p["unit"].partition("_")[0] in EARLY and p["state"]!="placed" and not p.get("target")
+                         for p in self.team_places)
+            ranked = preserve_bank_capacity(ranked,needed)
+        return ranked,visible,busy,rejected
 
     def place(self,unit,img):
         kind = unit.partition("_")[0]
@@ -782,34 +923,32 @@ class Alt:
         try:
             self.game.hover(farm.IDLE_POINT)
             snap = self.game.grab()
-            pose = placement_pose(snap)
-            if pose is None and self.reference is not None and self.game.rect()==self.reference_rect:
-                pose = tracked_pose(self.reference,self.pose,snap)
+            pose = self.map_pose(snap)
             if pose is None:
-                return "Проверяю направление Wastelands по дороге и обломкам"
-            titan = kind not in EARLY
-            start = self.attempt[unit]
-            if titan:
-                sites[start:] = rank_titan_sites(snap,pose,sites[start:],sites[:start])
-            conflicts = 0
-            for attempt in range(start,len(sites)):
-                self.attempt[unit] = attempt
-                point = sites[attempt] if titan else perimeter_point(snap,pose,*sites[attempt])
-                if point is None:
-                    continue
+                if self.last_turn and not farm.afk_panel(snap):
+                    heading,pixels,angle = self.last_turn
+                    self.game.drop()
+                    self.game.turn_camera(-pixels)
+                    self.last_turn = None
+                    self.max_turn = max(10,abs(angle)//2)
+                    if abs(angle)<=20:
+                        self.failed_heading = heading,(1 if angle>0 else -1),time.monotonic()+30
+                    self.next_pose_fit = 0
+                    return self.wait_for_check(f"{name} · вернул камеру, повторно сверяю дорогу",.8)
+                return self.wait_for_check(f"{name} · сверяю положение камеры по дороге и обломкам",1)
+            candidates,visible,busy,rejected = self.candidate_sites(unit,snap,pose,sites)
+            for point in candidates:
                 pt = screen_point(pose,point)
-                if not (.015<pt[0]<.985 and .10<pt[1]<.92) or (.27<pt[0]<.74 and pt[1]>.81):
-                    continue
-                if placement_conflict(self.player,unit,point,self.team_places):
-                    conflicts += 1
-                    continue
                 try:
                     reserved = self.exchange("reserve",unit=unit,point=point,slot=slot,
                                              count_before=before.slot,total_before=before.total)
                 except Wait as exc:
                     if any(reason in str(exc) for reason in
                            ("Рядом занят участок","Зона ранней защиты основы","Зона титанов основы")):
-                        conflicts += 1
+                        busy += 1
+                        continue
+                    if "недавно отклонила" in str(exc):
+                        rejected += 1
                         continue
                     if "За пределами назначенной зоны" in str(exc):
                         if not self.host_sites:
@@ -818,28 +957,35 @@ class Alt:
                     raise
                 self.pending_places.add(unit)
                 self.last_inventory = None
-                self.cash_uncertain = cash is None
+                since = next(p.get("target_since") for p in reserved["places"]
+                             if p["player"]==self.player and p["unit"]==unit)
+                self.funded_lease = (unit,tuple(point),since) if cash is not None and since is not None else None
                 reference_scene = scene(snap)
                 def live_point(frame):
-                    if frame.size==snap.size and not farm.afk_panel(frame) and np.median(abs(scene(frame)-reference_scene))<4:
+                    if frame.size!=snap.size or farm.afk_panel(frame):
+                        return None
+                    if np.median(abs(scene(frame)-reference_scene))<4:
                         return pt
-                    return None
+                    current = tracked_pose(snap,pose,frame)
+                    return screen_point(current,point) if current is not None else None
                 try:
                     self.game.click_live(pt,live_point,name)
                 except Wait:
                     # Game.click_live checks its guard before sending mouse-down.
-                    since = next((p.get("target_since") for p in reserved["places"]
-                                  if p["player"]==self.player and p["unit"]==unit),None)
-                    self.confirm = ("release",unit,point,since)
+                    self.confirm = ("release",unit,point,since,False)
                     raise
-                self.pose,self.reference,self.reference_rect = pose,snap,self.game.rect()
                 farm.log(f"Wastelands · твинк {self.player} · {name} · клик, слот {slot}, "
                          f"точка ({point[0]:.0f}, {point[1]:.0f}), {before}")
                 return self.wait_for_check(f"{name} · проверяю результат клика",.60)
-            self.attempt[unit] = len(sites)
-            if conflicts:
-                return f"{name} · основа защитила {conflicts} точек, ищу дальше по периметру"
-            return f"{name} · не вижу подходящего участка дороги в окне"
+            now = time.monotonic()
+            self.rescan_at[unit] = now+4
+            message = f"{name} · участков в кадре {visible}, занято {busy}, недавних отказов {rejected}"
+            if now>=self.search_log_at.get(kind,0):
+                farm.log(f"Wastelands · твинк {self.player} · {message}")
+                self.search_log_at[kind] = now+12
+            if self.reframe_sites(unit,snap,pose,sites):
+                return self.wait_for_check(f"{name} · повернул камеру к свободному участку, сверяю карту",.5)
+            return message
         finally:
             self.game.drop()
 
@@ -982,7 +1128,7 @@ class Alt:
             self.shot = None
             result = self.manager(unit,name,pt)
             op = "commit" if result=="Перенос подтверждён" else "release"
-            self.confirm = (op,unit,point,None)
+            self.confirm = (op,unit,point,None,False)
             self.exchange(op,unit=unit,point=point)
             self.confirm = None
             return {"result":result}
@@ -1028,14 +1174,13 @@ class Alt:
         if self.update_places(state):
             return "Состояние постановки синхронизировано"
         if state["progress"]["retry"]!=self.retry:
-            self.attempt = dict.fromkeys(PLACEMENT_ORDER, 0)
             self.at_limit.clear()
             self.manager_until.clear()
             self.next_check = self.read_delay = 0
             self.last_inventory = self.unchanged = None
             self.sites.clear()
             self.rescan_at.clear()
-            self.site_rescans.clear()
+            self.local_rejections.clear()
             self.retry = state["progress"]["retry"]
         if self.phase=="lobby":
             return self.lobby(state,img)
@@ -1082,14 +1227,8 @@ class Alt:
                     break
                 if unit in self.pending_places:
                     continue
-                if unit in self.sites and self.attempt[unit]>=len(self.sites[unit]):
-                    rescans = self.site_rescans.get(unit,0)
-                    due = self.rescan_at.setdefault(unit,now+min(16,4*(1+rescans)))
-                    if now<due:
-                        continue
-                    del self.rescan_at[unit]
-                    self.site_rescans[unit] = rescans+1
-                    self.attempt[unit] = 0
+                if now<self.rescan_at.get(unit,0):
+                    continue
                 return self.place(unit,img)
             return f"{placement_label(outstanding[0])} · повторю поиск по периметру дороги"
         if min(self.levels.values())<8 and time.monotonic()>self.next_upgrade:
@@ -1129,6 +1268,9 @@ class Alt:
                         self.status = "На связи · жду матч"
                 except (Wait,OSError,ValueError,RuntimeError) as exc:
                     self.status = str(exc)
+                if self.run and self.phase=="battle" and time.monotonic()>=self.next_status_log:
+                    farm.log(f"Wastelands · твинк {self.player} · {self.status}")
+                    self.next_status_log = time.monotonic()+15
                 if self.status != last_notice:
                     self.notify(self.status)
                     last_notice = self.status

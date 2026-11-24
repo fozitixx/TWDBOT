@@ -447,14 +447,41 @@ def screen_point(pose, point):
     return tuple(origin+mat@(np.array(point)-ANCHOR))
 
 
-def rank_titan_sites(img, pose, sites, tried=()):
-    """Prefer a clear patch under the base, in the local camera projection."""
+def placement_in_view(x,y):
+    return ((x>.015)&(x<.985)&(y>.10)&(y<.92) &
+            ((x<=.27)|(x>=.74)|(y<=.81)) & ((x<=.88)|(y<=.45)|(y>=.57)) &
+            ((x<=.79)|(y>=.15)) & ((x<=.32)|(x>=.68)|(y>=.12)))
+
+
+def framing_turn(pose, sites, size, avoid_sign=0):
+    """Find a nearby heading with more of the permitted ground inside the viewport."""
+    if not sites:
+        return 0
+    origin,mat = pose
+    # The camera orbits the avatar, so compare headings in physical pixels.
+    offsets = (origin+(np.asarray(sites)-ANCHOR)@mat.T-.5)*size
+    def coverage(angle):
+        radians = math.radians(angle)
+        co,si = math.cos(radians),math.sin(radians)
+        x,y = (.5+(offsets@np.array([[co,si],[-si,co]]))/size).T
+        return np.count_nonzero(placement_in_view(x,y))
+    best,score = 0,coverage(0)
+    for angle in (20,-20,40,-40,60,-60,80,-80,90,-90):
+        if angle*avoid_sign<=0:
+            available = coverage(angle)
+            if available>score:
+                best,score = angle,available
+    return best
+
+
+def rank_build_sites(img, pose, sites, radius, preference):
+    """Score sand and texture under each projected base, using the current frame."""
     if not sites:
         return []
-    grid = np.arange(-24, 25, 4)
+    grid = np.arange(-radius, radius+1, 3)
     dx, dy = np.meshgrid(grid, grid)
     footprint = np.column_stack((dx.ravel(), dy.ravel()))
-    footprint = footprint[(footprint**2).sum(axis=1) <= 24**2]
+    footprint = footprint[(footprint**2).sum(axis=1) <= radius**2]
     origin, mat = pose
     points = np.asarray(sites)
     pixels = np.rint((origin + (points[:, None] + footprint - ANCHOR) @ mat.T) * img.size).astype(int)
@@ -466,46 +493,51 @@ def rank_titan_sites(img, pose, sites, tried=()):
     sand = (r >= 75) & (r-g >= 9) & (g-b >= 18) & (r-g < 45) & (r-b < 105)
     spread = np.percentile(g, 90, axis=1) - np.percentile(g, 10, axis=1)
     cost = 1 - (visible & sand).mean(axis=1) + np.minimum(spread/100, 1)*.35
-    if len(tried):
-        # Adjacent offsets often cover the very same wreck.
-        distance = np.linalg.norm(points[:,None] - np.asarray(tried), axis=2).min(axis=1)
-        cost += np.maximum(0, 1 - distance/52)
-    # A near tie favors the earlier site in the coordinator's plan.
-    order = np.argsort(np.rint(cost*12), kind="stable")
+    order = np.argsort(np.rint((cost+preference)*12),kind="stable")
     return [sites[index] for index in order]
 
 
-def perimeter_point(img, pose, center, tangent, normal):
-    """Measure the outside edge in several cross-sections of the highlighted road."""
+def perimeter_points(img, pose, sites):
+    """Read the five road cross-sections of every candidate from the same frame."""
     from wastelands_team import BANK_OFFSET, EDGE_ADJUST, EDGE_GAP
-    # Work in map units so clearance is independent of projection and resolution.
-    offsets = np.arange(-40, 80)
-    coords = (np.asarray(center) + np.arange(-8,9,4)[:,None,None]*np.asarray(tangent)
-              + offsets[:,None]*np.asarray(normal))
-    origin, mat = pose
+    if not sites:
+        return []
+    centers,tangents,normals = np.asarray(sites).transpose(1,0,2)
+    offsets = np.arange(-40,80)
+    coords = (centers[:,None,None,:] + tangents[:,None,None,:]*np.arange(-8,9,4)[None,:,None,None]
+              + normals[:,None,None,:]*offsets[:,None])
+    origin,mat = pose
     pixels = np.rint((origin+(coords-ANCHOR)@mat.T)*img.size).astype(int)
-    x,y = pixels.transpose(2,0,1)
-    if x.min()<0 or y.min()<0 or x.max()>=img.width or y.max()>=img.height:
-        return None
-    left,top = int(x.min()),int(y.min())
-    crop = img.crop((left,top,int(x.max())+1,int(y.max())+1)).convert("RGB")
-    r,g,b = np.asarray(crop)[y-top,x-left].astype(np.int16).transpose(2,0,1)
+    x,y = pixels.transpose(3,0,1,2)
+    inside = ((x>=0)&(x<img.width)&(y>=0)&(y<img.height)).all(axis=(1,2))
+    result = [None]*len(sites)
+    if not inside.any():
+        return result
+    rgb = np.asarray(img.convert("RGB"))
+    r,g,b = rgb[y[inside],x[inside]].astype(np.int16).transpose(3,0,1,2)
     red = (r>110)&(r-g>58)&(r-b>52)
-    edges = []
-    for row in red:
-        # The boundary has a sustained red band followed by clear ground.
-        for i in range(10,len(row)-EDGE_GAP-3):
-            if (abs(offsets[i]+EDGE_GAP-BANK_OFFSET)<=EDGE_ADJUST and
-                    row[i-10:i].sum()>=8 and row[i-1] and not row[i:i+EDGE_GAP+3].any()):
-                edges.append(offsets[i])
-                break
-    if len(edges)<3 or np.ptp(edges)>8:
-        return None
-    distance = float(np.median(edges))+EDGE_GAP
-    index = round(distance)-offsets[0]
-    if red[:,index-2:index+3].any():
-        return None
-    return (np.asarray(center)+distance*np.asarray(normal)).tolist()
+    # At a bank the preceding band is red and the next base-width is clear.
+    indices = np.flatnonzero(abs(offsets+EDGE_GAP-BANK_OFFSET)<=EDGE_ADJUST)
+    sums = np.pad(np.cumsum(red,axis=2,dtype=np.int16),((0,0),(0,0),(1,0)))
+    edge = ((sums[:,:,indices]-sums[:,:,indices-10]>=8) & red[:,:,indices-1] &
+            (sums[:,:,indices+EDGE_GAP+3]==sums[:,:,indices]))
+    first = offsets[indices[edge.argmax(axis=2)]]
+    for i,row in enumerate(np.flatnonzero(inside)):
+        edges = first[i,edge[i].any(axis=1)]
+        if len(edges)<3:
+            continue
+        consistent = edges[abs(edges-np.median(edges))<=5]
+        if len(consistent)<3 or np.ptp(consistent)>8:
+            continue
+        distance = float(np.median(consistent))+EDGE_GAP
+        index = round(distance)-offsets[0]
+        if not red[i,:,index-2:index+3].any():
+            result[row] = (centers[row]+distance*normals[row]).tolist()
+    return result
+
+
+def perimeter_point(img, pose, center, tangent, normal):
+    return perimeter_points(img,pose,[(center,tangent,normal)])[0]
 
 
 def map_point(pose, point):
@@ -527,23 +559,24 @@ def scene(img):
 
 
 def tracked_pose(reference, pose, img):
-    """Update a known map pose from terrain when all unit slots are already full."""
+    """Verify or update a calibrated pose using terrain outside the HUD."""
+    if img.size != reference.size:
+        return None
     if cv2 is None:
-        # Reuse the pose only if textured terrain in separate quadrants is stationary.
-        # On camera movement the caller can take a new measurement from the road.
-        if img.size != reference.size:
-            return None
         def terrain(frame):
             return np.asarray(frame.convert("L").resize((320,180), Image.Resampling.BILINEAR), dtype=np.int16)
         old, new = terrain(reference), terrain(img)
-        matches = 0
-        for y in (48, 92):
-            for x in (40, 192):
-                patch = old[y:y+36, x:x+76]
-                changed = abs(new[y:y+36, x:x+76] - patch)
-                if patch.std() > 8 and np.mean(changed < 5) > .92:
-                    matches += 1
-        return pose if matches >= 3 else None
+        matches = []
+        for y in (44,68,92,116):
+            for x in (26,64,102,140,178,216,254):
+                patch = old[y:y+20,x:x+28]
+                edges = (abs(patch[1:,1:]-patch[:-1,1:])>6) | (abs(patch[1:,1:]-patch[1:,:-1])>6)
+                changed = abs(new[y+1:y+20,x+1:x+28]-patch[1:,1:])
+                if edges.sum()>=30 and np.mean(changed[edges]<5)>.84 and np.mean(changed<5)>.87:
+                    matches.append((x,y))
+        if len(matches)>=6 and (np.ptp(matches,axis=0)>=[100,45]).all():
+            return pose
+        return None
     def features(frame):
         a=np.asarray(frame.convert("L").resize((640,360),Image.Resampling.BILINEAR))
         mask=np.zeros_like(a)
