@@ -1,6 +1,6 @@
 # TWD Farm
 
-TWD Farm 6.0.17 для Roblox «Toilet Warfare Defense» объединяет фарм Invaded City и совместный режим Wastelands для основы и трёх твинков.
+TWD Farm 6.0.18 для Roblox «Toilet Warfare Defense» объединяет фарм Invaded City и совместный режим Wastelands для основы и трёх твинков.
 
 ## Установка
 

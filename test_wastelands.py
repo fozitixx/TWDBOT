@@ -532,13 +532,13 @@ class NetworkTest(unittest.TestCase):
     def test_hover_samples_only_selected_icon_without_click(self):
         a=self.alts[0]
         frame=Image.new("RGB",(1356,698))
-        for reads,expected in (([2,2],2),([0,1],None),([2,None],None)):
+        for reads,expected in (([2,2],2),([None,0,0],0),([0,1,0,1],None),([2,None,2,None],None)):
             with patch.object(a,"game") as game,patch.object(a,"slot_count",side_effect=reads) as count:
                 game.grab.return_value=frame
                 self.assertEqual(a.hover_count(4,4),expected)
                 x,y=game.hover.call_args.args[0]
                 self.assertTrue(688<x*frame.width<767 and 570<y*frame.height<642)
-                self.assertEqual([c.args[1:] for c in count.call_args_list],[(4,4),(4,4)])
+                self.assertEqual([c.args[1:] for c in count.call_args_list],[(4,4)]*len(reads))
                 game.click.assert_not_called()
                 game.key.assert_not_called()
 
@@ -690,6 +690,28 @@ class VisionTest(unittest.TestCase):
         self.assertEqual(wastelands_slots(frame),dict(amplifier=6,screen=1,plunger=4,tv=3))
         put(2,icons[3])
         self.assertIsNone(wastelands_slots(frame))
+
+    def test_visual_hotbar_counts_from_rdp_without_ocr(self):
+        a = Alt.__new__(Alt)
+        a.ocr = Mock()
+        a.ocr.read.return_value = []
+        fixtures = Path(__file__).parent/"tests"/"fixtures"
+        for name,size,slot,limit,value in (
+            ("plunger_zero",(1353,697),3,4,0),
+            ("plunger_small",(1092,559),3,4,0),
+            ("tv_two",(1356,698),4,4,2),
+            ("titan_zero",(2047,1150),2,1,0),
+        ):
+            with self.subTest(name=name):
+                frame = Image.new("RGB",size)
+                x = a.slot_center(frame,slot)*frame.width
+                with Image.open(fixtures/("count_"+name+".png")) as crop:
+                    frame.paste(crop,(round(x-.046*frame.height),round(.854*frame.height)))
+                a.ocr.read.reset_mock()
+                self.assertEqual(a.slot_count(frame,slot,limit),value)
+                a.ocr.read.assert_not_called()
+                self.assertIsNone(a.slot_count(frame,slot,1 if limit==4 else 4))
+                self.assertIsNone(a.slot_count(frame,slot+1,limit))
 
     def test_printed_cooldown_is_not_active_timer(self):
         row=[("45s",.3,.4,.03,.02),("cooldown",.34,.4,.05,.02)]
