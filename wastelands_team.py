@@ -636,6 +636,7 @@ class Match:
             if client and client["instance"] != owner and now-client["seen"] < 10:
                 raise ValueError("Этот номер твинка уже подключён")
             self.clients[player] = dict(instance=owner, seen=now, status=str(req.get("status",""))[:180],
+                                        reported_run=req.get("run"),
                                         can_summon=req.get("can_summon") is True,
                                         can_map=req.get("can_map") is True,
                                         can_clear_space=req.get("can_clear_space") is True)

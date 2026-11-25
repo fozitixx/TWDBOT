@@ -16,6 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
 
+import twd_bot as farm
 from twd_bot import C, FONT, SETTINGS, team_profile_dir
 from wastelands_pairing import PairingProfile, valid_key
 from wastelands_team import ABILITIES, AltConnection, Match, PairingExpired, PLAYERS, PORT, UNITS, Wait, connect_by_pin, placement_label, serve
@@ -82,12 +83,14 @@ def field(parent, **options):
 
 
 class App:
-    def __init__(self,root,*,prefs=None,save_prefs=None,farm_busy=None,mode_lock=None):
+    def __init__(self,root,*,prefs=None,save_prefs=None,farm_busy=None,mode_lock=None,open_discord=None):
         self.root = root
         self.standalone = isinstance(root,tk.Tk)
         self.farm_busy = farm_busy or (lambda: False)
         self.mode_lock = mode_lock or threading.RLock()
         self.save_prefs = save_prefs
+        self.open_discord = open_discord
+        self.discord_state = {}
         prefs = prefs if isinstance(prefs,dict) else {}
         self.profile = PairingProfile(team_profile_dir())
         self.pair_lock = threading.Lock()
@@ -207,6 +210,8 @@ class App:
         self.ip_entry.pack(side="left", padx=8, ipady=3)
         text(line, "Имя ПК: " + socket.gethostname(), size=9, color="muted").pack(side="left")
         button(line,"Собрать логи твинков",self.export_logs).pack(side="right")
+        if self.open_discord:
+            button(net, "Discord", self.open_discord).pack(side="right", padx=5)
 
         match = card(body)
         match.pack(fill="x", pady=(0, 6))
@@ -687,6 +692,56 @@ class App:
             win.destroy()
         canvas.bind("<Button-1>",choose)
 
+    def report_player(self, player, online, activity):
+        # Called under match.lock. DiscordLink queues delivery on its own thread.
+        link = farm.LINK
+        channel = getattr(link, "worker_channels", {}).get(player)
+        if not channel:
+            self.discord_state.pop(player, None)
+            return
+        previous = self.discord_state.get(player, {})
+        if previous.get("channel") != channel:
+            previous = {}
+        if not online and not previous:
+            return
+        events = []
+        if online != previous.get("online"):
+            events.append("На связи" if online else "Связь потеряна")
+        run = self.match.run if online or previous.get("run") == self.match.run else ""
+        new_run = run != previous.get("run", "")
+        if new_run:
+            events.append(f"Помощник запущен · {self.match.mode.upper()}" if run else "Помощник остановлен")
+        known = {} if new_run else previous.get("known", {})
+        current = dict(known)
+        if run and online:
+            progress = self.match.progress[player]
+            for key, title in (("invited", "Приглашение принято"), ("voted", "Голос отдан"), ("ready", "READY нажат")):
+                if progress[key] and not known.get(key):
+                    events.append(title)
+                    current[key] = True
+            for (owner, unit), place in self.match.places.items():
+                state = place["state"]
+                if owner == player and state in ("placed", "sold") and known.get(unit) != state:
+                    events.append(("Поставлен " if state == "placed" else "Продан ") + placement_label(unit))
+                    current[unit] = state
+            if self.match.clients[player].get("reported_run") == run:
+                for titan, level in re.findall(r"(Amplifier|Screen) ур\. ([0-8])/8", activity):
+                    if known.get(titan) != level:
+                        events.append(f"{titan} · уровень {level}/8")
+                        current[titan] = level
+                manual_afk = "AFK CHECK" in activity and "ручн" in activity
+                if manual_afk and not known.get("afk"):
+                    events.append("AFK CHECK · нужен ручной ответ")
+                current["afk"] = manual_afk
+                if "игра отклонила постановку" in activity or "точка вне кадра" in activity:
+                    unit = activity.partition(" · ")[0]
+                    if unit in ("Amplifier", "Screen") and not known.get(f"warning_{unit}"):
+                        events.append(f"{unit} · проверь метку на карте титанов")
+                        current[f"warning_{unit}"] = True
+        self.discord_state[player] = dict(channel=channel, run=run, online=online, known=current)
+        if events:
+            link.send(f"Wastelands · Твинк {player}", "\n".join(events), player=player)
+
     def render_players(self):
         now = time.monotonic()
         if self.save_prefs and self.saved_titan_sites!=self.match.titan_sites:
@@ -740,6 +795,7 @@ class App:
                 else:
                     self.player_actions[i].pack_forget()
                 activity = c.get("status","") if online else ""
+                self.report_player(i, online, activity)
                 result = self.match.results.get(i,"")
                 for widget,value in ((self.rows[i],activity),(self.player_results[i],f"Команда · {result}" if result else "")):
                     if value:
