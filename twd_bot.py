@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "6.0.24 (Wastelands: привязка и место под титанов)"
+VERSION = "6.0.25 (Wastelands: карта титанов)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2206,15 +2206,16 @@ _update_checked = 0.0
 # 5.x updates only the entry script. These Git blob IDs identify the exact
 # companion files for this version, even after the release branch moves on.
 # Pin the raw download to a commit containing this entire set of files.
-TEAM_REVISION = "02774ee865bd61137527eb6dc1b7b9fc142e02a8"
+TEAM_REVISION = "a9c32e18bfa27abbf3370e1c2b15f31478bf1105"
 TEAM_FILES = {
     "wastelands_digits.png": "352a4528f742858abceddba6e728893282d358c6",
     "wastelands_hotbar.png": "34ec85ea4c91b77596b2fb1c6a22b204332d242b",
     "wastelands_titan_labels.png": "3ddf69ed5fd6b0c4fd1303baa7acf780d157ea21",
-    "wastelands.py": "f03f0e5390ce2b2ef853145466a3f2c279ab9eaf",
-    "wastelands_alt.py": "0ee2b7af4591941cd871f6042c684a3dab23eadf",
+    "wastelands.py": "e874e81ea7ee7ba75a08f591c6eb7808ed8a1a80",
+    "wastelands_alt.py": "4dbd78f1a03db88fa60563561b8d3b373ee1e096",
     "wastelands_manager.py": "2b74f27d9eb9e166aa3a05a06bb7be888e004dd2",
-    "wastelands_team.py": "01f0aa666b76120a72cff22f5d9683a21a75ba35",
+    "wastelands_map.py": "11d65c7c0c0199cb0917a7b7da8b6de14498bada",
+    "wastelands_team.py": "85115210be5be0ea08d50e93039bb07f8752f292",
     "wastelands_view.py": "d80fac6ea519175dc1c29bd04d9526b8069910f9",
     "wastelands_ocr.ps1": "496e34e723f8a27cd6993fc72f826f398459b5b9",
     "wastelands_pairing.py": "bf5f3fdacf52414d6ab203853ff06a64440c84d9",
