@@ -102,7 +102,16 @@ class App:
         if self.standalone:
             root.title("TWD · Wastelands")
             root.minsize(760,420)
-        self.match = Match(prefs.get("titan_sites"))
+        self.titan_frame = None
+        self.map_editor = None
+        map_problem = ""
+        try:
+            saved_map = self.profile.read("titan-map.json")
+            self.match = Match(prefs.get("titan_sites"), saved_map.get("points"))
+            self.titan_frame = saved_map.get("frame")
+        except (ValueError, OSError):
+            self.match = Match(prefs.get("titan_sites"))
+            map_problem = "Не удалось прочитать сохранённую карту титанов. Можно запросить новый кадр."
         self.saved_titan_sites = dict(self.match.titan_sites)
         self.server = self.worker = self.listener = None
         self.stop = threading.Event()
@@ -147,6 +156,8 @@ class App:
         self.afk_auto = tk.BooleanVar(value=prefs.get("afk_auto",True))
         self.allow_sales = tk.BooleanVar(value=prefs.get("allow_sales") is True)
         self._build_main()
+        if map_problem:
+            self.note.configure(text=map_problem)
         self._build_client(prefs)
         self._run_view = False
         if prefs.get("role")=="alt":
@@ -205,6 +216,7 @@ class App:
         self.match_title.pack(side="left")
         self.run_button = button(top, "Запустить помощника", self.start_match, primary=True)
         self.run_button.pack(side="right")
+        button(top, "Карта титанов", self.open_titan_map).pack(side="right", padx=5)
         self.match_fields = tk.Frame(match, bg=C["card"])
         self.match_fields.pack(fill="x", pady=(4, 0))
         text(self.match_fields, "Имя в приглашении", size=9, color="muted").grid(row=0,column=0,sticky="w",padx=(0,16))
@@ -541,6 +553,14 @@ class App:
         except ValueError as exc:
             self.note.configure(text=f"Твинк {player} · {exc}")
 
+    def open_titan_map(self):
+        if self.map_editor is not None and self.map_editor.win.winfo_exists():
+            self.map_editor.win.deiconify()
+            self.map_editor.win.lift()
+            return
+        from wastelands_map import TitanMapEditor
+        self.map_editor = TitanMapEditor(self)
+
     def export_logs(self):
         users = Path(os.environ.get("SystemDrive","C:")+os.sep)/"Users"
         logs, missing = worker_logs(users)
@@ -632,6 +652,7 @@ class App:
                         if ok:
                             current.update(point=p,state="placed")
                         current.pop("target",None)
+                        self.match.apply_titan_point(current)
                     win.destroy()
                 text(area,f"Ручная сверка точки {target[0]:.0f}, {target[1]:.0f}. Юнит встал?",color="yellow").pack(anchor="w")
                 button(area,"Да, стоит",lambda f=resolve:f(True)).pack(side="left")
@@ -756,10 +777,17 @@ class App:
                 self.listener=None
             self.refresh_tabs()
         self.render_players()
+        if self.map_editor is not None:
+            if self.map_editor.win.winfo_exists():
+                self.map_editor.poll()
+            else:
+                self.map_editor = None
         self.timer = self.root.after(400,self.tick)
 
     def close(self):
         self.root.after_cancel(self.timer)
+        if self.map_editor is not None and self.map_editor.win.winfo_exists():
+            self.map_editor.win.destroy()
         self.root.winfo_toplevel().unbind("<MouseWheel>", self.wheel_binding)
         self.stop.set()
         self.match.stop()

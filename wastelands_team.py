@@ -21,6 +21,7 @@ ABILITIES = ("Aerial Attack", "Hook and Punch", "Teleport")
 # First copy keeps its original ID for existing commands and READY.
 MAIN_EARLY = ((930, 452), (950, 482))
 EARLY = ("plunger", "tv")
+TITANS = ("amplifier", "screen")
 # Map-space axes along the main road and its branch, from their junction.
 JUNCTION = (835.,475.)
 _road_length = math.hypot(715,490)
@@ -123,6 +124,11 @@ def shared_bank_sections():
 
 
 SHARED_BANKS = shared_bank_sections()
+PRIMARY_BANK_COUNT = 5 + len(SPARE_BANKS) + len(SHARED_BANKS)
+# Use the opposite edge of the main road when the usual perimeter is full.
+# The worker still measures the actual visible edge before reserving a point.
+OVERFLOW_BANKS = tuple((trunk_point(distance, 0), TRUNK, tuple(-v for v in BRANCH))
+                       for distance in (*range(-246, 165, 12), *range(294, 529, 12)))
 
 
 def bank_slot(player, unit, attempt=0):
@@ -137,15 +143,17 @@ def bank_slot(player, unit, attempt=0):
         branch_distance,distance,side = SPARE_BANKS[(attempt-5+rank+bank)%len(SPARE_BANKS)]
         start = [v+branch_distance*n for v,n in zip(JUNCTION,BRANCH)]
         tangent, normal = TRUNK, tuple(side*n for n in BRANCH)
-    else:
+    elif attempt < PRIMARY_BANK_COUNT:
         return SHARED_BANKS[attempt-5-len(SPARE_BANKS)]
+    else:
+        return OVERFLOW_BANKS[attempt-PRIMARY_BANK_COUNT]
     center = [v+distance*t for v,t in zip(start,tangent)]
     return center, tangent, normal
 
 
 def placement_attempts(unit):
     if unit.partition("_")[0] in EARLY:
-        return 5+len(SPARE_BANKS)+len(SHARED_BANKS)
+        return PRIMARY_BANK_COUNT + len(OVERFLOW_BANKS)
     return len(TITAN_OFFSETS)+len(TITAN_SPARES)+len(TITAN_LANE_GRID)+len(TITAN_BANK_GRID)
 
 
@@ -188,10 +196,10 @@ def segment_distance(p, a, b):
     return math.dist(p, mix(a, b, min(1, max(0, t))))
 
 
-def placement_conflict(player,unit,point,places):
-    if segment_distance(point, (638,438),(886,604)) < 58:
+def placement_conflict(player,unit,point,places,*,manual=False):
+    if not manual and segment_distance(point, (638,438),(886,604)) < 58:
         return "Зона титанов основы"
-    if any(math.dist(point, reserved) < 30 for reserved in MAIN_EARLY):
+    if not manual and any(math.dist(point, reserved) < 30 for reserved in MAIN_EARLY):
         return "Зона ранней защиты основы"
     for other in places:
         if other["player"]==player and other["unit"]==unit:
@@ -206,14 +214,15 @@ def placement_conflict(player,unit,point,places):
         # their small patch. Every pending or built base still owns its radius.
         same_titan_bank = (player==other["player"]==3 and unit in ("amplifier","screen")
                            and other["unit"] in ("amplifier","screen"))
-        protect_plan = other["state"]=="placed" or (not (other_early or same_titan_bank) and not target)
+        protect_plan = (other["state"]=="placed" or other.get("manual_site") or
+                        (not manual and not (other_early or same_titan_bank) and not target))
         for occupied in (other["point"] if protect_plan else None, target, other.get("clear_site")):
             if occupied and math.dist(point, occupied) < clearance:
                 return "Рядом занят участок"
     return None
 
 
-def single_blocker(player, titan, point, places):
+def single_blocker(player, titan, point, places, *, manual=False):
     """Return the confirmed small tower whose removal alone frees this site."""
     blocked = [p for p in places if p["unit"].partition("_")[0] in EARLY and p["state"]=="placed"
                and math.dist(point,p["point"])<TITAN_CLEARANCE]
@@ -223,7 +232,7 @@ def single_blocker(player, titan, point, places):
     if (tower.get("slot") is None or tower.get("target") or
             (tower.get("count_before") is None and tower.get("total_before") is None)):
         return None
-    if placement_conflict(player,titan,point,(p for p in places if p is not tower)):
+    if placement_conflict(player,titan,point,(p for p in places if p is not tower),manual=manual):
         return None
     return tower
 
@@ -244,6 +253,24 @@ def near_rejection(unit, point, sites):
     # An unsuccessful click proves only that spot. A real tower still owns 54.
     clearance = EARLY_CLEARANCE if group=="early" else 18
     return any(group==other and math.dist(point,center)<clearance for other,center in sites)
+
+
+def titan_layout(points):
+    """Validate the six optional positions in the common road coordinate system."""
+    slots = {f"{player}/{unit}" for player in PLAYERS for unit in TITANS}
+    if not isinstance(points, dict) or not points.keys() <= slots:
+        raise ValueError("Некорректная разметка титанов")
+    layout = {}
+    for key, point in points.items():
+        if (not isinstance(point, (list, tuple)) or len(point) != 2 or
+                not all(type(v) in (int, float) and math.isfinite(v) for v in point) or
+                not (0 < point[0] < 2048 and 0 < point[1] < 1152)):
+            raise ValueError("Точка за пределами карты Wastelands")
+        for other, center in layout.items():
+            if math.dist(center, point) < TITAN_CLEARANCE:
+                raise ValueError(f"Точки {other} и {key} слишком близко для двух титанов")
+        layout[key] = list(point)
+    return layout
 
 
 class Wait(Exception):
@@ -287,7 +314,7 @@ class AltConnection:
 
     def exchange(self, op="poll", *, run="", status="Подключение", **fields):
         payload = dict(instance=self.instance, run=run, status=status, op=op, can_summon=True,
-                       uses_host_sites=True, can_clear_space=True, **fields)
+                       uses_host_sites=True, can_clear_space=True, can_map=True, **fields)
         request = Request(self.url, data=json.dumps(payload).encode(), headers={
             "Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
         try:
@@ -305,7 +332,7 @@ class AltConnection:
 
 
 class Match:
-    def __init__(self, titan_sites=None):
+    def __init__(self, titan_sites=None, manual_titans=None):
         self.lock = threading.RLock()
         self.keys = {i: secrets.token_urlsafe(18) for i in PLAYERS}
         self.pins = {}
@@ -320,6 +347,8 @@ class Match:
         self.places = {}
         self.rejections = {}
         self.titan_sites = {}
+        self.manual_titans = titan_layout({} if manual_titans is None else manual_titans)
+        self.map_frame = None
         if isinstance(titan_sites,dict):
             for player in PLAYERS:
                 for unit in ("amplifier","screen"):
@@ -338,6 +367,29 @@ class Match:
         self.allow_sales = False
         self.vote_owner = None
         self.vote_until = 0
+
+    def apply_titan_point(self, row):
+        if row["unit"] not in TITANS or row["state"] != "reserved" or row.get("target") or row.get("clear_site"):
+            return
+        player, unit = row["player"], row["unit"]
+        row["manual_site"] = self.manual_titans.get(f"{player}/{unit}")
+        row["point"] = row["manual_site"] or position(player, unit)
+
+    def set_titan_layout(self, points):
+        with self.lock:
+            layout = titan_layout(points)
+            changed = {key for key in self.manual_titans.keys() | layout.keys()
+                       if self.manual_titans.get(key) != layout.get(key)}
+            self.manual_titans = layout
+            for sale in list(self.sales.values()):
+                key = f"{sale['requester']}/{sale['titan']}"
+                if key in changed and "before" not in sale:
+                    self.finish_sale(sale, False, time.monotonic())
+            for row in self.places.values():
+                if f"{row['player']}/{row['unit']}" in changed and "clear_until" in row:
+                    row.pop("clear_until")
+                    row.pop("clear_site", None)
+                self.apply_titan_point(row)
 
     def issue_pin(self, player):
         with self.lock:
@@ -384,6 +436,9 @@ class Match:
             self.vote_owner = None
             self.places = {(i, u): {"unit": u, "player": i, "point": position(i, u),
                                     "state": "reserved"} for i in PLAYERS for u in PLACEMENT_ORDER}
+            for row in self.places.values():
+                self.apply_titan_point(row)
+            self.map_frame = None
             self.pending.clear()
             self.frames.clear()
             self.results.clear()
@@ -392,6 +447,7 @@ class Match:
     def stop(self):
         with self.lock:
             self.run = ""
+            self.map_frame = None
             self.sales.clear()
             self.recalled.clear()
             self.pending.clear()
@@ -421,22 +477,25 @@ class Match:
             self.results[player] = "Отправлен вызов в приватку"
 
     def command(self, player, name, **details):
-        if name not in (*ABILITIES, "snapshot"):
+        if name not in (*ABILITIES, "snapshot", "map_snapshot"):
             raise ValueError("Неизвестная команда")
         with self.lock:
             client = self.clients.get(player, {})
             if not self.run or time.monotonic() - client.get("seen", -1e9) > 8:
                 raise ValueError("Твинк вне связи или матч не начат")
+            if name == "map_snapshot" and not client.get("can_map"):
+                raise ValueError("Для кадра карты обнови твинк до 6.0.25")
             if player in self.recalled or player in self.summons:
                 raise ValueError("Твинк вызван в приватку")
             prior = self.pending.get(player)
             if prior and time.monotonic() < prior["until"]:
                 raise ValueError("Предыдущая команда ещё выполняется")
             self.pending[player] = dict(details, id=secrets.token_hex(8), name=name,
-                                        until=time.monotonic()+8)
+                                        until=time.monotonic()+(18 if name=="map_snapshot" else 8))
             self.results[player] = "Команда отправлена"
             if name == "snapshot":
                 self.frames.pop(player, None)
+            return self.pending[player]["id"]
 
     def reserve(self, player, unit, point, count_before=None, total_before=None, slot=None):
         if not isinstance(point, list) or len(point) != 2 or not all(
@@ -481,13 +540,17 @@ class Match:
                 dx,dy = x-planned[0],y-planned[1]
                 return (abs(dx*tangent[0]+dy*tangent[1])<1 and
                         abs(dx*normal[0]+dy*normal[1])<=EDGE_ADJUST+.01)
-            if not any(allowed(j) for j in range(placement_attempts(unit))):
+            manual = place.get("manual_site")
+            if manual and point != manual:
+                raise ValueError("Точка титана изменилась на основе")
+            if not manual and not any(allowed(j) for j in range(placement_attempts(unit))):
                 raise ValueError("За пределами назначенной зоны")
         elif unit != "screen":
             raise ValueError("Перенос доступен только для Screen")
         if place["state"]!="placed" and near_rejection(unit,point,recent_sites(self.rejections,time.monotonic())):
             raise ValueError("Игра недавно отклонила этот участок")
-        conflict = placement_conflict(player,unit,point,self.places.values())
+        conflict = placement_conflict(player,unit,point,self.places.values(),
+                                      manual=bool(place.get("manual_site")) and place["state"] != "placed")
         if conflict:
             raise ValueError(conflict)
         place["count_before"] = count_before
@@ -505,9 +568,12 @@ class Match:
             return
         if not isinstance(point,list) or len(point)!=2 or not all(type(v) in (float,int) and math.isfinite(v) for v in point):
             return
-        if not any(math.dist(point,position(player,titan,i))<1 for i in range(placement_attempts(titan))):
+        manual = row.get("manual_site")
+        if manual and point != manual:
             return
-        tower = single_blocker(player,titan,point,self.places.values())
+        if not manual and not any(math.dist(point,position(player,titan,i))<1 for i in range(placement_attempts(titan))):
+            return
+        tower = single_blocker(player,titan,point,self.places.values(),manual=bool(manual))
         if tower is None:
             return
         owner,unit = tower["player"],tower["unit"]
@@ -526,8 +592,13 @@ class Match:
         if sold:
             self.places[owner,unit]["state"] = "sold"
             row.update(sale_used=True,clear_until=now+20)
+            if row.get("manual_site") != self.manual_titans.get(f"{sale['requester']}/{sale['titan']}"):
+                row.pop("clear_site", None)
+                row.pop("clear_until")
+                self.apply_titan_point(row)
         else:
             row.pop("clear_site",None)
+            self.apply_titan_point(row)
             # After issuing a sale, never send another click for the same tower
             # and request within this match, even if the response was lost.
             self.sale_retry[sale["requester"],sale["titan"],owner,unit] = (
@@ -566,6 +637,7 @@ class Match:
                 raise ValueError("Этот номер твинка уже подключён")
             self.clients[player] = dict(instance=owner, seen=now, status=str(req.get("status",""))[:180],
                                         can_summon=req.get("can_summon") is True,
+                                        can_map=req.get("can_map") is True,
                                         can_clear_space=req.get("can_clear_space") is True)
             for sale in list(self.sales.values()):
                 if "before" not in sale and (sale["until"]<now or sale["requester"] in self.recalled
@@ -575,11 +647,13 @@ class Match:
                 if "clear_until" in row and row["clear_until"]<=now:
                     row.pop("clear_until")
                     row.pop("clear_site",None)
+                    self.apply_titan_point(row)
             self.expire_summon(player, now)
             summon = self.summons.get(player)
             op = req.get("op","poll")
             sites = None
             preferred_site = None
+            manual_site = None
             claimed = None
             send_sale = False
             if op == "summon_result":
@@ -604,8 +678,9 @@ class Match:
                     if unit not in PLACEMENT_ORDER:
                         raise ValueError("Неизвестный юнит")
                     locate = bank_slot if unit.partition("_")[0] in EARLY else position
-                    sites = [locate(player,unit,i) for i in range(placement_attempts(unit))]
-                    preferred_site = self.titan_sites.get(f"{player}/{unit}",CONFIRMED_TITAN_SITES[player].get(unit))
+                    manual_site = self.places[player,unit].get("manual_site")
+                    sites = [manual_site] if manual_site else [locate(player,unit,i) for i in range(placement_attempts(unit))]
+                    preferred_site = manual_site or self.titan_sites.get(f"{player}/{unit}",CONFIRMED_TITAN_SITES[player].get(unit))
                 elif op in ("reserve","release","commit"):
                     unit = req["unit"]
                     place = self.places[player,unit]
@@ -613,6 +688,8 @@ class Match:
                             and req["target_since"]!=place.get("target_since")):
                         raise ValueError("Резерв изменился")
                     if op == "reserve":
+                        if "plan_point" in req and req["plan_point"] != place.get("manual_site") and place["state"] != "placed":
+                            raise ValueError("Точка титана изменилась на основе")
                         try:
                             self.reserve(player,unit,req["point"],req.get("count_before"),
                                          req.get("total_before"),req.get("slot"))
@@ -631,8 +708,9 @@ class Match:
                                 and (place.get("count_before") is not None or place.get("total_before") is not None)):
                             self.rejections[footprint_class(unit),tuple(place["target"])] = now+REJECTION_SECONDS
                         place.pop("target",None)
+                        self.apply_titan_point(place)
                     elif place.get("target") == req["point"]:
-                        if (unit in ("amplifier","screen") and place["state"]!="placed" and place.get("slot")
+                        if (unit in TITANS and not place.get("manual_site") and place["state"]!="placed" and place.get("slot")
                                 and (place.get("count_before") is not None or place.get("total_before") is not None)):
                             self.titan_sites[f"{player}/{unit}"] = list(place["target"])
                         place.update(point=place.pop("target"),state="placed")
@@ -660,6 +738,8 @@ class Match:
                     if cmd and cmd["id"] == req["id"]:
                         if cmd["name"] == "snapshot" and req.get("frame"):
                             self.frames[player] = (cmd["id"],req["frame"])
+                        if cmd["name"] == "map_snapshot" and cmd.get("claimed") and now <= cmd["until"] and req.get("frame"):
+                            self.map_frame = (cmd["id"], dict(player=player, image=req["frame"], pose=req.get("pose")))
                         self.results[player] = str(req["result"])[:160]
                         del self.pending[player]
                 else:
@@ -672,7 +752,7 @@ class Match:
             return dict(run="" if player in self.recalled else self.run,
                         allow_sales=self.allow_sales, sale=dict(self.sales[player]) if player in self.sales else None,
                         send_sale=send_sale,
-                        rejected_sites=recent_sites(self.rejections,now),preferred_site=preferred_site,
+                        rejected_sites=recent_sites(self.rejections,now),preferred_site=preferred_site,manual_site=manual_site,
                         summon={"id":summon["id"],"link":summon["link"]} if summon and summon["instance"]==owner else None,
                         afk_auto=self.afk_auto, placement_sites=True, placement_totals=True, sites=sites, mode=self.mode,host=self.host,places=[dict(p) for p in self.places.values()],claimed=claimed,
                         vote_seconds=max(0,self.vote_until-now) if self.vote_owner==player else 0,

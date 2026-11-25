@@ -10,7 +10,7 @@ from pynput import mouse
 
 import twd_bot as farm
 from wastelands_manager import manager_bounds, titan_cards, upgrade_price
-from wastelands_team import (ABILITIES, BANK_OFFSET, EARLY, EARLY_CLEARANCE, TITAN_CLEARANCE, REJECTION_SECONDS, PairingExpired, single_blocker,
+from wastelands_team import (ABILITIES, BANK_OFFSET, EARLY, EARLY_CLEARANCE, PRIMARY_BANK_COUNT, TITANS, TITAN_CLEARANCE, REJECTION_SECONDS, PairingExpired, single_blocker,
                             PLACEMENT_ORDER, SPARE_BANKS, Wait, bank_slot, footprint_class, near_rejection, placement_conflict,
                             on_third_titan_bank, placement_label, position, private_server_links, recent_sites)
 from wastelands_view import (OCR, color_boxes, framing_turn, invite_buttons, label, read_invite, map_point, preview,
@@ -348,9 +348,11 @@ class Alt:
         self.allow_sales = state.get("allow_sales",False)
         self.sale_checks = {}
         self.sites = {}
+        self.manual_titans = {}
         self.preferred_titans = {}
         self.failed_titan_sites = {}
         self.rescan_at = {}
+        self.blocked_tv = set()
         self.local_rejections = {}
         self.team_rejections = state.get("rejected_sites",())
         self.search_log_at = {}
@@ -554,6 +556,17 @@ class Alt:
         own = {p["unit"]:p for p in self.team_places if p["player"]==self.player}
         if not all(unit in own for unit in PLACEMENT_ORDER):
             raise Wait("Основа не передала десять мест. Обнови основу до 6.0.4.")
+        for unit in TITANS:
+            point = own[unit].get("manual_site")
+            if self.manual_titans.get(unit) != point:
+                if point:
+                    self.manual_titans[unit] = point
+                else:
+                    self.manual_titans.pop(unit, None)
+                self.sites.pop(unit, None)
+                self.preferred_titans.pop(unit, None)
+                self.rescan_at.pop(unit, None)
+                self.next_check = 0
         placed = {u for u,p in own.items() if p["state"]=="placed"}
         self.retired = {u for u,p in own.items() if p["state"]=="sold"}
         pending = {u for u,p in own.items() if p.get("target")}
@@ -583,7 +596,9 @@ class Alt:
             if self.host_sites:
                 plan = self.exchange("placement_sites",unit=unit)
                 sites = plan["sites"]
-                if self.player==3 and unit in ("amplifier","screen"):
+                if plan.get("manual_site") and unit in TITANS:
+                    self.manual_titans[unit] = plan["manual_site"]
+                elif self.player==3 and unit in TITANS:
                     sites = [p for p in sites if on_third_titan_bank(p)]
                     if not sites:
                         raise Wait("Основа передала старую зону титанов твинка 3. Обнови основу до 6.0.23 или новее.")
@@ -636,6 +651,11 @@ class Alt:
                 return count
             previous = count
             frames.append(frame)
+        if limit == 4 and any(self.slots.get(kind) == slot and until > time.monotonic()
+                              for kind, until in self.manager_until.items()):
+            # This icon was unreadable recently and the manager supplied its
+            # total. Avoid two expensive OCR passes on the same failed slot.
+            return None
         # Do the inexpensive visual pass before calling Windows OCR. Only two
         # recent, independently captured fractions with the right limit can agree.
         observed = []
@@ -712,6 +732,11 @@ class Alt:
         confirmed = sum(u.partition("_")[0]==kind for u in self.placed)
         if count is not None and count<confirmed:
             count = None
+        if (kind in EARLY and self.last_inventory and count == confirmed
+                and reading.total == len(self.placed)):
+            # Reuse a measured total across a cash/terrain wait only after the
+            # live slot agrees with the roster this worker controlled.
+            return UnitCounts(count, reading.total)
         if count==limit or (count is not None and not self.host_totals):
             return UnitCounts(count)
         # A stale zero can persist over the icon after a titan was placed.
@@ -742,18 +767,24 @@ class Alt:
     def placement_readback(self,kind,slot,before,double_check):
         limit = 4 if kind in EARLY else 1
         manager = None
-        if before.total is not None and (before.slot is None or time.monotonic()<self.manager_until.get(kind,0)):
+        if before.total is not None and (before.slot is None or
+                kind not in EARLY and time.monotonic()<self.manager_until.get(kind,0)):
             manager = self.manager_counts(kind,limit,cards=False)
             if before.delta(manager) in (0,1) or before.slot is None:
                 return manager
         count = self.hover_count(slot,limit)
         if manager is None:
-            if count is not None and (count==before.slot+1 or count==before.slot and not double_check):
+            if before.slot is not None and count is not None and (count==before.slot+1 or count==before.slot
+                    and (not double_check or kind in EARLY and before.total is None)):
                 return UnitCounts(count)
             manager = self.manager_counts(kind,limit,cards=before.total is None)
+        if (kind in EARLY and double_check and count == before.slot and before.total is not None
+                and manager.slot is None and manager.total == before.total+1):
+            # The slot can lag; this worker owns exactly one in-flight purchase.
+            return UnitCounts(total=manager.total)
         if count is None and manager.total is not None:
             self.manager_until[kind] = time.monotonic()+12
-        elif count is not None:
+        else:
             self.manager_until.pop(kind,None)
         if count is not None and manager.slot is not None and count!=manager.slot:
             if (limit==1 and manager.slot==1 and before.slot==0 and before.total is not None
@@ -792,6 +823,9 @@ class Alt:
         if not delta:
             cooldown = REJECTION_SECONDS if funded else 18
             self.local_rejections[footprint_class(unit),tuple(point)] = time.monotonic()+cooldown
+            if unit in ("tv_3", "tv_4"):
+                self.blocked_tv.add(unit)
+                self.rescan_at[unit] = time.monotonic()+3
             if kind not in EARLY and funded:
                 site = tuple(point)
                 self.failed_titan_sites[site] = self.failed_titan_sites.get(site,0)+1
@@ -858,7 +892,8 @@ class Alt:
         if unit.partition("_")[0] in EARLY:
             sites = [[v+BANK_OFFSET*n for v,n in zip(center,normal)] for center,_,normal in sites]
         recent = recent_sites(self.local_rejections,now) + list(self.team_rejections)
-        free = [point for point in sites if not placement_conflict(self.player,unit,point,self.team_places)
+        manual = bool(self.manual_titans.get(unit))
+        free = [point for point in sites if not placement_conflict(self.player,unit,point,self.team_places,manual=manual)
                 and not near_rejection(unit,point,recent)]
         heading = self.camera_heading(pose,frame.size)
         avoid_sign = 0
@@ -866,7 +901,7 @@ class Alt:
             failed,sign,until = self.failed_heading
             if now<until and abs((heading-failed+180)%360-180)<12:
                 avoid_sign = sign
-        radius = TITAN_CLEARANCE//2 if self.player==3 and unit in ("amplifier","screen") else 0
+        radius = TITAN_CLEARANCE//2 if (manual or self.player==3) and unit in TITANS else 0
         angle = framing_turn(pose,free,frame.size,avoid_sign,radius=radius)
         angle = max(-self.max_turn,min(self.max_turn,angle))
         if not angle or farm.afk_panel(self.game.grab()):
@@ -882,6 +917,15 @@ class Alt:
         return True
 
     def candidate_sites(self,unit,frame,pose,sites):
+        if unit.partition("_")[0] in EARLY and len(sites) > PRIMARY_BANK_COUNT:
+            usual = self.rank_sites(unit,frame,pose,sites[:PRIMARY_BANK_COUNT])
+            if usual[0]:
+                return usual
+            extra = self.rank_sites(unit,frame,pose,sites[PRIMARY_BANK_COUNT:])
+            return (extra[0], *(a+b for a,b in zip(usual[1:],extra[1:])))
+        return self.rank_sites(unit,frame,pose,sites)
+
+    def rank_sites(self,unit,frame,pose,sites):
         early = unit.partition("_")[0] in EARLY
         if early:
             measured = perimeter_points(frame,pose,sites)
@@ -902,7 +946,7 @@ class Alt:
             if not placement_in_view(x,y):
                 continue
             visible += 1
-            if placement_conflict(self.player,unit,point,self.team_places):
+            if placement_conflict(self.player,unit,point,self.team_places,manual=unit in self.manual_titans):
                 busy += 1
                 continue
             if near_rejection(unit,point,recent):
@@ -919,6 +963,10 @@ class Alt:
             if any(math.dist(point,p)<EARLY_CLEARANCE for p in other_plans):
                 cost += .24
             preference.append(cost)
+        if unit in self.manual_titans:
+            # The operator picked this exact patch. Let the game decide
+            # whether it accepts the base; its colour is only a search heuristic.
+            return available,visible,busy,rejected,0
         check_ground = self.player==3 and not early
         radius = TITAN_CLEARANCE//2 if check_ground else (12 if early else 24)
         ranked = rank_build_sites(frame,pose,available,radius,preference,clear_titan_base=check_ground)
@@ -966,13 +1014,13 @@ class Alt:
         for point in dict.fromkeys(map(tuple,sites)):
             if self.titan_misses(point) or near_rejection(unit,point,recent):
                 continue
-            tower = single_blocker(self.player,unit,point,self.team_places)
+            tower = single_blocker(self.player,unit,point,self.team_places,manual=unit in self.manual_titans)
             if tower:
                 possible.append(list(point))
                 costs.append(0 if tower["player"]==self.player else .15)
                 blockers[point] = tower
         ranked = rank_build_sites(frame,pose,possible,TITAN_CLEARANCE//2,costs,clear_titan_base=True,
-                                  occupied_centers=[p["point"] for p in blockers.values()])
+                                  occupied_centers=[blockers[tuple(point)]["point"] for point in possible])
         tried = set()
         for point in ranked:
             tower = blockers[tuple(point)]
@@ -1008,7 +1056,13 @@ class Alt:
             self.at_limit.add(kind)
             return f"{name} · в игре уже {limit}/{limit}"
         if not before.known():
+            if unit in ("tv_3", "tv_4"):
+                self.blocked_tv.add(unit)
+                self.rescan_at[unit] = time.monotonic()+4
+                return f"{name} · жду счётчик слота {slot} или UNITS"
             return self.wait_for_check(f"{name} · жду счётчик слота {slot} или UNITS")
+        if kind in EARLY:
+            self.last_inventory = (kind,time.monotonic()+8,before)
         self.read_delay = 0
         sites = self.placement_sites(unit)
         if not self.game.take(slot):
@@ -1051,7 +1105,8 @@ class Alt:
                 pt = screen_point(pose,point)
                 try:
                     reserved = self.exchange("reserve",unit=unit,point=point,slot=slot,
-                                             count_before=before.slot,total_before=before.total)
+                                             count_before=before.slot,total_before=before.total,
+                                             plan_point=self.manual_titans.get(unit))
                 except Wait as exc:
                     if any(reason in str(exc) for reason in
                            ("Рядом занят участок","Зона ранней защиты основы","Зона титанов основы")):
@@ -1074,6 +1129,9 @@ class Alt:
                 def live_point(frame):
                     if frame.size!=snap.size or farm.afk_panel(frame):
                         return None
+                    if unit in self.manual_titans:
+                        current = self.map_pose(frame)
+                        return screen_point(current,point) if current is not None else None
                     if np.median(abs(scene(frame)-reference_scene))<4:
                         return pt
                     current = tracked_pose(snap,pose,frame)
@@ -1089,6 +1147,8 @@ class Alt:
                 return self.wait_for_check(f"{name} · проверяю результат клика",.60)
             now = time.monotonic()
             self.rescan_at[unit] = now+4
+            if unit in ("tv_3", "tv_4"):
+                self.blocked_tv.add(unit)
             message = f"{name} · участков в кадре {visible}, занято {busy}, недавних отказов {rejected}"
             if obstructed:
                 message = f"{name} · ищу свободный песок в своей зоне · занято {busy}, помехи в {obstructed} точках"
@@ -1097,6 +1157,9 @@ class Alt:
                 self.search_log_at[kind] = now+12
             if self.reframe_sites(unit,snap,pose,sites):
                 return self.wait_for_check(f"{name} · повернул камеру к свободному участку, сверяю карту",.5)
+            if unit in self.manual_titans:
+                reason = "участок занят" if busy else ("игра отклонила постановку" if rejected else "точка вне кадра")
+                return f"{name} · {reason}. Можно передвинуть метку в «Карта титанов»."
             return message
         finally:
             self.game.drop()
@@ -1263,8 +1326,50 @@ class Alt:
             self.deadline = None
             self.close_manager()
 
+    def map_snapshot(self):
+        if self.phase != "battle":
+            return {"result":"Дождись появления карты Wastelands у твинка"}
+        live = self.game.grab()
+        if farm.afk_panel(live):
+            raise Wait("Сначала заверши проверку на экране")
+        # The projection and preview must come from the very same grab.
+        current = self.map_pose(live)
+        if current is None:
+            try:
+                for kind in (*EARLY, *TITANS):
+                    self.guard()
+                    if self.game.take(self.slots[kind]):
+                        self.game.hover(farm.IDLE_POINT)
+                        live = self.game.grab()
+                        if farm.afk_panel(live):
+                            raise Wait("Сначала заверши проверку на экране")
+                        current = self.map_pose(live)
+                        break
+            finally:
+                self.game.drop()
+        if current is None:
+            return {"result":"Дорога не распознана. Запроси кадр с другого твинка или измени ракурс."}
+        return {"result":"Кадр карты готов", "frame":preview(live),
+                "pose":[part.tolist() for part in current]}
+
+    def run_command(self, request):
+        cmd = self.exchange("claim",id=request["id"])["claimed"]
+        if not cmd:
+            return "Команда уже принята или устарела"
+        self.deadline = time.monotonic()+cmd["remaining"]
+        try:
+            response = self.command(cmd)
+        except Wait as exc:
+            response = {"result":str(exc)}
+        finally:
+            self.deadline = None
+        self.exchange("result",id=cmd["id"],**response)
+        return response["result"]
+
     def command(self, cmd):
         name = cmd["name"]
+        if name == "map_snapshot":
+            return self.map_snapshot()
         unit = "amplifier" if name=="Aerial Attack" else "screen"
         if unit in self.pending_places:
             return {"result":"Место титана ещё не подтверждено"}
@@ -1427,6 +1532,9 @@ class Alt:
         self.afk_signature = None
         if farm.is_end_image(farm.crop_frac(img,farm.END_BOX)):
             self.phase = "end"
+        cmd = state.get("command")
+        if self.phase!="battle" and cmd and cmd["name"]=="map_snapshot":
+            return self.run_command(cmd)
         if self.phase=="end":
             return "Матч завершён · жду следующий матч"
         if self.update_places(state):
@@ -1439,6 +1547,7 @@ class Alt:
             self.sites.clear()
             self.rescan_at.clear()
             self.local_rejections.clear()
+            self.blocked_tv.clear()
             self.failed_titan_sites.clear()
             self.retry = state["progress"]["retry"]
         if self.phase=="lobby":
@@ -1455,20 +1564,8 @@ class Alt:
             self.next_slot_check = float("inf") if detected else time.monotonic()+2
         if state.get("sale"):
             return self.clear_space(state["sale"])
-        cmd = state["command"]
         if cmd:
-            cmd = self.exchange("claim",id=cmd["id"])["claimed"]
-            if not cmd:
-                return "Команда уже принята или устарела"
-            self.deadline = time.monotonic()+cmd["remaining"]
-            try:
-                response = self.command(cmd)
-            except Wait as exc:
-                response = {"result":str(exc)}
-            finally:
-                self.deadline = None
-            self.exchange("result",id=cmd["id"],**response)
-            return response["result"]
+            return self.run_command(cmd)
         now = time.monotonic()
         if now<self.next_check:
             return self.wait_status
@@ -1479,21 +1576,34 @@ class Alt:
 
         outstanding = [u for u in PLACEMENT_ORDER if u not in self.placed and u not in self.retired
                        and u.partition("_")[0] not in self.at_limit]
-        # A different copy can use another bank, but TV must wait for all
-        # Plungers, and both titans must wait for all TVs.
+        # Once both last TVs have actually run out of options, give a titan
+        # one turn even if scanning the bank outlasted the other TV's cooldown.
         if outstanding:
             first = outstanding[0].partition("_")[0]
+            late_tv = first == "tv" and all(u in self.placed or u in self.retired for u in ("tv", "tv_2"))
+            remaining_tv = [u for u in outstanding if u.partition("_")[0]=="tv"]
+            if late_tv and self.blocked_tv.issuperset(remaining_tv):
+                self.blocked_tv.difference_update(remaining_tv)
+                outstanding = [u for u in outstanding if u in TITANS] + remaining_tv
+                if all(u in self.placed or u in self.at_limit for u in TITANS):
+                    return self.upgrade_tick(img)
+            elif late_tv:
+                outstanding = sorted(remaining_tv, key=self.blocked_tv.__contains__) + [u for u in outstanding if u in TITANS]
             for unit in outstanding:
-                if first in EARLY and unit.partition("_")[0]!=first:
+                if first in EARLY and unit.partition("_")[0]!=first and not late_tv:
                     break
                 if unit in self.pending_places:
                     continue
                 if any(p["player"]==self.player and p["unit"]==unit and p.get("clear_site")
                        and not p.get("sale_used") for p in self.team_places):
-                    return f"{placement_label(unit)} · жду освобождения места владельцем башни"
+                    if len(outstanding)==1:
+                        return f"{placement_label(unit)} · жду освобождения места владельцем башни"
+                    continue
                 if now<self.rescan_at.get(unit,0):
                     continue
                 return self.place(unit,img)
+            if late_tv and all(u in self.placed or u in self.at_limit for u in TITANS):
+                return self.upgrade_tick(img)
             area = "по периметру дороги" if first in EARLY else "в зоне титанов"
             return f"{placement_label(outstanding[0])} · повторю поиск {area}"
         return self.upgrade_tick(img)
