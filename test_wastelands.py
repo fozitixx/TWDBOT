@@ -111,6 +111,12 @@ class IntegrationTest(unittest.TestCase):
                 self.assertTrue(farm.team_directory())
                 app.show("wastelands")
                 panel = app.team
+                panel.open_discord()
+                self.assertEqual(app.current, "discord")
+                app.vars["discord_worker_2"].set("200000000000000002")
+                app.save()
+                self.assertEqual(farm.SETTINGS["discord_worker_2"], "200000000000000002")
+                app.show("wastelands")
                 self.assertEqual([panel.tabs.tab(p,"text") for p in panel.tabs.tabs()],["Основа","Твинк"])
                 panel.host.set("S4R")
                 panel.tabs.select(panel.client)

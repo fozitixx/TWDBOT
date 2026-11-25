@@ -1,4 +1,4 @@
-TWD Farm 6.0.25 — Wastelands и Invaded City
+TWD Farm 6.0.26 — Wastelands и Invaded City
 
 1. Для установки запусти «Создать ярлык.bat». Открывай приложение через ярлык TWD Farm или «Запуск.bat».
 2. Для совместного матча открой Wastelands в левом меню. Во вкладке «Основа» находятся LAN-адрес,
@@ -9,6 +9,7 @@ TWD Farm 6.0.25 — Wastelands и Invaded City
 4. Если что-то пошло не так - пришли twd_log.txt (вкладка "Журнал" -> "Открыть папку").
 
 Discord
+Для отчётов Wastelands на основе открой «Wastelands → Основа → Discord». Включи бота, укажи общий токен и отдельный ID текстового канала для каждого нужного твинка. Нажми «Сохранить и подключить». Пустое поле отключает отчёты этого твинка.
 1. https://discord.com/developers/applications -> New Application -> Bot -> Reset Token, скопируй токен.
    (Message Content Intent больше НЕ нужен.)
 2. OAuth2 -> URL Generator: отметь scopes "bot" и "applications.commands",

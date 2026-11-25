@@ -50,7 +50,7 @@ from pynput import keyboard, mouse
 
 # рядом с .exe (если бот собран в exe) или рядом с .py
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-VERSION = "6.0.25 (Wastelands: карта титанов)"
+VERSION = "6.0.26 (Wastelands: Discord для твинков)"
 START_KEY = keyboard.Key.f8
 ABORT_KEY = keyboard.Key.f6
 
@@ -2007,6 +2007,9 @@ DEFAULT_SETTINGS = {
     "afk_auto": False,
     "discord_token": "",
     "discord_channel": "",
+    "discord_worker_1": "",
+    "discord_worker_2": "",
+    "discord_worker_3": "",
     "discord_allowed": "",       # ID через запятую; пусто - все в канале
     "discord_ping": "",
     "notify_match": True,
@@ -2206,16 +2209,16 @@ _update_checked = 0.0
 # 5.x updates only the entry script. These Git blob IDs identify the exact
 # companion files for this version, even after the release branch moves on.
 # Pin the raw download to a commit containing this entire set of files.
-TEAM_REVISION = "a9c32e18bfa27abbf3370e1c2b15f31478bf1105"
+TEAM_REVISION = "e15ce15c3f2ee1b679ad72aa406d1a4e7d3b2d63"
 TEAM_FILES = {
     "wastelands_digits.png": "352a4528f742858abceddba6e728893282d358c6",
     "wastelands_hotbar.png": "34ec85ea4c91b77596b2fb1c6a22b204332d242b",
     "wastelands_titan_labels.png": "3ddf69ed5fd6b0c4fd1303baa7acf780d157ea21",
-    "wastelands.py": "e874e81ea7ee7ba75a08f591c6eb7808ed8a1a80",
+    "wastelands.py": "8a637c62f546e9cffdba79c769929e4b9a6a1928",
     "wastelands_alt.py": "4dbd78f1a03db88fa60563561b8d3b373ee1e096",
     "wastelands_manager.py": "2b74f27d9eb9e166aa3a05a06bb7be888e004dd2",
     "wastelands_map.py": "11d65c7c0c0199cb0917a7b7da8b6de14498bada",
-    "wastelands_team.py": "85115210be5be0ea08d50e93039bb07f8752f292",
+    "wastelands_team.py": "4c679cd207a428603cb5170e9f23f173a6f3614f",
     "wastelands_view.py": "d80fac6ea519175dc1c29bd04d9526b8069910f9",
     "wastelands_ocr.ps1": "496e34e723f8a27cd6993fc72f826f398459b5b9",
     "wastelands_pairing.py": "bf5f3fdacf52414d6ab203853ff06a64440c84d9",
@@ -2519,6 +2522,11 @@ class DiscordLink:
         self.app = app                       # контроллер приложения (start/stop фарма)
         self.token = str(SETTINGS.get("discord_token", "")).strip()
         self.channel = str(SETTINGS.get("discord_channel", "")).strip()
+        self.worker_channels = {}
+        for player in (1, 2, 3):
+            channel = str(SETTINGS.get(f"discord_worker_{player}", "")).strip()
+            if channel.isascii() and channel.isdecimal() and 0 < len(channel) <= 20:
+                self.worker_channels[player] = channel
         self.allowed = {x.strip() for x in str(SETTINGS.get("discord_allowed", "")).replace(";", ",").split(",")
                         if x.strip()}
         self.ping = str(SETTINGS.get("discord_ping", "")).strip()
@@ -2593,18 +2601,19 @@ class DiscordLink:
         return self._request("POST", path, body, ctype, auth=auth)
 
     # --- уведомления ---
-    def send(self, title, desc="", color=COLOR_INFO, image=None, ping=False, fields=None):
-        if not self.ok:
+    def send(self, title, desc="", color=COLOR_INFO, image=None, ping=False, fields=None, *, player=None):
+        channel = self.channel if player is None else self.worker_channels.get(player)
+        if not channel or not self.alive or (player is None and not self.ok):
             return
         content = f"<@{self.ping}>" if ping and self.ping else ""
-        self.queue.append(({"content": content, "embeds": [self.embed(title, desc, color, fields)]}, image))
+        self.queue.append((channel, {"content": content, "embeds": [self.embed(title, desc, color, fields)]}, image))
         self.wake.set()
 
     def afk_prompt(self, key, panel):
-        if self.ok:
+        if self.ok and self.channel:
             buttons = [{"type": 2, "style": 1, "label": str(i+1), "custom_id": f"afk:{key}:{i}"} for i in range(4)]
             mention = f"<@{self.ping}> " if self.ping else ""
-            self.queue.append(({"content": mention + "AFK CHECK — выбери позицию слева направо",
+            self.queue.append((self.channel, {"content": mention + "AFK CHECK — выбери позицию слева направо",
                                 "components": [{"type": 1, "components": buttons}]}, panel))
             self.wake.set()
 
@@ -2626,6 +2635,7 @@ class DiscordLink:
 
     # --- запуск ---
     def start(self):
+        threading.Thread(target=self._sender, daemon=True).start()
         threading.Thread(target=self._run, daemon=True).start()
 
     def stop(self):
@@ -2641,6 +2651,10 @@ class DiscordLink:
         try:
             me = self._request("GET", "/oauth2/applications/@me")
             self.app_id = me["id"]
+            if not self.channel:
+                self.ok = True
+                self.status = "подключён · отчёты Wastelands"
+                return
             ch = self._request("GET", f"/channels/{self.channel}")
             guild = ch.get("guild_id")
             if guild:      # команды сервера появляются сразу (глобальные - до часа)
@@ -2655,19 +2669,18 @@ class DiscordLink:
             self.status = f"ошибка: {e}"
             log(f"Discord: не удалось подключиться ({e})")
             return
-        threading.Thread(target=self._sender, daemon=True).start()
         self._gateway_loop()
 
     def _sender(self):
         while self.alive:
             self.wake.wait(timeout=1.0)
             self.wake.clear()
-            while self.queue:
-                payload, image = self.queue.popleft()
+            while self.alive and self.queue:
+                channel, payload, image = self.queue.popleft()
                 try:
-                    self._post(f"/channels/{self.channel}/messages", payload, image)
+                    self._post(f"/channels/{channel}/messages", payload, image)
                 except Exception as e:
-                    log(f"Discord: сообщение не отправилось ({e})")
+                    log(f"Discord: сообщение в канал {channel} не отправилось ({e})")
 
     # --- Gateway: только чтобы получать слэш-команды ---
     def _gateway_loop(self):
@@ -5600,6 +5613,7 @@ class FarmApp:
             widget.destroy()
         self.team = App(page, prefs=SETTINGS.get("wastelands"), save_prefs=self.save_team,
                         farm_busy=lambda: self.thread is not None and self.thread.is_alive(),
+                        open_discord=lambda: self.show("discord"),
                         mode_lock=self.mode_lock)
 
     def save_team(self, prefs):
@@ -6033,8 +6047,13 @@ class FarmApp:
         self.switch(s, "discord_enabled", "Включить Discord-бота")
         self.entry(s, "discord_token", "Токен бота", "Developer Portal → твоё приложение → Bot → Reset Token. "
                    "Никому не показывай.", secret=True)
-        self.entry(s, "discord_channel", "ID канала", "ПКМ по каналу → «Копировать ID канала» "
+        self.entry(s, "discord_channel", "ID канала Invaded City", "ПКМ по каналу → «Копировать ID канала» "
                    "(нужен режим разработчика в настройках Discord)")
+        s = self.section(p, "Wastelands · отчёты с основы")
+        self.label(s, "Один токен для всех твинков. Пустой ID выключает отчёты этого твинка.",
+                   9, "muted").pack(anchor="w", padx=18)
+        for player in (1, 2, 3):
+            self.entry(s, f"discord_worker_{player}", f"ID канала твинка {player}", width=30)
         st = self.tk.Frame(s, bg=C["card"])
         st.pack(fill="x", padx=18, pady=(4, 16))
         self.flat_button(st, "Сохранить и подключить", self.save).pack(side="left")
@@ -6085,6 +6104,19 @@ class FarmApp:
 
     # --- логика ---
     def save(self):
+        from tkinter import messagebox
+        channels = {self.vars["discord_channel"].get().strip()}
+        for player in (1, 2, 3):
+            channel = self.vars[f"discord_worker_{player}"].get().strip()
+            if not channel:
+                continue
+            if not (channel.isascii() and channel.isdecimal() and len(channel) <= 20):
+                messagebox.showerror("Discord", f"Твинк {player}: введи числовой ID канала.", parent=self.root)
+                return
+            if channel in channels:
+                messagebox.showerror("Discord", f"Твинк {player}: этот канал уже выбран. Укажи отдельный канал.", parent=self.root)
+                return
+            channels.add(channel)
         for k, v in self.vars.items():
             val = v.get()
             if isinstance(DEFAULT_SETTINGS.get(k), bool):
@@ -6110,11 +6142,12 @@ class FarmApp:
             self.link.stop()
         self.link = None
         LINK = NullLink()
-        if SETTINGS.get("discord_enabled") and SETTINGS.get("discord_token") and SETTINGS.get("discord_channel"):
-            self.link = DiscordLink(self)
-            self.link.status = "подключаюсь…"
-            LINK = self.link
-            self.link.start()
+        if SETTINGS.get("discord_enabled") and SETTINGS.get("discord_token"):
+            link = DiscordLink(self)
+            if link.channel or link.worker_channels:
+                self.link = LINK = link
+                link.status = "подключаюсь…"
+                link.start()
 
     def start_farm(self):
         """Можно вызывать из любого потока (кнопка, F8, /start)."""
