@@ -255,6 +255,20 @@ def near_rejection(unit, point, sites):
     return any(group==other and math.dist(point,center)<clearance for other,center in sites)
 
 
+def nearby_titan_sites(anchor):
+    # Distances use the same road coordinates as the map editor. Even the
+    # innermost ring lies outside the 18-unit exclusion around a failed click.
+    sites = []
+    for radius in (22,36,50):
+        for step in range(12):
+            angle = step*math.pi/6
+            x = round(anchor[0]+radius*math.cos(angle),2)
+            y = round(anchor[1]+radius*math.sin(angle),2)
+            if 0 < x < 2048 and 0 < y < 1152:
+                sites.append([x,y])
+    return sites
+
+
 def titan_layout(points):
     """Validate the six optional positions in the common road coordinate system."""
     slots = {f"{player}/{unit}" for player in PLAYERS for unit in TITANS}
@@ -372,7 +386,10 @@ class Match:
         if row["unit"] not in TITANS or row["state"] != "reserved" or row.get("target") or row.get("clear_site"):
             return
         player, unit = row["player"], row["unit"]
-        row["manual_site"] = self.manual_titans.get(f"{player}/{unit}")
+        anchor = self.manual_titans.get(f"{player}/{unit}")
+        if anchor != row.get("manual_site"):
+            row.pop("retry_nearby", None)
+        row["manual_site"] = anchor
         row["point"] = row["manual_site"] or position(player, unit)
 
     def set_titan_layout(self, points):
@@ -541,7 +558,7 @@ class Match:
                 return (abs(dx*tangent[0]+dy*tangent[1])<1 and
                         abs(dx*normal[0]+dy*normal[1])<=EDGE_ADJUST+.01)
             manual = place.get("manual_site")
-            if manual and point != manual:
+            if manual and point != manual and not (place.get("retry_nearby") and point in nearby_titan_sites(manual)):
                 raise ValueError("Точка титана изменилась на основе")
             if not manual and not any(allowed(j) for j in range(placement_attempts(unit))):
                 raise ValueError("За пределами назначенной зоны")
@@ -708,9 +725,25 @@ class Match:
                                 and req.get("target_since")==place["target_since"]
                                 and (place.get("count_before") is not None or place.get("total_before") is not None)):
                             self.rejections[footprint_class(unit),tuple(place["target"])] = now+REJECTION_SECONDS
+                            if place.get("manual_site") == place["target"]:
+                                place["retry_nearby"] = True
                         place.pop("target",None)
                         self.apply_titan_point(place)
                     elif place.get("target") == req["point"]:
+                        key = f"{player}/{unit}"
+                        if (place.get("retry_nearby") and place["state"] != "placed"
+                                and place.get("manual_site") == self.manual_titans.get(key)
+                                and place.get("slot") and place["target"] != place["manual_site"]
+                                and (place.get("count_before") is not None or place.get("total_before") is not None)):
+                            # A map edit during a live reservation always wins.
+                            # A newly added adjacent mark can also rule out learning this position.
+                            try:
+                                layout = titan_layout(self.manual_titans | {key:place["target"]})
+                            except ValueError:
+                                pass
+                            else:
+                                self.manual_titans = layout
+                                place["manual_site"] = layout[key]
                         if (unit in TITANS and not place.get("manual_site") and place["state"]!="placed" and place.get("slot")
                                 and (place.get("count_before") is not None or place.get("total_before") is not None)):
                             self.titan_sites[f"{player}/{unit}"] = list(place["target"])

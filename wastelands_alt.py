@@ -12,10 +12,10 @@ import twd_bot as farm
 from wastelands_manager import manager_bounds, titan_cards, upgrade_price
 from wastelands_team import (ABILITIES, BANK_OFFSET, EARLY, EARLY_CLEARANCE, PRIMARY_BANK_COUNT, TITANS, TITAN_CLEARANCE, REJECTION_SECONDS, PairingExpired, single_blocker,
                             PLACEMENT_ORDER, SPARE_BANKS, Wait, bank_slot, footprint_class, near_rejection, placement_conflict,
-                            on_third_titan_bank, placement_label, position, private_server_links, recent_sites)
+                            nearby_titan_sites, on_third_titan_bank, placement_label, position, private_server_links, recent_sites)
 from wastelands_view import (OCR, color_boxes, framing_turn, invite_buttons, label, read_invite, map_point, preview,
                             perimeter_points, rank_build_sites, placement_in_view, placement_pose, mission_button, ready_button,
-                            recover_third_bank_pose, visual_slot_count, wastelands_slots, scene, screen_point, tracked_pose)
+                            invalid_placement, recover_third_bank_pose, visual_slot_count, wastelands_slots, scene, screen_point, tracked_pose)
 
 
 class Game(farm.Bot):
@@ -368,6 +368,7 @@ class Alt:
         self.wait_status = ""
         self.ocr_retry = 0
         self.funded_lease = None
+        self.toast_lease = None
         self.retry = state["progress"].get("retry",0)
         self.levels = {"amplifier":None,"screen":None}
         self.upgrade_note = ""
@@ -793,7 +794,7 @@ class Alt:
             return UnitCounts()
         return UnitCounts(count if count is not None else manager.slot,manager.total)
 
-    def recheck_pending(self,state):
+    def recheck_pending(self,state,frame=None):
         row = next((p for p in state["places"] if p["player"]==self.player
                     and p.get("target") and p["state"]!="placed"),None)
         if row is None:
@@ -806,33 +807,35 @@ class Alt:
             return f"{name} · нет исходного счётчика. Проверь точку в «Места юнитов»"
         key = (unit,tuple(point),row.get("target_since"))
         second = self.unchanged==key
-        after = self.placement_readback(kind,row.get("slot") or self.slots[kind],before,second)
+        invalid = frame is not None and self.toast_lease == key and invalid_placement(frame)
+        after = before if invalid else self.placement_readback(kind,row.get("slot") or self.slots[kind],before,second)
         delta = before.delta(after)
         if delta not in (0,1):
             self.unchanged = None
             if not self.read_delay:
                 farm.log(f"Wastelands · твинк {self.player} · {name} · ожидание: {before} → {after}")
             return self.wait_for_check(f"{name} · сверяю постановку по слоту и UNITS")
-        if delta==0 and not second:
+        if delta==0 and not second and not invalid:
             self.unchanged = key
             return self.wait_for_check(f"{name} · счётчик прежний, жду обновления игры",1.1)
 
         op = "commit" if delta else "release"
         since = row.get("target_since")
-        funded = self.funded_lease==key
+        site_failed = not delta and (self.funded_lease==key or invalid)
         if not delta:
-            cooldown = REJECTION_SECONDS if funded else 18
+            cooldown = REJECTION_SECONDS if site_failed else 18
             self.local_rejections[footprint_class(unit),tuple(point)] = time.monotonic()+cooldown
             if unit in ("tv_3", "tv_4"):
                 self.blocked_tv.add(unit)
                 self.rescan_at[unit] = time.monotonic()+3
-            if kind not in EARLY and funded:
+            if kind not in EARLY and site_failed:
                 site = tuple(point)
                 self.failed_titan_sites[site] = self.failed_titan_sites.get(site,0)+1
-        self.confirm = (op,unit,point,since,not delta and funded)
-        self.exchange(op,unit=unit,point=point,target_since=since,site_failed=not delta and funded)
+        self.confirm = (op,unit,point,since,site_failed)
+        self.exchange(op,unit=unit,point=point,target_since=since,site_failed=site_failed)
         self.confirm = None
         self.funded_lease = None
+        self.toast_lease = None
         self.unchanged = None
         self.pending_places.discard(unit)
         self.next_check = self.read_delay = 0
@@ -844,12 +847,15 @@ class Alt:
         count = after.slot if after.slot is not None else (before.slot+delta if before.slot is not None else None)
         total = after.total if after.total is not None else (before.total+delta if before.total is not None else None)
         self.last_inventory = (kind,time.monotonic()+8,UnitCounts(count,total if self.host_totals else None))
+        if invalid:
+            self.last_inventory = None
 
-        evidence = f"слот {after.slot}" if before.slot is not None and after.slot is not None else f"UNITS {before.total} → {after.total}"
+        evidence = ("Invalid Placement" if invalid else
+                    f"слот {after.slot}" if before.slot is not None and after.slot is not None else f"UNITS {before.total} → {after.total}")
         farm.log(f"Wastelands · твинк {self.player} · {name} · {op} · {evidence}")
         if delta:
             return f"Поставил {name} · {evidence}"
-        if not funded:
+        if not site_failed:
             return self.wait_for_check(f"{name} · число прежнее, перепроверю средства и место",1)
         return f"{name} · число прежнее, пробую другую точку"
 
@@ -964,8 +970,10 @@ class Alt:
                 cost += .24
             preference.append(cost)
         if unit in self.manual_titans:
-            # The operator picked this exact patch. Let the game decide
-            # whether it accepts the base; its colour is only a search heuristic.
+            if sites != [self.manual_titans[unit]]:
+                ranked = rank_build_sites(frame,pose,available,TITAN_CLEARANCE//2,preference,clear_titan_base=True)
+                ranked.sort(key=self.titan_misses)
+                return ranked,visible,busy,rejected,len(available)-len(ranked)
             return available,visible,busy,rejected,0
         check_ground = self.player==3 and not early
         radius = TITAN_CLEARANCE//2 if check_ground else (12 if early else 24)
@@ -1065,6 +1073,11 @@ class Alt:
             self.last_inventory = (kind,time.monotonic()+8,before)
         self.read_delay = 0
         sites = self.placement_sites(unit)
+        anchor = self.manual_titans.get(unit)
+        nearby = anchor and any(p["player"]==self.player and p["unit"]==unit and p.get("retry_nearby")
+                                for p in self.team_places)
+        if nearby:
+            sites = nearby_titan_sites(anchor)
         if not self.game.take(slot):
             return self.wait_for_check(f"{name} · жду подсветку дороги",1)
         try:
@@ -1092,7 +1105,7 @@ class Alt:
                         candidates.remove(freed)
                         if rank_build_sites(snap,pose,[freed],TITAN_CLEARANCE//2,[0],clear_titan_base=True):
                             candidates.insert(0,freed)
-                elif cash is not None and cash>=price and (before.slot==0 or
+                elif not nearby and cash is not None and cash>=price and (before.slot==0 or
                         before.slot is None and before.total==len(self.placed) and unit not in self.placed):
                     requested = self.ask_for_space(unit,snap,pose,sites,candidates)
                     if requested:
@@ -1131,6 +1144,7 @@ class Alt:
                         return None
                     if unit in self.manual_titans:
                         current = self.map_pose(frame)
+                        self.toast_lease = None if invalid_placement(frame) else (unit,tuple(point),since)
                         return screen_point(current,point) if current is not None else None
                     if np.median(abs(scene(frame)-reference_scene))<4:
                         return pt
@@ -1158,6 +1172,8 @@ class Alt:
             if self.reframe_sites(unit,snap,pose,sites):
                 return self.wait_for_check(f"{name} · повернул камеру к свободному участку, сверяю карту",.5)
             if unit in self.manual_titans:
+                if nearby:
+                    return f"{name} · ищу свободный песок рядом с меткой"
                 reason = "участок занят" if busy else ("игра отклонила постановку" if rejected else "точка вне кадра")
                 return f"{name} · {reason}. Можно передвинуть метку в «Карта титанов»."
             return message
@@ -1570,7 +1586,7 @@ class Alt:
         if now<self.next_check:
             return self.wait_status
         if self.pending_places:
-            status = self.recheck_pending(state)
+            status = self.recheck_pending(state,img)
             if status:
                 return status
 

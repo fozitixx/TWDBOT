@@ -145,6 +145,28 @@ def _binary_match(template, spectrum, integral, shape):
     return scores[y,x], (x,y)
 
 
+@lru_cache(maxsize=1)
+def _invalid_masks():
+    with Image.open(Path(__file__).with_name("wastelands_invalid.png")) as reference:
+        return [np.asarray(reference.resize((round(reference.width*s),round(reference.height*s)),
+                                            Image.Resampling.BILINEAR)) >= 115
+                for s in (1., .95, 1.05, .9, 1.1, .8, 1.2)]
+
+
+def invalid_placement(img):
+    """Read the red 'Invalid Placement' lettering above the battlefield."""
+    width, height = img.size
+    band = img.crop((round(.29*width),round(.09*height),round(.72*width),round(.23*height)))
+    band = band.convert("RGB").resize((440,max(24, round(1024*band.height/width))),Image.Resampling.BILINEAR)
+    r,g,b = np.asarray(band,dtype=np.int16).transpose(2,0,1)
+    ink = (r>90)&(g<.49*r)&(b<.49*r)
+    if ink.sum(axis=1).max() < 35:
+        return False
+    integral = np.pad(ink.cumsum(0).cumsum(1),((1,0),(1,0)))
+    spectrum = np.fft.rfft2(ink)
+    return any(_binary_match(mask,spectrum,integral,ink.shape)[0] >= .70 for mask in _invalid_masks())
+
+
 def mission_button(img, mode):
     """Match the aligned red and purple button outlines even when a card is black."""
     w = 640

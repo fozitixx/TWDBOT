@@ -116,6 +116,8 @@ class App:
             self.match = Match(prefs.get("titan_sites"))
             map_problem = "Не удалось прочитать сохранённую карту титанов. Можно запросить новый кадр."
         self.saved_titan_sites = dict(self.match.titan_sites)
+        self.saved_layout = dict(self.match.manual_titans)
+        self.map_write_retry = 0
         self.server = self.worker = self.listener = None
         self.stop = threading.Event()
         self.messages = queue.SimpleQueue()
@@ -742,8 +744,22 @@ class App:
         if events:
             link.send(f"Wastelands · Твинк {player}", "\n".join(events), player=player)
 
+    def save_learned_layout(self):
+        with self.match.lock:
+            points = self.match.manual_titans
+            if points != self.saved_layout:
+                try:
+                    self.profile.write("titan-map.json", dict(points=points, frame=self.titan_frame))
+                except (ValueError, OSError) as exc:
+                    self.map_write_retry = time.monotonic()+5
+                    self.note.configure(text=f"Не удалось сохранить найденную точку: {exc}")
+                    return
+                self.saved_layout = dict(points)
+
     def render_players(self):
         now = time.monotonic()
+        if now >= self.map_write_retry and self.saved_layout != self.match.manual_titans:
+            self.save_learned_layout()
         if self.save_prefs and self.saved_titan_sites!=self.match.titan_sites:
             self.remember()
         with self.match.lock:
@@ -852,6 +868,7 @@ class App:
         if self.server:
             self.server.shutdown()
             self.server.server_close()
+        self.save_learned_layout()
         self.remember()
         if self.standalone:
             self.root.destroy()

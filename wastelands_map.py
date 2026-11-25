@@ -44,6 +44,7 @@ class TitanMapEditor:
         self.packet = self.image = self.pose = self.photo = self.request = None
         self.bounds = (0, 0, 0, 0)
         self.draft = dict(app.match.manual_titans)
+        self.baseline = dict(self.draft)
         self.selected = tk.StringVar(win, "1/amplifier")
         online = [p for p, c in app.match.clients.copy().items() if time.monotonic()-c["seen"] < 8]
         self.source = tk.IntVar(win, min(online, default=1))
@@ -105,6 +106,10 @@ class TitanMapEditor:
         self.note.configure(text=f"Твинк {player} сверяет положение дороги…")
 
     def poll(self):
+        with self.app.match.lock:
+            if self.baseline != self.app.match.manual_titans:
+                self.merge_learned_points()
+                self.draw()
         if self.request is None:
             return
         player, request, run, deadline = self.request
@@ -191,13 +196,28 @@ class TitanMapEditor:
         self.note.configure(text="Для выбранного титана включится автопоиск после сохранения.")
         self.draw()
 
+    def merge_learned_points(self):
+        latest = dict(self.app.match.manual_titans)
+        for key in self.baseline.keys() | latest.keys():
+            if self.draft.get(key) == self.baseline.get(key):
+                if key in latest:
+                    self.draft[key] = latest[key]
+                else:
+                    self.draft.pop(key, None)
+        self.baseline = latest
+
     def save(self):
         try:
-            plan = titan_layout(self.draft)
-            self.app.profile.write("titan-map.json", dict(points=plan, frame=self.packet))
-            self.app.match.set_titan_layout(plan)
+            with self.app.match.lock:
+                self.merge_learned_points()
+                plan = titan_layout(self.draft)
+                self.app.profile.write("titan-map.json", dict(points=plan, frame=self.packet))
+                self.app.match.set_titan_layout(plan)
+                self.app.saved_layout = dict(plan)
+                self.baseline = dict(plan)
+                self.app.titan_frame = self.packet
         except (ValueError, OSError) as exc:
             self.note.configure(text=f"Не удалось сохранить точки. {exc}")
             return
-        self.app.titan_frame = self.packet
+        self.draw()
         self.note.configure(text="Сохранено. Метки применяются при следующей постановке каждого титана.")
