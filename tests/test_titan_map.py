@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 import tempfile
 import threading
 import time
@@ -16,8 +17,8 @@ from wastelands_map import TitanMapEditor, decode_map_frame
 from wastelands_pairing import PairingProfile
 from wastelands_team import (AltConnection, Match, PLAYERS, TITANS, UNITS,
                              PLACEMENT_ORDER, PRIMARY_BANK_COUNT, on_third_titan_bank,
-                             placement_attempts, placement_conflict, position, serve, titan_layout)
-from wastelands_view import ANCHOR, preview, screen_point
+                             nearby_titan_sites, placement_attempts, placement_conflict, position, serve, titan_layout)
+from wastelands_view import ANCHOR, invalid_placement, preview, screen_point
 
 
 def camera(size, angle, focus):
@@ -34,6 +35,93 @@ POINTS = {f"{p}/{unit}":[980+p*95, 575+i*100] for p in PLAYERS for i,unit in enu
 
 
 class TitanMapTest(unittest.TestCase):
+    def test_invalid_then_nearby_confirm_and_reload(self):
+        player, unit = 3, "amplifier"
+        key = "3/amplifier"
+        host = Match(manual_titans=POINTS)
+        host.start("hard", "Host")
+        anchor = POINTS[key]
+        conn = Mock(player=player)
+        conn.exchange.side_effect = lambda op, **data: host.exchange(player,dict(instance="three",op=op,**data))
+        with patch("wastelands_alt.Game"):
+            alt = Alt(conn,dict(zip(UNITS,(3,4,1,2))),threading.Event(),Mock())
+        alt.reset(alt.exchange())
+        alt.update_places(alt.exchange())
+        frame = Image.new("RGB",(1024,576),(140,108,65))
+        toast = frame.copy()
+        with Image.open(Path(__file__).resolve().parents[1]/"wastelands_invalid.png") as mask:
+            toast.paste((192,24,22),(416,84,416+mask.width,84+mask.height),mask)
+        self.assertTrue(invalid_placement(toast))
+        self.assertFalse(invalid_placement(frame))
+        pose = camera(frame.size,.61,np.array(anchor))
+        alt.game.grab.return_value = frame
+        alt.game.click_live.side_effect = lambda point,locate,title: self.assertEqual(locate(frame),point)
+        with patch.object(alt,"map_pose",return_value=pose), patch("wastelands_alt.placement_cash",return_value=None), \
+             patch.object(alt,"placement_baseline",return_value=UnitCounts(0,8)):
+            alt.place(unit,frame)
+            row = host.places[player,unit]
+            self.assertEqual(row["target"], anchor)
+            with patch.object(alt,"placement_readback",side_effect=AssertionError("explicit game rejection")):
+                alt.recheck_pending(alt.exchange(),toast)
+            self.assertTrue(row["retry_nearby"])
+            self.assertEqual(host.manual_titans,POINTS)
+            alt.update_places(alt.exchange())
+            gray = Image.new("RGB",frame.size,(95,96,94))
+            self.assertFalse(alt.candidate_sites(unit,gray,pose,nearby_titan_sites(anchor))[0])
+            # The first warning can still be visible when the next click lands.
+            alt.game.click_live.side_effect = lambda point,locate,title: self.assertEqual(locate(toast),point)
+            alt.place(unit,frame)
+            target = list(row["target"])
+            self.assertIn(target,nearby_titan_sites(anchor))
+            self.assertGreater(math.dist(target,anchor),18)
+            self.assertLessEqual(math.dist(target,anchor),50.01)
+            self.assertEqual(host.manual_titans,POINTS)
+            with patch.object(alt,"placement_readback",return_value=UnitCounts(1,9)):
+                alt.recheck_pending(alt.exchange(),toast)
+        expected = POINTS | {key:target}
+        self.assertEqual(host.manual_titans,expected)
+        with tempfile.TemporaryDirectory() as tmp:
+            app = App.__new__(App)
+            app.match, app.saved_layout = host, dict(POINTS)
+            app.profile, app.titan_frame = PairingProfile(tmp), packet(frame,pose,player)
+            app.save_learned_layout()
+            saved = app.profile.read("titan-map.json")
+            self.assertEqual(saved["frame"], app.titan_frame)
+            restored = Match(manual_titans=saved["points"])
+            restored.start("hard","Host")
+            self.assertEqual(restored.places[player,unit]["point"],target)
+
+    def test_nearby_requires_failure_and_preserves_concurrent_edit(self):
+        m = Match(manual_titans=POINTS)
+        m.start("hard","Host")
+        key, unit = "3/screen","screen"
+        anchor = POINTS[key]
+        candidate = nearby_titan_sites(anchor)[0]
+        with self.assertRaisesRegex(ValueError,"изменилась"):
+            m.reserve(3,unit,candidate,0,8,2)
+        m.reserve(3,unit,anchor,0,8,2)
+        row = m.places[3,unit]
+        m.exchange(3,dict(instance="three",run=m.run,op="release",unit=unit,point=anchor,
+                          target_since=row["target_since"],site_failed=True))
+        m.reserve(3,unit,candidate,0,8,2)
+        edited = POINTS | {key:[1350,830]}
+        m.set_titan_layout(edited)
+        m.exchange(3,dict(instance="three",run=m.run,op="commit",unit=unit,point=candidate))
+        self.assertEqual(row["point"],candidate)
+        self.assertEqual(m.manual_titans,edited)
+
+    def test_editor_keeps_unsaved_edits_and_updates_untouched_markers(self):
+        m = Match(manual_titans=POINTS)
+        editor = TitanMapEditor.__new__(TitanMapEditor)
+        editor.app = SimpleNamespace(match=m)
+        editor.baseline = dict(POINTS)
+        editor.draft = dict(POINTS)
+        editor.draft.pop("1/screen")
+        m.set_titan_layout(POINTS | {"3/screen":[1350,830]})
+        editor.merge_learned_points()
+        self.assertNotIn("1/screen",editor.draft)
+        self.assertEqual(editor.draft["3/screen"],[1350,830])
+
     def test_editor_marks_all_six_on_one_letterboxed_frame_and_reopens_offline(self):
         root = tk.Tk()
         root.withdraw()
